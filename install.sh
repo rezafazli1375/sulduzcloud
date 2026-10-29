@@ -162,8 +162,12 @@ mkdir -p "$DATA_DIR_/backups"
 chown -R sulduz:sulduz "$DATA_DIR_"
 chown -R root:root "$APP_DIR"
 chmod -R a+rX "$APP_DIR"
-# a+rX above would expose the env file; restore the restricted mode.
-[ -f "$APP_DIR/server/.env" ] && chmod 600 "$APP_DIR/server/.env"
+# The service runs as `sulduz` and also reads .env itself: keep it out of other
+# users' reach but readable by the service (systemd loads it as root anyway).
+if [ -f "$APP_DIR/server/.env" ]; then
+  chown root:sulduz "$APP_DIR/server/.env"
+  chmod 640 "$APP_DIR/server/.env"
+fi
 
 log "Writing the systemd unit"
 cat > /etc/systemd/system/sulduzcloud.service <<EOF
