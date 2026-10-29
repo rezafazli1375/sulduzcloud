@@ -147,8 +147,10 @@ BACKUP_DIR=$DATA_DIR_/backups
 PUBLIC_URL=http://$DOMAIN
 EOF
 elif [ "$DOMAIN_SET" = "1" ]; then
-  # An explicit --domain wins, but keep HTTPS if a certificate already exists.
+  # An explicit --domain wins, but never downgrade an HTTPS panel to plain HTTP:
+  # keep https when the current URL uses it or a certificate already exists.
   scheme="http"
+  if grep -q '^PUBLIC_URL=https://' "$APP_DIR/server/.env" 2>/dev/null; then scheme="https"; fi
   [ -f "/etc/letsencrypt/live/$DOMAIN/cert.pem" ] && scheme="https"
   sed -i "s#^PUBLIC_URL=.*#PUBLIC_URL=$scheme://$DOMAIN#" "$APP_DIR/server/.env" || true
   log "PUBLIC_URL set to $scheme://$DOMAIN"
