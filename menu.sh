@@ -9,8 +9,8 @@ set -uo pipefail
 APP_DIR="${SC_APP_DIR:-/opt/sulduzcloud}"
 ENV_FILE="$APP_DIR/server/.env"
 NGINX_SITE="/etc/nginx/sites-available/sulduzcloud"
-MENU_ENV="/etc/sulduzcloud/menu.env"
-CRED_FILE="/etc/sulduzcloud/admin.cred"
+MENU_ENV="${SC_MENU_ENV:-/etc/sulduzcloud/menu.env}"
+CRED_FILE="${SC_CRED_FILE:-/etc/sulduzcloud/admin.cred}"
 SERVICE="sulduzcloud"
 
 c_r=$'\033[0m'; c_b=$'\033[1m'; c_g=$'\033[32m'; c_y=$'\033[33m'; c_red=$'\033[31m'; c_c=$'\033[36m'

@@ -71,7 +71,11 @@ function cmdAdmins() {
     .all();
   for (const row of rows) {
     const status = row.status === 'active' ? 'فعال' : row.status;
-    console.log(`${row.username}   ${status}   ${String(row.created_at || '').slice(0, 10)}`);
+    const stamp = Number(row.created_at);
+    const when = Number.isFinite(stamp) && stamp > 0
+      ? new Date(stamp > 1e12 ? stamp : stamp * 1000).toISOString().slice(0, 10)
+      : '';
+    console.log(`${row.username}   ${status}   ${when}`);
   }
 }
 
