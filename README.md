@@ -60,7 +60,7 @@ Version 1.3.0 · Node.js 20+ · SQLite · React 18 · multi-panel
 ```bash
 sudo bash install.sh --domain panel.example.com --license /root/license.json
 # یا از روی مخزن:
-curl -fsSL https://raw.githubusercontent.com/REPO_SLUG/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
   | sudo bash -s -- --domain panel.example.com --license /root/license.json
 ```
 
@@ -285,7 +285,7 @@ A fresh Ubuntu/Debian box (or any Linux with Node.js 20+, `python3`, `make`, `g+
 ```bash
 sudo bash install.sh --domain panel.example.com --license /root/license.json
 # or straight from the repository:
-curl -fsSL https://raw.githubusercontent.com/REPO_SLUG/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
   | sudo bash -s -- --domain panel.example.com --license /root/license.json
 ```
 

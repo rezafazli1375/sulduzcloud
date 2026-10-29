@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sulduz Cloud — one-command installer for a fresh Ubuntu/Debian server.
 #
-#   curl -fsSL https://raw.githubusercontent.com/REPO_SLUG/main/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
 #     | sudo bash -s -- --domain panel.example.com --license /root/license.json
 #
 # Options:
@@ -17,7 +17,7 @@
 
 set -Eeuo pipefail
 
-REPO_SLUG="${SC_REPO_SLUG:-REPO_SLUG}"
+REPO_SLUG="${SC_REPO_SLUG:-rezafazli1375/sulduzcloud}"
 APP_DIR="/opt/sulduzcloud"
 DATA_DIR_="/var/lib/sulduzcloud"
 LICENSE_DST="/etc/sulduzcloud/license.json"
