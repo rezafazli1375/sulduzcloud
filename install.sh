@@ -77,6 +77,10 @@ else
 fi
 
 mkdir -p "$APP_DIR" "$DATA_DIR_" /etc/sulduzcloud
+if ! id -u sulduz >/dev/null 2>&1; then
+  log "Creating the service user"
+  useradd --system --home-dir "$DATA_DIR_" --shell /usr/sbin/nologin sulduz
+fi
 if systemctl list-unit-files | grep -q '^sulduzcloud.service'; then
   log "Stopping the running service"
   systemctl stop sulduzcloud || true
@@ -93,6 +97,8 @@ fi
 log "Installing backend dependencies"
 cd "$APP_DIR/server"
 if [ -f package-lock.json ]; then npm ci --omit=dev --no-audit --no-fund; else npm install --omit=dev --no-audit --no-fund; fi
+mkdir -p "$DATA_DIR_/secrets" "$DATA_DIR_/backups"
+chown -R sulduz:sulduz "$DATA_DIR_" "$APP_DIR/server/data" 2>/dev/null || true
 
 log "Building the web panel"
 cd "$APP_DIR/web"
@@ -134,7 +140,9 @@ else
   sed -i "s#^PUBLIC_URL=.*#PUBLIC_URL=http://$DOMAIN#" "$APP_DIR/server/.env" || true
 fi
 mkdir -p "$DATA_DIR_/backups"
-chown -R root:root "$APP_DIR" "$DATA_DIR_"
+chown -R sulduz:sulduz "$DATA_DIR_"
+chown -R root:root "$APP_DIR"
+chmod -R a+rX "$APP_DIR"
 
 log "Writing the systemd unit"
 cat > /etc/systemd/system/sulduzcloud.service <<EOF
@@ -144,14 +152,20 @@ After=network.target
 
 [Service]
 Type=simple
+User=sulduz
+Group=sulduz
 WorkingDirectory=$APP_DIR/server
 EnvironmentFile=$APP_DIR/server/.env
 ExecStart=$(command -v node) src/index.js
 Restart=always
 RestartSec=3
-User=root
-LimitNOFILE=65535
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=$DATA_DIR_
+LimitNOFILE=65535
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
