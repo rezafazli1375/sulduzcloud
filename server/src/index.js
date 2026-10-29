@@ -39,9 +39,6 @@ app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 app.use(auth.authMiddleware);
 app.use(auth.csrfProtection);
 
-// Offline licence gate. The check is skipped in tests and when LICENSE_DISABLED=1.
-app.use('/api', require('./license').middleware);
-
 // ------------------------------------------------------------------ routes
 
 app.use('/api/v1', require('./routes/apiV1'));

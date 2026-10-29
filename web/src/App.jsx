@@ -1,11 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect } from 'react';
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
-import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
-import { Copy, Home, LockKeyhole, RefreshCw, ShieldAlert } from 'lucide-react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { Home, LockKeyhole, ShieldAlert } from 'lucide-react';
 
 import { LanguageProvider, useI18n } from './lib/i18n.jsx';
 import { AuthProvider, useAuth } from './lib/auth.jsx';
-import { api } from './lib/api.js';
 import { ToastProvider, ConfirmProvider } from './components/feedback.jsx';
 import ErrorBoundary from './components/ErrorBoundary.jsx';
 import Shell from './components/Shell.jsx';
@@ -60,64 +59,7 @@ function BootScreen() {
   );
 }
 
-function LicenseScreen({ state, onRetry, retrying }) {
-  const { t } = useI18n();
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(state.fingerprint || '');
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (_err) { /* clipboard may be blocked */ }
-  };
-  return (
-    <div className="flex min-h-screen items-center justify-center p-5">
-      <div className="card w-full max-w-lg p-7">
-        <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-300">
-          <LockKeyhole className="h-5 w-5" />
-        </span>
-        <h1 className="mt-4 text-lg font-semibold text-white">{t('license.title')}</h1>
-        <p className="mt-1.5 text-[12px] leading-6 text-slate-400">{t('license.subtitle')}</p>
-        {state.reason ? (
-          <p className="mt-2 text-[11.5px] text-rose-300">{t(`license.reason.${state.reason}`)}</p>
-        ) : null}
-        <div className="mt-5 rounded-xl border border-white/[0.07] bg-black/20 p-4">
-          <p className="text-[10.5px] uppercase tracking-wider text-slate-500">{t('license.fingerprint')}</p>
-          <div className="mt-2 flex items-center gap-2">
-            <code className="flex-1 select-all font-mono text-[13px] tracking-wide text-emerald-300">{state.fingerprint}</code>
-            <button type="button" onClick={copy} className="btn btn-secondary btn-sm inline-flex items-center gap-1.5">
-              <Copy className="h-3.5 w-3.5" />
-              {copied ? t('license.copied') : t('license.copy')}
-            </button>
-          </div>
-        </div>
-        <p className="mt-4 text-[11px] leading-6 text-slate-500">{t('license.steps')}</p>
-        <code className="mt-1 inline-block rounded-lg bg-black/30 px-2.5 py-1.5 font-mono text-[11px] text-slate-300">
-          {t('license.command')}
-        </code>
-        <p className="mt-4 text-[10.5px] leading-5 text-slate-500">{t('license.support')}</p>
-        <button type="button" onClick={onRetry} disabled={retrying} className="btn btn-primary mt-5 inline-flex items-center gap-2">
-          <RefreshCw className={`h-4 w-4 ${retrying ? 'animate-spin' : ''}`} />
-          {t('license.retry')}
-        </button>
-      </div>
-    </div>
-  );
-}
 
-function LicenseGate({ children }) {
-  const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ['license'],
-    queryFn: () => api.get('/license'),
-    retry: 0,
-    staleTime: 60000,
-  });
-  if (isLoading) return <BootScreen />;
-  if (data && data.enforced && !data.valid) {
-    return <LicenseScreen state={data} retrying={isFetching} onRetry={() => refetch()} />;
-  }
-  return children;
-}
 
 function NoAccess() {
   const { t } = useI18n();
@@ -201,9 +143,7 @@ export default function App() {
             <AuthProvider>
               <BrowserRouter>
                 <ErrorBoundary>
-                  <LicenseGate>
-                    <AppRoutes />
-                  </LicenseGate>
+                  <AppRoutes />
                 </ErrorBoundary>
               </BrowserRouter>
             </AuthProvider>

@@ -8,7 +8,6 @@ set -uo pipefail
 APP_DIR="${SC_APP_DIR:-/opt/sulduzcloud}"
 ENV_FILE="$APP_DIR/server/.env"
 NGINX_SITE="/etc/nginx/sites-available/sulduzcloud"
-LICENSE_DST="/etc/sulduzcloud/license.json"
 MENU_ENV="/etc/sulduzcloud/menu.env"
 SERVICE="sulduzcloud"
 
@@ -117,15 +116,6 @@ cert_expiry() { # path -> "end-date|days-left"
   printf '%s|%s' "$end" "$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))"
 }
 
-run_license() { # args... (as sulduz because it only reads)
-  if [ -f "$APP_DIR/server/scripts/license-cli.js" ]; then
-    ( cd "$APP_DIR/server" && LICENSE_PATH="$LICENSE_DST" as_sulduz node scripts/license-cli.js "$@" )
-  else
-    err "license-cli.js پیدا نشد."
-    return 1
-  fi
-}
-
 # ---------------------------------------------------------------- pages
 
 page_status() {
@@ -135,10 +125,7 @@ page_status() {
   if [ -n "$h" ]; then ok "  health: $h"; else err "  health: پاسخ نداد"; fi
   say "  آدرس عمومی: $(public_url || true)"
   say "  پورت داخلی: $(panel_port)"
-  local fp; fp="$(run_license fingerprint 2>/dev/null)"
-  [ -n "$fp" ] && say "  شناسه نصب: $fp"
-  local lic; lic="$(run_license status 2>/dev/null | awk -F': *' '/^valid:/{print $2}')"
-  [ -n "$lic" ] && say "  لایسنس: $lic"
+  say "  دیتابیس: $(env_get DATA_DIR || echo /var/lib/sulduzcloud)/panel.db"
   local xui; xui="$(as_sulduz node -e '
     try {
       const s = require(process.argv[1] + "/server/src/settings");
@@ -277,29 +264,6 @@ issue_cert() { # host
   fi
 }
 
-page_license() {
-  head1 "لایسنس و شناسهٔ نصب"
-  run_license status || true
-  say ""
-  say "  1) فعال‌سازی با فایل کلید"
-  say "  0) بازگشت"
-  printf 'انتخاب: '
-  local ch; read -r ch || true
-  [ "${ch:-}" = "1" ] || return
-  printf 'مسیر فایل کلید (مثلاً /root/license.json): '
-  local f; read -r f || true
-  [ -f "${f:-}" ] || { err "فایل پیدا نشد."; pause; return; }
-  mkdir -p "$(dirname "$LICENSE_DST")"
-  install -m 644 "$f" "$LICENSE_DST"
-  if run_license status; then
-    systemctl restart "$SERVICE"; sleep 2
-    [ -n "$(health)" ] && ok "پنل با کلید جدید بالا آمد." || err "پنل بالا نیامد."
-  else
-    err "کلید معتبر نیست یا برای این ماشین صادر نشده."
-  fi
-  pause
-}
-
 page_backup() {
   head1 "بکاپ فوری"
   local data_dir backup_dir stamp out
@@ -350,14 +314,13 @@ draw_menu() {
   printf '%s' "$c_r"
   say "  پنل: $(public_url || echo 'تنظیم نشده')   |   نسخهٔ health: $(health | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
   say "  ------------------------------------------------------------"
-  say "  1) وضعیت سرویس، لایسنس و اتصال ۳x-ui"
+  say "  1) وضعیت سرویس و اتصال ۳x-ui"
   say "  2) حساب‌ها، نمایش کاربران و تغییر رمز"
   say "  3) تنظیم دامنه پنل"
   say "  4) گواهی SSL (صدور/تمدید)"
-  say "  5) شناسهٔ نصب و فعال‌سازی لایسنس"
-  say "  6) بکاپ فوری دیتابیس"
-  say "  7) ری‌استارت پنل"
-  say "  8) لاگ سرویس"
+  say "  5) بکاپ فوری دیتابیس"
+  say "  6) ری‌استارت پنل"
+  say "  7) لاگ سرویس"
   say "  0) خروج"
   printf '  انتخاب: '
 }
@@ -371,10 +334,9 @@ main_menu() {
       2) page_accounts ;;
       3) page_domain ;;
       4) page_ssl ;;
-      5) page_license ;;
-      6) page_backup ;;
-      7) page_restart ;;
-      8) page_logs ;;
+      5) page_backup ;;
+      6) page_restart ;;
+      7) page_logs ;;
       0|q|Q) exit 0 ;;
       *) ;;
     esac
@@ -398,12 +360,11 @@ main() {
       fi
       ;;
     ssl) if [ -n "${2:-}" ]; then issue_cert "$2"; else page_ssl; fi ;;
-    license) page_license ;;
     backup) page_backup ;;
     restart) page_restart ;;
     logs) page_logs ;;
     ""|-m|menu) main_menu ;;
-    *) say "استفاده: sc [status|accounts|domain <host>|ssl <host>|license|backup|restart|logs]" ;;
+    *) say "استفاده: sc [status|accounts|domain <host>|ssl <host>|backup|restart|logs]" ;;
   esac
 }
 

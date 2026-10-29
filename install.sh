@@ -2,16 +2,15 @@
 # Sulduz Cloud — one-command installer for a fresh Ubuntu/Debian server.
 #
 #   curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
-#     | sudo bash -s -- --domain panel.example.com --license /root/license.json
+#     | sudo bash -s -- --key sulduz_server
 #
 # Options:
-#   --domain <host>       public host name (default: server IP)
-#   --license <file>      signed activation key for this machine (required)
+#   --key <key>           installation key (required)
+#   --domain <host>       public host name (default: server IP; change later with `sc`)
 #   --port <port>         panel port on 127.0.0.1 (default 3100)
 #   --ssl-email <email>   obtain a Let's Encrypt certificate with certbot
 #   --no-nginx            skip the nginx site (use your own reverse proxy)
 #   --dir <path>          install directory (default /opt/sulduzcloud)
-#   --id                  only print this machine's installation id and exit
 #
 # The installer never touches x-ui; connect the panel to x-ui from the admin UI
 # after the first login.
@@ -21,43 +20,27 @@ set -Eeuo pipefail
 REPO_SLUG="${SC_REPO_SLUG:-rezafazli1375/sulduzcloud}"
 APP_DIR="/opt/sulduzcloud"
 DATA_DIR_="/var/lib/sulduzcloud"
-LICENSE_DST="/etc/sulduzcloud/license.json"
 PORT="3100"
 DOMAIN=""
-LICENSE_FILE=""
 SSL_EMAIL=""
 USE_NGINX="1"
-SHOW_ID="0"
+
+# Fixed installation key. Builds of this project only install when it matches.
+INSTALL_KEY="sulduz_server"
+PROVIDED_KEY=""
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
-# Same algorithm as server/src/license.js: sha256("sulduzcloud|" + machine-id),
-# first 20 hex, uppercase, in groups of four.
-installation_id() {
-  local mid=""
-  if [ -s /etc/machine-id ]; then
-    mid="$(tr -d '[:space:]' < /etc/machine-id)"
-  elif [ -s /var/lib/dbus/machine-id ]; then
-    mid="$(tr -d '[:space:]' < /var/lib/dbus/machine-id)"
-  else
-    mid="$(hostname)"
-  fi
-  local hex
-  hex="$(printf 'sulduzcloud|%s' "$mid" | sha256sum | cut -c1-20 | tr 'abcdef' 'ABCDEF')"
-  printf '%s' "$hex" | sed -E 's/(.{4})/\1-/g; s/-$//'
-}
-
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN="${2:-}"; shift 2 ;;
-    --license) LICENSE_FILE="${2:-}"; shift 2 ;;
+    --key) PROVIDED_KEY="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
     --ssl-email) SSL_EMAIL="${2:-}"; shift 2 ;;
     --no-nginx) USE_NGINX="0"; shift ;;
     --dir) APP_DIR="${2:-}"; shift 2 ;;
-    --id) SHOW_ID="1"; shift ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
@@ -65,20 +48,8 @@ done
 
 [ "$(id -u)" = "0" ] || die "run as root (sudo bash install.sh ...)"
 
-INSTALL_ID="$(installation_id)"
-if [ "$SHOW_ID" = "1" ]; then
-  printf '%s\n' "$INSTALL_ID"
-  exit 0
-fi
-
-if [ -z "$LICENSE_FILE" ]; then
-  warn "No activation key given (--license)."
-  printf '\n  Installation id of this machine:\n\n    \033[1m%s\033[0m\n\n' "$INSTALL_ID"
-  printf '  Send this id to the vendor and ask for a signed key, then run:\n\n'
-  printf '    sudo bash install.sh --domain <your-domain> --license /root/license.json\n\n'
-  exit 1
-fi
-[ -f "$LICENSE_FILE" ] || die "license file not found: $LICENSE_FILE"
+[ -n "$PROVIDED_KEY" ] || die "installation key required: pass --key <key>"
+[ "$PROVIDED_KEY" = "$INSTALL_KEY" ] || die "wrong installation key"
 
 log "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -138,21 +109,6 @@ cd "$APP_DIR/web"
 if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
 npx vite build
 
-# ------------------------------------------------------------------ licence
-log "Checking the activation key"
-node "$APP_DIR/server/scripts/license-cli.js" fingerprint >/tmp/sc-fingerprint.txt
-FINGERPRINT="$(cat /tmp/sc-fingerprint.txt)"
-if [ -f "$LICENSE_DST" ]; then
-  cp -a "$LICENSE_DST" "$LICENSE_DST.bak.$(date +%s)"
-fi
-cp -a "$LICENSE_FILE" "$LICENSE_DST"
-chmod 644 "$LICENSE_DST"
-if ! node "$APP_DIR/server/scripts/license-cli.js" status >/tmp/sc-license.txt 2>&1; then
-  cat /tmp/sc-license.txt
-  die "the activation key does not match this machine (installation id: $FINGERPRINT)"
-fi
-log "Licence OK for $FINGERPRINT"
-
 # ------------------------------------------------------------------ env + unit
 if [ -z "$DOMAIN" ]; then
   DOMAIN="$(hostname -I | awk '{print $1}')"
@@ -165,7 +121,6 @@ HOST=127.0.0.1
 PORT=$PORT
 DATA_DIR=$DATA_DIR_
 BACKUP_DIR=$DATA_DIR_/backups
-LICENSE_PATH=$LICENSE_DST
 PUBLIC_URL=http://$DOMAIN
 EOF
   chmod 600 "$APP_DIR/server/.env"
@@ -262,7 +217,6 @@ $(printf '\033[1;32m')Sulduz Cloud is installed.$(printf '\033[0m')
   Service:          systemctl status sulduzcloud
   Logs:             journalctl -u sulduzcloud -f
   Data:             $DATA_DIR_ (back it up!)
-  Activation:       $LICENSE_DST (installation id: $FINGERPRINT)
 
 Next: log in, open Settings → x-UI (or Servers → Add server), paste the panel
 address and API token, then sync inbounds and set prices.

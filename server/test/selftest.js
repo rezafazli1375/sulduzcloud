@@ -556,19 +556,6 @@ function startMockXui(inboundRows) {
 
 
     // ------------------------------------------------------------------- misc
-    const licenseState = await request('GET', '/api/license');
-    check(
-      'license status is public and reports the installation id',
-      licenseState.status === 200
-        && /^[0-9A-F]{4}(-[0-9A-F]{4}){4}$/.test(licenseState.json?.data?.fingerprint || '')
-        && licenseState.json?.data?.enforced === false,
-      `fp=${licenseState.json?.data?.fingerprint}`
-    );
-    const badLicense = await request('POST', '/api/license/activate', {
-      cookies, csrf, body: { license: JSON.stringify({ id: 'SC-FAKE', fingerprint: 'X', sig: 'bm90LWEtc2ln' }) },
-    });
-    check('a forged activation key is rejected', badLicense.status === 422, `status=${badLicense.status}`);
-
     const key = await request('POST', '/api/auth/api-key', { cookies: shopCookies, csrf: shopCsrf, body: {} });
     const apiKey = key.json?.data?.apiKey || '';
     check('reseller api key issued', key.status === 200 && apiKey.startsWith('sc_'));

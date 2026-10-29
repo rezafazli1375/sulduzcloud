@@ -4,26 +4,24 @@
 
 A bilingual (Persian/English) reseller & config management panel for 3x-ui, with a premium dark UI, per-reseller limits, wallet, tickets, live node status, backups and a reseller REST API.
 
-Version 1.3.0 · Node.js 20+ · SQLite · React 18 · multi-panel
+Version 1.3.1 · Node.js 20+ · SQLite · React 18 · multi-panel
 
 ---
 
 ## نصب خودکار (Quick install)
 
-روی یک سرور تازهٔ Ubuntu/Debian فقط سه قدم:
+یک فرمان روی سرور تازهٔ Ubuntu/Debian:
 
 ```bash
-# ۱) شناسهٔ نصب این سرور را بگیرید و برای فروشنده بفرستید
-curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh | sudo bash -s -- --id
-
-# ۲) فایل کلید امضاشده را در /root/license.json بگذارید
-
-# ۳) نصب کامل با دامنه و گواهی SSL
-curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
-  | sudo bash -s -- --domain panel.example.com --license /root/license.json --ssl-email you@example.com
+curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh | sudo bash -s -- --key sulduz_server
 ```
 
-همین سه فرمان: Node.js 20، nginx، سرویس systemd، بیلد وب‌پنل و بررسی کلید را نصب می‌کند و در پایان `sudo sc` (منوی سرور: دامنه، SSL، رمز ادمین، بکاپ) را آماده می‌گذارد.
+همین یک فرمان Node.js 20، nginx، سرویس systemd و بیلد وب‌پنل را نصب می‌کند و `sudo sc` (منوی سرور: دامنه، SSL، رمز ادمین، بکاپ) را آماده می‌گذارد. دامنه و گواهی را بعداً با `sudo sc` تنظیم کنید، یا همان اول در دستور بیاورید:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
+  | sudo bash -s -- --key sulduz_server --domain panel.example.com --ssl-email you@example.com
+```
 
 ---
 
@@ -72,24 +70,23 @@ curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/inst
 
 - Ubuntu/Debian تازه (یا هر لینوکسی با Node.js 20+ و ابزار ساخت بسته‌های native: `python3`, `make`, `g++`)
 - یک پنل ۳x-ui فعال با API Token
-- کلید فعال‌سازی امضاشده برای همان سرور (کد نصب را از پنل بگیرید و برای دریافت کلید ارسال کنید)
+- کلید نصب: `sulduz_server`
 
 ### نصب با یک فرمان
 
 ```bash
-sudo bash install.sh --domain panel.example.com --license /root/license.json
+sudo bash install.sh --key sulduz_server
 # یا از روی مخزن:
 curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
-  | sudo bash -s -- --domain panel.example.com --license /root/license.json
+  | sudo bash -s -- --key sulduz_server
 ```
 
-اسکریپت خودش Node.js 20، nginx، سرویس systemd، بیلد وب و بررسی کلید فعال‌سازی را انجام می‌دهد. گزینه‌ها:
+اسکریپت خودش Node.js 20، nginx، سرویس systemd و بیلد وب را انجام می‌دهد. گزینه‌ها:
 
 | گزینه | توضیح |
 | --- | --- |
-| `--id` | فقط شناسهٔ نصب این سرور را چاپ می‌کند (برای گرفتن کلید) |
-| `--domain <host>` | نام دامنه عمومی (پیش‌فرض: IP سرور) |
-| `--license <file>` | فایل کلید فعال‌سازی امضاشده (الزامی) |
+| `--key <key>` | کلید نصب `sulduz_server` (الزامی) |
+| `--domain <host>` | نام دامنه عمومی (پیش‌فرض: IP سرور؛ بعداً هم با `sc` قابل تغییر است) |
 | `--ssl-email <email>` | دریافت خودکار گواهی Let's Encrypt با certbot |
 | `--port <port>` | پورت داخلی پنل (پیش‌فرض ۳۱۰۰) |
 | `--no-nginx` | بدون ساخت سایت nginx (پروکسی معکوس خودتان) |
@@ -103,29 +100,15 @@ curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/inst
 
 ```bash
 sudo sc            # منوی تعاملی
-sudo sc status     # وضعیت سرویس، شناسهٔ نصب، لایسنس، اتصال ۳x-ui
+sudo sc status     # وضعیت سرویس، مسیر دیتابیس، اتصال ۳x-ui
 sudo sc accounts   # فهرست حساب‌ها و ساخت رمز تازه برای یک کاربر
 sudo sc domain panel.example.com
 sudo sc ssl        # وضعیت گواهی و صدور/تمدید با certbot
-sudo sc license    # وضعیت لایسنس و فعال‌سازی با فایل کلید
 sudo sc backup     # بکاپ فوری دیتابیس
 sudo sc restart    # فقط ری‌استارت سرویس پنل
 ```
 
 رمزها هش می‌شوند و بازیابی‌شدنی نیستند؛ گزینهٔ «حساب‌ها» یک رمز تازه می‌سازد و همان لحظه نشان می‌دهد. این منو هیچ‌وقت ۳x-ui، اینباندها یا کلاینت‌ها را تغییر نمی‌دهد. اگر سایت nginx یا گواهی در مسیر غیرمعمول باشد، منو آن را از روی پیکربندی nginx خودکار پیدا می‌کند.
-
-### فعال‌سازی آفلاین
-
-هر نصب یک **کد نصب (Installation ID)** یکتا از `machine-id` سرور می‌سازد:
-
-```bash
-cd /opt/sulduzcloud/server
-node scripts/license-cli.js fingerprint   # مثلاً 0010-B7CC-525C-4808-A1D9
-node scripts/license-cli.js status        # وضعیت کلید فعلی
-node scripts/license-cli.js activate key.json
-```
-
-کلید با Ed25519 و کلید خصوصی فروشنده امضا می‌شود و فقط برای همان کد نصب معتبر است؛ بررسی کاملاً آفلاین است. بدون کلید معتبر، API پنل قفل می‌ماند و صفحه فعال‌سازی نمایش داده می‌شود (کلید در `/etc/sulduzcloud/license.json`). ابزار امضا (`server/scripts/sign-license.js`) در مخزن هست اما کلید خصوصی هرگز منتشر نمی‌شود.
 
 ### متغیرهای محیطی
 
@@ -303,30 +286,18 @@ A fresh Ubuntu/Debian box (or any Linux with Node.js 20+, `python3`, `make`, `g+
 ### Install
 
 ```bash
-# 1) print this machine's installation id (send it to the vendor)
-curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh | sudo bash -s -- --id
+curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh | sudo bash -s -- --key sulduz_server
 
-# 2) install once the signed key is in /root/license.json
+# with a domain and a Let's Encrypt certificate up front:
 curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
-  | sudo bash -s -- --domain panel.example.com --license /root/license.json
+  | sudo bash -s -- --key sulduz_server --domain panel.example.com --ssl-email you@example.com
 ```
 
-The installer provisions Node.js 20, nginx, the systemd unit, builds the web panel and validates the activation key. Open the panel afterwards, create the owner account on first run, then connect 3x-ui from **Settings → 3x-ui** or **Servers → Add server**, sync inbounds and set prices.
+The installer provisions Node.js 20, nginx and the systemd unit, and builds the web panel. Open the panel afterwards, create the owner account on first run, then connect 3x-ui from **Settings → 3x-ui** or **Servers → Add server**, sync inbounds and set prices.
 
 ### Server menu
 
-The installer drops `sc` in `/usr/local/bin`. Run it as root: `sudo sc` for the interactive menu, or directly `sc status`, `sc accounts`, `sc domain <host>`, `sc ssl`, `sc license`, `sc backup`, `sc restart`. Passwords are stored as bcrypt hashes, so the menu issues a new one and shows it once. The menu never touches 3x-ui, inbounds or clients.
-
-### Offline activation
-
-```bash
-cd /opt/sulduzcloud/server
-node scripts/license-cli.js fingerprint   # e.g. 0010-B7CC-525C-4808-A1D9
-node scripts/license-cli.js status
-node scripts/license-cli.js activate key.json
-```
-
-Keys are Ed25519-signed for a single installation id and verified locally; without a valid key the API stays locked and the activation screen shows the installation id. The signing tool ships with the repo, the private key never does.
+The installer drops `sc` in `/usr/local/bin`. Run it as root: `sudo sc` for the interactive menu, or directly `sc status`, `sc accounts`, `sc domain <host>`, `sc ssl`, `sc backup`, `sc restart`. Passwords are stored as bcrypt hashes, so the menu issues a new one and shows it once. The menu never touches 3x-ui, inbounds or clients.
 
 Environment variables, the systemd unit and the nginx sample are documented in the Persian section above (same names and values).
 
@@ -340,7 +311,7 @@ Environment variables, the systemd unit and the nginx sample are documented in t
 cd server && npm run selftest
 ```
 
-76 automated checks covering setup, auth, session revocation, CSRF, multi-panel management, config creation and renewal against a mock 3x-ui, wallet charges, quotas, tickets, backups, audit log and API keys, on a temporary database.
+74 automated checks covering setup, auth, session revocation, CSRF, multi-panel management, config creation and renewal against a mock 3x-ui, wallet charges, quotas, tickets, backups, audit log and API keys, on a temporary database.
 
 ### License
 

@@ -10,7 +10,6 @@ const usersService = require('../services/users');
 const ticketsService = require('../services/tickets');
 const notify = require('../notify');
 const monitor = require('../services/monitor');
-const license = require('../license');
 const { ApiError, asyncH, sanitizeUser } = require('../utils');
 const { audit } = require('../audit');
 
@@ -37,30 +36,6 @@ router.get('/health', (req, res) => {
 router.get('/meta', (req, res) => {
   const csrf = auth.ensureCsrfCookie(req, res);
   res.json({ ok: true, data: { ...settings.publicMeta(), csrf } });
-});
-
-// Licence state is public on purpose: the activation screen must be able to
-// show the installation id before anybody logs in.
-router.get('/license', (req, res) => {
-  const state = license.status();
-  res.json({
-    ok: true,
-    data: {
-      valid: state.valid,
-      reason: state.reason,
-      fingerprint: state.fingerprint,
-      license: state.license,
-      enforced: license.enforced(),
-    },
-  });
-});
-
-router.post('/license/activate', auth.requireAuth, (req, res) => {
-  if (req.user.role !== 'admin') throw new ApiError(403, 'forbidden', 'Admin only');
-  const result = license.activate(req.body?.license || req.body?.key || '');
-  if (!result.ok) throw new ApiError(422, result.reason, 'Activation key was rejected');
-  audit(req, 'license.activate', 'license', result.state?.license?.id || '', {});
-  res.json({ ok: true, data: { ...result.state } });
 });
 
 router.get('/setup/status', (req, res) => {
