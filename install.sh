@@ -11,6 +11,7 @@
 #   --ssl-email <email>   obtain a Let's Encrypt certificate with certbot
 #   --no-nginx            skip the nginx site (use your own reverse proxy)
 #   --dir <path>          install directory (default /opt/sulduzcloud)
+#   --id                  only print this machine's installation id and exit
 #
 # The installer never touches x-ui; connect the panel to x-ui from the admin UI
 # after the first login.
@@ -26,10 +27,27 @@ DOMAIN=""
 LICENSE_FILE=""
 SSL_EMAIL=""
 USE_NGINX="1"
+SHOW_ID="0"
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Same algorithm as server/src/license.js: sha256("sulduzcloud|" + machine-id),
+# first 20 hex, uppercase, in groups of four.
+installation_id() {
+  local mid=""
+  if [ -s /etc/machine-id ]; then
+    mid="$(tr -d '[:space:]' < /etc/machine-id)"
+  elif [ -s /var/lib/dbus/machine-id ]; then
+    mid="$(tr -d '[:space:]' < /var/lib/dbus/machine-id)"
+  else
+    mid="$(hostname)"
+  fi
+  local hex
+  hex="$(printf 'sulduzcloud|%s' "$mid" | sha256sum | cut -c1-20 | tr 'abcdef' 'ABCDEF')"
+  printf '%s' "$hex" | sed -E 's/(.{4})/\1-/g; s/-$//'
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -39,13 +57,27 @@ while [ $# -gt 0 ]; do
     --ssl-email) SSL_EMAIL="${2:-}"; shift 2 ;;
     --no-nginx) USE_NGINX="0"; shift ;;
     --dir) APP_DIR="${2:-}"; shift 2 ;;
+    --id) SHOW_ID="1"; shift ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
 
 [ "$(id -u)" = "0" ] || die "run as root (sudo bash install.sh ...)"
-[ -n "$LICENSE_FILE" ] || die "--license is required: send this machine's installation id to the vendor (see docs/INSTALL.md)"
+
+INSTALL_ID="$(installation_id)"
+if [ "$SHOW_ID" = "1" ]; then
+  printf '%s\n' "$INSTALL_ID"
+  exit 0
+fi
+
+if [ -z "$LICENSE_FILE" ]; then
+  warn "No activation key given (--license)."
+  printf '\n  Installation id of this machine:\n\n    \033[1m%s\033[0m\n\n' "$INSTALL_ID"
+  printf '  Send this id to the vendor and ask for a signed key, then run:\n\n'
+  printf '    sudo bash install.sh --domain <your-domain> --license /root/license.json\n\n'
+  exit 1
+fi
 [ -f "$LICENSE_FILE" ] || die "license file not found: $LICENSE_FILE"
 
 log "Installing system packages"

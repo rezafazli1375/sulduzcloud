@@ -8,6 +8,25 @@ Version 1.3.0 · Node.js 20+ · SQLite · React 18 · multi-panel
 
 ---
 
+## نصب خودکار (Quick install)
+
+روی یک سرور تازهٔ Ubuntu/Debian فقط سه قدم:
+
+```bash
+# ۱) شناسهٔ نصب این سرور را بگیرید و برای فروشنده بفرستید
+curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh | sudo bash -s -- --id
+
+# ۲) فایل کلید امضاشده را در /root/license.json بگذارید
+
+# ۳) نصب کامل با دامنه و گواهی SSL
+curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
+  | sudo bash -s -- --domain panel.example.com --license /root/license.json --ssl-email you@example.com
+```
+
+همین سه فرمان: Node.js 20، nginx، سرویس systemd، بیلد وب‌پنل و بررسی کلید را نصب می‌کند و در پایان `sudo sc` (منوی سرور: دامنه، SSL، رمز ادمین، بکاپ) را آماده می‌گذارد.
+
+---
+
 ## فارسی
 
 ### این پروژه چه می‌کند؟
@@ -68,6 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/inst
 
 | گزینه | توضیح |
 | --- | --- |
+| `--id` | فقط شناسهٔ نصب این سرور را چاپ می‌کند (برای گرفتن کلید) |
 | `--domain <host>` | نام دامنه عمومی (پیش‌فرض: IP سرور) |
 | `--license <file>` | فایل کلید فعال‌سازی امضاشده (الزامی) |
 | `--ssl-email <email>` | دریافت خودکار گواهی Let's Encrypt با certbot |
@@ -283,8 +303,10 @@ A fresh Ubuntu/Debian box (or any Linux with Node.js 20+, `python3`, `make`, `g+
 ### Install
 
 ```bash
-sudo bash install.sh --domain panel.example.com --license /root/license.json
-# or straight from the repository:
+# 1) print this machine's installation id (send it to the vendor)
+curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh | sudo bash -s -- --id
+
+# 2) install once the signed key is in /root/license.json
 curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
   | sudo bash -s -- --domain panel.example.com --license /root/license.json
 ```
