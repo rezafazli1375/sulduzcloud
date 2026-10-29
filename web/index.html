@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#070c17" />
+    <title>Sulduz Cloud — پنل مدیریت نمایندگی</title>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('sc-theme');
+          if (t !== 'light' && t !== 'dark') t = 'dark';
+          document.documentElement.setAttribute('data-theme', t);
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
+    <link rel="preload" href="/fonts/Vazirmatn.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%2310b981'/%3E%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23g)' d='M32 4 56 18v28L32 60 8 46V18z'/%3E%3Cpath fill='%23070c17' d='M32 15 46 23v18l-14 8-14-8V23z'/%3E%3Cpath fill='url(%23g)' d='M32 24l8 5v10l-8 5-8-5V29z'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

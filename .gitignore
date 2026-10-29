@@ -1,0 +1,44 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+web/dist/
+server/dist/
+
+# runtime data & secrets
+server/.env
+server/data/
+server/backups/
+data/
+backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+runtime-secrets.json
+*.pem
+*.key
+
+# logs
+*.log
+npm-debug.log*
+
+# local review tooling & screenshots (not part of the product)
+_review/
+.creds
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+_keys/
+*.pem
+!web/public/*.pem
+
+# vendor reports and signing material
+report-*.md
+_keys/

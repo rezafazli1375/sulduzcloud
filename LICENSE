@@ -1,0 +1,47 @@
+Sulduz Cloud — Commercial License
+Copyright (c) 2026 Sulduz Cloud. All rights reserved.
+
+This software and its source code, documentation, design assets and database
+schema (the "Software") are proprietary and are licensed, not sold.
+
+1. GRANT OF LICENSE
+   Upon purchase, the buyer receives a non-exclusive, non-transferable license
+   to install and use one (1) production instance of the Software on servers
+   owned or controlled by the buyer, for the buyer's own business (including
+   selling VPN/config services to the buyer's own customers).
+
+2. RESTRICTIONS
+   You may NOT:
+   a) copy, publish, distribute, sublicense, rent, lease or sell the Software
+      or any derivative of it, in whole or in part;
+   b) publish the source code in any public repository or marketplace;
+   c) remove or alter copyright, license or attribution notices;
+   d) use the Software to operate a service that resells the Software itself;
+   e) claim authorship of the Software.
+
+3. MODIFICATIONS
+   The buyer may modify the source code for internal use on the licensed
+   instance. Modified versions remain subject to this license and may not be
+   redistributed.
+
+4. THIRD-PARTY COMPONENTS
+   The Software depends on open-source packages (Node.js, Express, React,
+   Vite, Tailwind CSS, better-sqlite3, recharts, lucide-react, etc.) that are
+   distributed under their own licenses. Those licenses continue to apply.
+
+5. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. THE AUTHOR IS NOT
+   LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE USE OF
+   THE SOFTWARE, INCLUDING DATA LOSS, SERVICE INTERRUPTION OR REVENUE LOSS.
+
+6. SUPPORT
+   Installation assistance, updates and support are provided only if agreed
+   separately in writing.
+
+7. TERMINATION
+   Any breach of this license terminates the grant immediately. On
+   termination you must stop using the Software and delete all copies.
+
+For licensing and purchase inquiries contact the author.
