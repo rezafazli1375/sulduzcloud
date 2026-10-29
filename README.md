@@ -4,7 +4,7 @@
 
 A bilingual (Persian/English) reseller & config management panel for 3x-ui, with a premium dark UI, per-reseller limits, wallet, tickets, live node status, backups and a reseller REST API.
 
-Version 1.3.2 · Node.js 20+ · SQLite · React 18 · multi-panel
+Version 1.3.3 · Node.js 20+ · SQLite · React 18 · multi-panel
 
 ---
 
@@ -91,6 +91,8 @@ curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/inst
 | `--port <port>` | پورت داخلی پنل (پیش‌فرض ۳۱۰۰) |
 | `--no-nginx` | بدون ساخت سایت nginx (پروکسی معکوس خودتان) |
 | `--dir <path>` | مسیر نصب (پیش‌فرض `/opt/sulduzcloud`) |
+
+اجرای مجدد همین فرمان روی یک نصب موجود، امن است: فایل `server/.env` (شامل `PUBLIC_URL`، `XUI_URL`، `PANEL_TZ`)، دیتابیس و سایت nginx فعلی حفظ می‌شوند و فقط کد و بیلد وب به‌روز می‌شوند.
 
 پس از نصب، پنل را باز کنید؛ بار اول حساب مدیر ساخته می‌شود. سپس از **تنظیمات → اتصال ۳x-ui** یا صفحه **سرورها → افزودن سرور** آدرس و توکن پنل ۳x-ui را وارد کنید، اینباندها را همگام کنید و تعرفه بگذارید.
 

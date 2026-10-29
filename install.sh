@@ -26,6 +26,7 @@ APP_DIR="/opt/sulduzcloud"
 DATA_DIR_="/var/lib/sulduzcloud"
 PORT="3100"
 DOMAIN=""
+DOMAIN_SET="0"
 SSL_EMAIL=""
 USE_NGINX="1"
 
@@ -41,7 +42,7 @@ die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --domain) DOMAIN="${2:-}"; shift 2 ;;
+    --domain) DOMAIN="${2:-}"; DOMAIN_SET="1"; shift 2 ;;
     --key) PROVIDED_KEY="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
     --ssl-email) SSL_EMAIL="${2:-}"; shift 2 ;;
@@ -88,6 +89,7 @@ else
 fi
 
 mkdir -p "$APP_DIR" "$DATA_DIR_" /etc/sulduzcloud
+chmod 750 "$DATA_DIR_" 2>/dev/null || true
 if ! id -u sulduz >/dev/null 2>&1; then
   log "Creating the service user"
   useradd --system --home-dir "$DATA_DIR_" --shell /usr/sbin/nologin sulduz
@@ -95,6 +97,15 @@ fi
 if systemctl list-unit-files | grep -q '^sulduzcloud.service'; then
   log "Stopping the running service"
   systemctl stop sulduzcloud || true
+fi
+
+# Re-running the installer on a live panel must not lose its configuration
+# (PUBLIC_URL, XUI_URL, PANEL_TZ, ...): keep server/.env across the file copy.
+ENV_BACKUP=""
+if [ -f "$APP_DIR/server/.env" ]; then
+  ENV_BACKUP="$(mktemp)"
+  cp -a "$APP_DIR/server/.env" "$ENV_BACKUP"
+  log "Keeping the existing $APP_DIR/server/.env"
 fi
 
 log "Copying files to $APP_DIR"
@@ -118,6 +129,10 @@ if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install 
 npx vite build
 
 # ------------------------------------------------------------------ env + unit
+if [ -n "$ENV_BACKUP" ]; then
+  cp -a "$ENV_BACKUP" "$APP_DIR/server/.env"
+  rm -f "$ENV_BACKUP"
+fi
 if [ -z "$DOMAIN" ]; then
   DOMAIN="$(hostname -I | awk '{print $1}')"
   warn "No --domain given, using $DOMAIN (no HTTPS will be configured)"
@@ -131,14 +146,22 @@ DATA_DIR=$DATA_DIR_
 BACKUP_DIR=$DATA_DIR_/backups
 PUBLIC_URL=http://$DOMAIN
 EOF
-  chmod 600 "$APP_DIR/server/.env"
+elif [ "$DOMAIN_SET" = "1" ]; then
+  # An explicit --domain wins, but keep HTTPS if a certificate already exists.
+  scheme="http"
+  [ -f "/etc/letsencrypt/live/$DOMAIN/cert.pem" ] && scheme="https"
+  sed -i "s#^PUBLIC_URL=.*#PUBLIC_URL=$scheme://$DOMAIN#" "$APP_DIR/server/.env" || true
+  log "PUBLIC_URL set to $scheme://$DOMAIN"
 else
-  sed -i "s#^PUBLIC_URL=.*#PUBLIC_URL=http://$DOMAIN#" "$APP_DIR/server/.env" || true
+  log "Keeping PUBLIC_URL from the existing .env"
 fi
+chmod 600 "$APP_DIR/server/.env" 2>/dev/null || true
 mkdir -p "$DATA_DIR_/backups"
 chown -R sulduz:sulduz "$DATA_DIR_"
 chown -R root:root "$APP_DIR"
 chmod -R a+rX "$APP_DIR"
+# a+rX above would expose the env file; restore the restricted mode.
+[ -f "$APP_DIR/server/.env" ] && chmod 600 "$APP_DIR/server/.env"
 
 log "Writing the systemd unit"
 cat > /etc/systemd/system/sulduzcloud.service <<EOF
@@ -184,8 +207,21 @@ fi
 
 # ------------------------------------------------------------------ nginx
 if [ "$USE_NGINX" = "1" ]; then
-  log "Configuring nginx for $DOMAIN"
-  cat > /etc/nginx/sites-available/sulduzcloud <<EOF
+  # A live panel may already be served by a customized site (HTTPS, hand-managed
+  # certificate, static root): only write a site when nothing proxies to the port.
+  EXISTING_SITE=""
+  for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+    [ -e "$f" ] || continue
+    if grep -q "127.0.0.1:${PORT}\b" "$f" 2>/dev/null; then EXISTING_SITE="$f"; break; fi
+  done
+
+  if [ -n "$EXISTING_SITE" ]; then
+    log "nginx already serves the panel from $EXISTING_SITE; leaving it untouched"
+    rm -f /etc/nginx/sites-enabled/default
+    nginx -t && systemctl reload nginx
+  else
+    log "Configuring nginx for $DOMAIN"
+    cat > /etc/nginx/sites-available/sulduzcloud <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -203,9 +239,10 @@ server {
     }
 }
 EOF
-  ln -sf /etc/nginx/sites-available/sulduzcloud /etc/nginx/sites-enabled/sulduzcloud
-  rm -f /etc/nginx/sites-enabled/default
-  nginx -t && systemctl reload nginx
+    ln -sf /etc/nginx/sites-available/sulduzcloud /etc/nginx/sites-enabled/sulduzcloud
+    rm -f /etc/nginx/sites-enabled/default
+    nginx -t && systemctl reload nginx
+  fi
 
   if [ -n "$SSL_EMAIL" ]; then
     log "Requesting a Let's Encrypt certificate"
