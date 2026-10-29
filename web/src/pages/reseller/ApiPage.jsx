@@ -47,7 +47,7 @@ export default function ApiPage() {
   const confirm = useConfirm();
   const [tab, setTab] = useState('create');
 
-  const base = typeof window !== 'undefined' ? `${window.location.origin}/api/v1` : 'https://sulduzcloud.ir/api/v1';
+  const base = `${window.location.origin}/api/v1`;
   const key = user?.apiKey || '';
   const placeholder = key || 'sc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
 

@@ -128,7 +128,7 @@ function Hero({ meta }) {
           </div>
         </div>
         <p className="mt-4 text-[10px] text-slate-600">
-          {meta?.website || 'sulduzcloud.ir'} · {t('app.footer')}
+          {meta?.website || 'Sulduz Cloud'} · {t('app.footer')}
         </p>
       </div>
     </aside>

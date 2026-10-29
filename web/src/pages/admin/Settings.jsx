@@ -251,8 +251,8 @@ export default function Settings() {
           )}
         >
           <div className="space-y-4">
-            <Field label={t('settings.xui.url')} hint="https://127.0.0.1:1220/panel-path" required>
-              <Input dir="ltr" value={xui.url || ''} onChange={(e) => patch('xui', 'url', e.target.value)} placeholder="https://127.0.0.1:1220/panel-path" />
+            <Field label={t('settings.xui.url')} hint="https://127.0.0.1:2053/panel-path" required>
+              <Input dir="ltr" value={xui.url || ''} onChange={(e) => patch('xui', 'url', e.target.value)} placeholder="https://127.0.0.1:2053/panel-path" />
             </Field>
             <Field
               label={t('settings.xui.token')}

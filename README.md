@@ -77,6 +77,23 @@ curl -fsSL https://raw.githubusercontent.com/REPO_SLUG/main/install.sh \
 
 پس از نصب، پنل را باز کنید؛ بار اول حساب مدیر ساخته می‌شود. سپس از **تنظیمات → اتصال ۳x-ui** یا صفحه **سرورها → افزودن سرور** آدرس و توکن پنل ۳x-ui را وارد کنید، اینباندها را همگام کنید و تعرفه بگذارید.
 
+### منوی سرور (SSH)
+
+اسکریپت نصب فرمان `sc` را در `/usr/local/bin/sc` می‌گذارد. با root اجرا کنید:
+
+```bash
+sudo sc            # منوی تعاملی
+sudo sc status     # وضعیت سرویس، شناسهٔ نصب، لایسنس، اتصال ۳x-ui
+sudo sc accounts   # فهرست حساب‌ها و ساخت رمز تازه برای یک کاربر
+sudo sc domain panel.example.com
+sudo sc ssl        # وضعیت گواهی و صدور/تمدید با certbot
+sudo sc license    # وضعیت لایسنس و فعال‌سازی با فایل کلید
+sudo sc backup     # بکاپ فوری دیتابیس
+sudo sc restart    # فقط ری‌استارت سرویس پنل
+```
+
+رمزها هش می‌شوند و بازیابی‌شدنی نیستند؛ گزینهٔ «حساب‌ها» یک رمز تازه می‌سازد و همان لحظه نشان می‌دهد. این منو هیچ‌وقت ۳x-ui، اینباندها یا کلاینت‌ها را تغییر نمی‌دهد. اگر سایت nginx یا گواهی در مسیر غیرمعمول باشد، منو آن را از روی پیکربندی nginx خودکار پیدا می‌کند.
+
 ### فعال‌سازی آفلاین
 
 هر نصب یک **کد نصب (Installation ID)** یکتا از `machine-id` سرور می‌سازد:
@@ -96,7 +113,7 @@ node scripts/license-cli.js activate key.json
 | --- | --- | --- |
 | `NODE_ENV` | `production` | حالت اجرا |
 | `HOST` / `PORT` | `127.0.0.1` / `3100` | آدرس شنود بک‌اند (پشت nginx) |
-| `PUBLIC_URL` | `https://sulduzcloud.ir` | آدرس عمومی پنل؛ برای کوکی امن و لینک‌ها |
+| `PUBLIC_URL` | خالی | آدرس عمومی پنل؛ برای کوکی امن و لینک‌ها (اسکریپت نصب پر می‌کند) |
 | `PANEL_TZ` | `Asia/Tehran` | منطقه زمانی گزارش‌ها و بکاپ خودکار |
 | `DATA_DIR` | `server/data` | دیتابیس و فایل‌های زمان اجرا |
 | `BACKUP_DIR` | `server/backups` | محل بکاپ‌ها |
@@ -273,6 +290,10 @@ curl -fsSL https://raw.githubusercontent.com/REPO_SLUG/main/install.sh \
 ```
 
 The installer provisions Node.js 20, nginx, the systemd unit, builds the web panel and validates the activation key. Open the panel afterwards, create the owner account on first run, then connect 3x-ui from **Settings → 3x-ui** or **Servers → Add server**, sync inbounds and set prices.
+
+### Server menu
+
+The installer drops `sc` in `/usr/local/bin`. Run it as root: `sudo sc` for the interactive menu, or directly `sc status`, `sc accounts`, `sc domain <host>`, `sc ssl`, `sc license`, `sc backup`, `sc restart`. Passwords are stored as bcrypt hashes, so the menu issues a new one and shows it once. The menu never touches 3x-ui, inbounds or clients.
 
 ### Offline activation
 

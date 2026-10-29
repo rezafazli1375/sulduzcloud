@@ -69,7 +69,9 @@ function loadRuntimeSecrets() {
 
 const runtimeSecrets = loadRuntimeSecrets();
 
-const publicUrl = (process.env.PUBLIC_URL || 'https://sulduzcloud.ir').replace(/\/+$/, '');
+// Written by install.sh / the SSH menu. Empty means "unknown": cookies stay
+// non-secure until a public HTTPS address is configured.
+const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
 
 const config = {
   root: ROOT,

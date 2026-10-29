@@ -90,6 +90,7 @@ log "Copying files to $APP_DIR"
 if [ "$(cd "$SRC_DIR" && pwd)" != "$(cd "$APP_DIR" && pwd)" ]; then
   find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.env' -exec rm -rf {} +
   cp -a "$SRC_DIR/server" "$SRC_DIR/web" "$APP_DIR/"
+  [ -f "$SRC_DIR/menu.sh" ] && cp -a "$SRC_DIR/menu.sh" "$APP_DIR/menu.sh"
 else
   warn "Installing from $APP_DIR itself; files are left in place"
 fi
@@ -178,6 +179,13 @@ sleep 2
 curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null || die "the service did not start; check: journalctl -u sulduzcloud -n 50"
 log "Panel service is running on 127.0.0.1:$PORT"
 
+# ------------------------------------------------------------------ server menu
+if [ -f "$APP_DIR/menu.sh" ]; then
+  log "Installing the server menu (sc)"
+  install -m 755 "$APP_DIR/menu.sh" /usr/local/bin/sc
+  ln -sf /usr/local/bin/sc /usr/local/bin/sulduzcloud-menu
+fi
+
 # ------------------------------------------------------------------ nginx
 if [ "$USE_NGINX" = "1" ]; then
   log "Configuring nginx for $DOMAIN"
@@ -218,6 +226,7 @@ $(printf '\033[1;32m')Sulduz Cloud is installed.$(printf '\033[0m')
 
   Panel:            http://$DOMAIN
   First-run setup:  open the panel and create the owner account
+  Server menu:      sc          (status, domain, SSL, accounts, backups)
   Service:          systemctl status sulduzcloud
   Logs:             journalctl -u sulduzcloud -f
   Data:             $DATA_DIR_ (back it up!)

@@ -355,15 +355,22 @@ function SidebarFooter() {
           </div>
         </div>
       ) : null}
-      <a
-        href={meta?.supportUrl || 'https://t.me/sulduzserver'}
-        target="_blank"
-        rel="noreferrer"
-        className="flex items-center gap-2 rounded-lg px-1 py-1 text-[10.5px] text-slate-600 transition hover:text-slate-300"
-      >
-        <HelpCircle className="h-3.5 w-3.5" />
-        {t('app.footer')}
-      </a>
+      {meta?.supportUrl ? (
+        <a
+          href={meta.supportUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-2 rounded-lg px-1 py-1 text-[10.5px] text-slate-600 transition hover:text-slate-300"
+        >
+          <HelpCircle className="h-3.5 w-3.5" />
+          {t('app.footer')}
+        </a>
+      ) : (
+        <p className="flex items-center gap-2 px-1 py-1 text-[10.5px] text-slate-600">
+          <HelpCircle className="h-3.5 w-3.5" />
+          {t('app.footer')}
+        </p>
+      )}
     </div>
   );
 }
