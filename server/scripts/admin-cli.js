@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 
-// Operator CLI (root or the sulduz user). Used by the SSH menu (`sc`) to show
-// accounts and to reset a password without opening the web UI.
+// Operator CLI (root or the sulduz user). Used by the SSH menu (`sulduzcloud` /
+// `sc`) to show accounts and to reset a password without opening the web UI.
 //
 //   npm run admin -- list
+//   npm run admin -- admins
 //   npm run admin -- info <username>
 //   npm run admin -- reset <username> [--password VALUE]
 //
 // Passwords are stored as bcrypt hashes, so the original password can never be
-// printed. `reset` generates a fresh one and prints it once.
+// printed. `reset` generates a fresh one and prints it once; the menu stores that
+// value in /etc/sulduzcloud/admin.cred (mode 600, root only) so it can be shown.
 
 const crypto = require('crypto');
 const config = require('../src/config');
@@ -62,6 +64,17 @@ function cmdList() {
   console.log(`\n${rows.length} account(s), ${owners} admin. Database: ${config.dbPath}`);
 }
 
+function cmdAdmins() {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT username, status, created_at FROM users WHERE deleted_at = 0 AND role = 'admin' ORDER BY id")
+    .all();
+  for (const row of rows) {
+    const status = row.status === 'active' ? 'فعال' : row.status;
+    console.log(`${row.username}   ${status}   ${String(row.created_at || '').slice(0, 10)}`);
+  }
+}
+
 function cmdInfo(username) {
   const user = users.getUserByUsername(username);
   if (!user) {
@@ -99,12 +112,14 @@ function main() {
   const [command, target] = _;
   try {
     if (command === 'list') cmdList();
+    else if (command === 'admins') cmdAdmins();
     else if (command === 'info' && target) cmdInfo(target);
     else if (command === 'reset' && target) {
       cmdReset(target, typeof flags.password === 'string' ? flags.password : '');
     } else {
       console.log('Usage:');
       console.log('  admin-cli.js list');
+      console.log('  admin-cli.js admins');
       console.log('  admin-cli.js info <username>');
       console.log('  admin-cli.js reset <username> [--password VALUE]');
       process.exitCode = command ? 2 : 0;

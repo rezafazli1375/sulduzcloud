@@ -2,7 +2,11 @@
 # Sulduz Cloud — one-command installer for a fresh Ubuntu/Debian server.
 #
 #   curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
-#     | sudo bash -s -- --key sulduz_server
+#     | sudo bash -s -- --key "<installation key>"
+#
+# The installation key is private. This file only stores its SHA-256 hash, so the
+# key cannot be read from the repository: without the exact key nothing installs.
+# Get the key from the project owner.
 #
 # Options:
 #   --key <key>           installation key (required)
@@ -25,8 +29,10 @@ DOMAIN=""
 SSL_EMAIL=""
 USE_NGINX="1"
 
-# Fixed installation key. Builds of this project only install when it matches.
-INSTALL_KEY="sulduz_server"
+# SHA-256 of the private installation key. The key itself is NOT stored here (and
+# must never be committed): the owner hands it out together with the install
+# command, so a leaked or rotated key is simply a new hash below.
+INSTALL_KEY_SHA256="7eb7decb0a915f8f81b016ac0f068759eeacf393e31df838034b4ede0eaca375"
 PROVIDED_KEY=""
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -49,7 +55,9 @@ done
 [ "$(id -u)" = "0" ] || die "run as root (sudo bash install.sh ...)"
 
 [ -n "$PROVIDED_KEY" ] || die "installation key required: pass --key <key>"
-[ "$PROVIDED_KEY" = "$INSTALL_KEY" ] || die "wrong installation key"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found (coreutils missing)"
+PROVIDED_KEY_HASH="$(printf '%s' "$PROVIDED_KEY" | sha256sum | awk '{print $1}')"
+[ "$PROVIDED_KEY_HASH" = "$INSTALL_KEY_SHA256" ] || die "wrong installation key"
 
 log "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -168,9 +176,10 @@ log "Panel service is running on 127.0.0.1:$PORT"
 
 # ------------------------------------------------------------------ server menu
 if [ -f "$APP_DIR/menu.sh" ]; then
-  log "Installing the server menu (sc)"
-  install -m 755 "$APP_DIR/menu.sh" /usr/local/bin/sc
-  ln -sf /usr/local/bin/sc /usr/local/bin/sulduzcloud-menu
+  log "Installing the server menu (sulduzcloud / sc)"
+  install -m 755 "$APP_DIR/menu.sh" /usr/local/bin/sulduzcloud
+  ln -sf /usr/local/bin/sulduzcloud /usr/local/bin/sc
+  ln -sf /usr/local/bin/sulduzcloud /usr/local/bin/sulduzcloud-menu
 fi
 
 # ------------------------------------------------------------------ nginx
@@ -213,7 +222,7 @@ $(printf '\033[1;32m')Sulduz Cloud is installed.$(printf '\033[0m')
 
   Panel:            http://$DOMAIN
   First-run setup:  open the panel and create the owner account
-  Server menu:      sc          (status, domain, SSL, accounts, backups)
+  Server menu:      sulduzcloud      (or: sc)  -> accounts, domain, SSL, backups
   Service:          systemctl status sulduzcloud
   Logs:             journalctl -u sulduzcloud -f
   Data:             $DATA_DIR_ (back it up!)

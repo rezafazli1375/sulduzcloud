@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Sulduz Cloud — server menu.
-# Installed as /usr/local/bin/sc by install.sh. Run as root: `sudo sc`
+# Installed by install.sh as /usr/local/bin/sulduzcloud (shortcut: sc).
+# Run as root: `sudo sulduzcloud`
 #
 # Read-only where possible: it never touches x-ui, inbounds or clients.
 set -uo pipefail
@@ -9,6 +10,7 @@ APP_DIR="${SC_APP_DIR:-/opt/sulduzcloud}"
 ENV_FILE="$APP_DIR/server/.env"
 NGINX_SITE="/etc/nginx/sites-available/sulduzcloud"
 MENU_ENV="/etc/sulduzcloud/menu.env"
+CRED_FILE="/etc/sulduzcloud/admin.cred"
 SERVICE="sulduzcloud"
 
 c_r=$'\033[0m'; c_b=$'\033[1m'; c_g=$'\033[32m'; c_y=$'\033[33m'; c_red=$'\033[31m'; c_c=$'\033[36m'
@@ -138,29 +140,96 @@ page_status() {
   xui_state
 }
 
-page_accounts() {
-  head1 "حساب‌ها"
-  if ! as_sulduz node "$APP_DIR/server/scripts/admin-cli.js" list; then
-    err "اجرای admin-cli ناموفق بود."
-    pause; return
+admin_list() { as_sulduz node "$APP_DIR/server/scripts/admin-cli.js" admins 2>/dev/null; }
+
+cred_get() { # KEY -> value
+  [ -f "$CRED_FILE" ] || return 0
+  awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$CRED_FILE"
+}
+
+cred_save() { # username password
+  mkdir -p "$(dirname "$CRED_FILE")"
+  ( umask 077
+    printf 'ADMIN_USER=%s\nADMIN_PASS=%s\nADMIN_SET=%s\n' "$1" "$2" "$(date '+%Y-%m-%d %H:%M')" > "$CRED_FILE"
+  )
+  chmod 600 "$CRED_FILE"
+}
+
+show_credentials() {
+  head1 "نام کاربری و رمز عبور مدیر"
+  local admins; admins="$(admin_list)"
+  if [ -z "$admins" ]; then
+    warn "هنوز هیچ حساب ادمینی ساخته نشده است."
+    say "  پنل را در مرورگر باز کنید و در صفحهٔ اول حساب مالک را بسازید."
+    return
   fi
+  say "  نام کاربری مدیر:"
+  printf '%s\n' "$admins" | while IFS= read -r line; do [ -n "$line" ] && say "    $line"; done
+  if [ -f "$CRED_FILE" ]; then
+    local u p t
+    u="$(cred_get ADMIN_USER)"; p="$(cred_get ADMIN_PASS)"; t="$(cred_get ADMIN_SET)"
+    say ""
+    ok "  رمز عبور: $p"
+    say "  کاربر: $u    |    آخرین تنظیم از همین منو: $t"
+    warn "  اگر رمز را از داخل پنل وب عوض کرده‌اید این مقدار قدیمی است؛ گزینهٔ ۲ را بزنید."
+  else
+    say ""
+    warn "  رمز عبور: قابل نمایش نیست."
+    say "  رمزها به‌صورت هش ذخیره می‌شوند و بازیابی ندارند. با گزینهٔ ۲ یک رمز تازه بسازید"
+    say "  (همان لحظه نمایش داده و در همین سرور ذخیره می‌شود)."
+  fi
+}
+
+set_admin_password() { # username [password]
+  local u="$1" pw="${2:-}" out
+  if [ -n "$pw" ]; then
+    as_sulduz node "$APP_DIR/server/scripts/admin-cli.js" reset "$u" --password "$pw" >/dev/null \
+      || { err "تغییر رمز ناموفق بود."; return 1; }
+  else
+    out="$(as_sulduz node "$APP_DIR/server/scripts/admin-cli.js" reset "$u")" \
+      || { err "تغییر رمز ناموفق بود."; return 1; }
+    pw="$(printf '%s\n' "$out" | sed -n 's/^  New password: //p')"
+  fi
+  [ -n "$pw" ] || { err "رمز تازه ساخته نشد."; return 1; }
+  cred_save "$u" "$pw"
   say ""
-  say "رمزها به‌صورت هش ذخیره می‌شوند و بازیابی‌شدنی نیستند؛ می‌توانید رمز تازه بسازید"
-  say "و همان لحظه روی صفحه ببینید."
-  printf '\nنام کاربری برای تغییر رمز (خالی = انصراف): '
-  local target; read -r target || true
-  [ -z "${target:-}" ] && return
-  printf 'رمز خودکار ساخته شود؟ [Y/n]: '
-  local auto; read -r auto || true
+  ok "  کاربر: $u"
+  ok "  رمز جدید: $pw"
+  warn "  این رمز در $CRED_FILE ذخیره شد (فقط root می‌تواند بخواند) و از این منو نمایش‌دادنی است."
+}
+
+change_admin_password() {
+  local first target pw auto
+  first="$(admin_list | awk 'NF { print $1; exit }')"
+  [ -n "$first" ] || { err "حساب ادمینی وجود ندارد؛ اول در پنل وب حساب مالک را بسازید."; return 1; }
+  printf 'نام کاربری (خالی = %s): ' "$first"
+  read -r target || true
+  target="${target:-$first}"
+  printf 'رمز به‌صورت خودکار ساخته شود؟ [Y/n]: '
+  read -r auto || true
   if [[ "${auto:-Y}" =~ ^[Nn]$ ]]; then
     printf 'رمز جدید (حداقل ۸ کاراکتر): '
-    local pw; read -rs pw || true; printf '\n'
-    [ ${#pw} -lt 8 ] && { err "کوتاه است."; pause; return; }
-    as_sulduz node "$APP_DIR/server/scripts/admin-cli.js" reset "$target" --password "$pw"
+    read -rs pw || true; printf '\n'
+    [ ${#pw} -ge 8 ] || { err "کوتاه است."; return 1; }
+    set_admin_password "$target" "$pw"
   else
-    as_sulduz node "$APP_DIR/server/scripts/admin-cli.js" reset "$target"
+    set_admin_password "$target"
   fi
-  pause
+}
+
+page_accounts() {
+  show_credentials
+  say ""
+  say "  1) نمایش دوباره"
+  say "  2) تغییر رمز عبور مدیر"
+  say "  0) بازگشت"
+  printf 'انتخاب: '
+  local ch; read -r ch || true
+  case "${ch:-}" in
+    1) show_credentials ;;
+    2) change_admin_password; pause ;;
+    *) : ;;
+  esac
 }
 
 page_domain() {
@@ -315,7 +384,7 @@ draw_menu() {
   say "  پنل: $(public_url || echo 'تنظیم نشده')   |   نسخهٔ health: $(health | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
   say "  ------------------------------------------------------------"
   say "  1) وضعیت سرویس و اتصال ۳x-ui"
-  say "  2) حساب‌ها، نمایش کاربران و تغییر رمز"
+  say "  2) نام کاربری و رمز مدیر (نمایش / تغییر)"
   say "  3) تنظیم دامنه پنل"
   say "  4) گواهی SSL (صدور/تمدید)"
   say "  5) بکاپ فوری دیتابیس"
@@ -364,7 +433,7 @@ main() {
     restart) page_restart ;;
     logs) page_logs ;;
     ""|-m|menu) main_menu ;;
-    *) say "استفاده: sc [status|accounts|domain <host>|ssl <host>|backup|restart|logs]" ;;
+    *) say "استفاده: sulduzcloud [status|accounts|domain <host>|ssl <host>|backup|restart|logs]" ;;
   esac
 }
 
