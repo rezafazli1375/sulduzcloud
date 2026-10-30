@@ -313,7 +313,7 @@ Environment variables, the systemd unit and the nginx sample are documented in t
 cd server && npm run selftest
 ```
 
-74 automated checks covering setup, auth, session revocation, CSRF, multi-panel management, config creation and renewal against a mock 3x-ui, wallet charges, quotas, tickets, backups, audit log and API keys, on a temporary database.
+77 automated checks covering setup, auth, session revocation, CSRF, multi-panel management, config creation and renewal against a mock 3x-ui, wallet charges, quotas, tickets, backups, audit log and API keys, on a temporary database.
 
 ### License
 

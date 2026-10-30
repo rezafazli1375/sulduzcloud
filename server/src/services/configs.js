@@ -106,7 +106,7 @@ function slug(value) {
     .slice(0, 18);
 }
 
-// Client names follow "<reseller>-<5 random digits>", e.g. rezafazli-85743.
+// Client names follow "<reseller>-<5 random digits>", e.g. shop-85743.
 // The numeric suffix keeps the x-ui email readable while staying unique.
 function emailFor(user) {
   const base = slug(user?.username) || `r${Number(user?.id) || 0}`;
