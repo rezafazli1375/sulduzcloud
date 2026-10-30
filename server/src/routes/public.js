@@ -192,9 +192,26 @@ router.get('/sub/:token', asyncH(async (req, res) => {
   ).all(token);
   if (!rows.length) throw new ApiError(404, 'not_found', 'Subscription not found');
 
+  // The package is one shared pool: every member row carries the same limit,
+  // usage is summed across inbounds and the latest expiry wins. Client apps
+  // read these numbers from the `subscription-userinfo` header.
+  const quota = rows.reduce((max, row) => Math.max(max, Number(row.total_bytes || 0)), 0);
+  const upload = rows.reduce((sum, row) => sum + Number(row.up_bytes || 0), 0);
+  const download = rows.reduce((sum, row) => sum + Number(row.down_bytes || 0), 0);
+  const expireAt = rows.reduce((max, row) => Math.max(max, Number(row.expiry_at || 0)), 0);
+  const userinfoHeader = `upload=${upload}; download=${download}; total=${quota}; expire=${expireAt > 0 ? Math.floor(expireAt / 1000) : 0}`;
+
+  const applyHeaders = (target) => {
+    target.set('Cache-Control', 'no-store');
+    target.set('subscription-userinfo', userinfoHeader);
+    target.set('profile-update-interval', '12');
+    const site = String(settings.getSetting('general').website || config.publicUrl || '').trim();
+    if (site) target.set('profile-web-page-url', site.replace(/\/+$/, ''));
+  };
+
   const cached = subCache.get(token);
   if (cached && Date.now() - cached.at < SUB_CACHE_MS) {
-    res.set('Cache-Control', 'no-store');
+    applyHeaders(res);
     return res.type('text/plain').send(cached.body);
   }
 
@@ -211,7 +228,7 @@ router.get('/sub/:token', asyncH(async (req, res) => {
   if (subCache.size > 1000) subCache.clear();
   const body = Buffer.from(links.join('\n'), 'utf8').toString('base64');
   subCache.set(token, { at: Date.now(), body });
-  res.set('Cache-Control', 'no-store');
+  applyHeaders(res);
   return res.type('text/plain').send(body);
 }));
 

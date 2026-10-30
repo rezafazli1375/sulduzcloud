@@ -22,20 +22,29 @@ function userStats(userId) {
   const row = db.prepare(
     `SELECT COUNT(*) AS configs,
             COALESCE(SUM(CASE WHEN enabled = 1 AND (expiry_at = 0 OR expiry_at > ?) AND (total_bytes = 0 OR up_bytes + down_bytes < total_bytes) THEN 1 ELSE 0 END), 0) AS active,
-            COALESCE(SUM(total_bytes), 0) AS quota,
             COALESCE(SUM(up_bytes + down_bytes), 0) AS used
      FROM configs WHERE user_id = ? AND deleted_at = 0`
   ).get(Date.now(), Number(userId));
   // Row counts above stay for API v1, which is documented as one row per inbound.
   // Packages are the customer-facing unit: every inbound of one subscription is
-  // a single customer, exactly like the grouped config list and the dashboard.
+  // a single customer with ONE shared traffic pool, exactly like the grouped
+  // config list and the dashboard. Quota is the pool size (largest member
+  // quota), never the sum of per-inbound quotas.
+  const now = Date.now();
   const packages = db.prepare(
     `SELECT COUNT(*) AS total,
-            COALESCE(SUM(CASE WHEN active_n = members THEN 1 ELSE 0 END), 0) AS active
+            COALESCE(SUM(quota), 0) AS quota,
+            COALESCE(SUM(used), 0) AS used,
+            COALESCE(SUM(CASE WHEN (expiry_at = 0 OR expiry_at > ${now}) AND (quota = 0 OR used < quota)
+                               AND disabled_n < members AND active_n = members THEN 1 ELSE 0 END), 0) AS active
      FROM (
        SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey, COUNT(*) AS members,
-         SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${Date.now()})
-                   AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes) THEN 1 ELSE 0 END) AS active_n
+         SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
+                   AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes) THEN 1 ELSE 0 END) AS active_n,
+         SUM(CASE WHEN c.enabled = 0 THEN 1 ELSE 0 END) AS disabled_n,
+         MAX(c.expiry_at) AS expiry_at,
+         MAX(c.total_bytes) AS quota,
+         SUM(c.up_bytes + c.down_bytes) AS used
        FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0
        GROUP BY gkey
      )`
@@ -45,8 +54,8 @@ function userStats(userId) {
     active: Number(row.active || 0),
     packages: Number(packages.total || 0),
     activePackages: Number(packages.active || 0),
-    quotaBytes: Number(row.quota || 0),
-    usedBytes: Number(row.used || 0),
+    quotaBytes: Number(packages.quota || 0),
+    usedBytes: Number(packages.used || 0),
   };
 }
 
@@ -272,9 +281,9 @@ function adjustBalance(id, amount, description, req) {
 function checkLimits(user, { gb = 0, days = 0, count: adding = 1, gbEach = 0 } = {}) {
   const db = getDb();
   const row = db.prepare(
-    `SELECT COUNT(*) AS packages, COALESCE(SUM(total_bytes), 0) AS quota
+    `SELECT COUNT(*) AS packages, COALESCE(SUM(quota), 0) AS quota
      FROM (
-       SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey, SUM(c.total_bytes) AS total_bytes
+       SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey, MAX(c.total_bytes) AS quota
        FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0
        GROUP BY gkey
      )`

@@ -266,7 +266,10 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   };
 
   const askReset = async () => {
-    const ok = await confirm({ title: t('configs.actions.reset'), body: t('common.irreversible'), danger: true });
+    const body = group.length > 1
+      ? `${t('common.irreversible')}\n${t('configs.group.resetNote', { n: formatNumber(group.length, lang) })}`
+      : t('common.irreversible');
+    const ok = await confirm({ title: t('configs.actions.reset'), body, danger: true });
     if (ok) reset.mutate();
   };
 
@@ -428,7 +431,21 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
               bodyClass="p-4"
             >
               <p className="mb-3 text-[10.5px] leading-5 text-slate-500">{t('configs.group.hint')}</p>
-              {group.length > 1 ? <p className="mb-3 text-[10.5px] leading-5 text-slate-400">{t('configs.memberActionHint')}</p> : null}
+              {group.length > 1 ? (
+                <div className="mb-3 rounded-xl border border-cyan-400/20 bg-cyan-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-cyan-100/80">
+                  <p className="flex items-start gap-2">
+                    <Layers className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>{t('configs.memberActionHint')}</span>
+                  </p>
+                  <p className="mt-1 text-cyan-200/70">
+                    {t('configs.group.poolUsage', {
+                      used: formatBytes(config.used, lang),
+                      total: config.totalBytes ? formatBytes(config.totalBytes, lang) : '∞',
+                      n: formatNumber(group.length, lang),
+                    })}
+                  </p>
+                </div>
+              ) : null}
               <div className="space-y-2">
                 {group.map((item) => (
                   <div
@@ -451,9 +468,6 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
                       <StatusBadge status={item.status} />
-                      <span className="hidden text-[10px] text-slate-500 sm:inline">
-                        {item.totalBytes ? formatBytes(item.totalBytes, lang) : '∞'}
-                      </span>
                       {onSelect && Number(item.id) !== Number(configId) ? (
                         <IconButton
                           icon={ExternalLink}

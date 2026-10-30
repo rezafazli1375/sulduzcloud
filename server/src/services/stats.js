@@ -13,33 +13,36 @@ function dayRange(days) {
 }
 
 // Counts customers (packages), not x-ui clients: a two-inbound package is one
-// customer. A package only counts toward a status when every inbound shares it;
-// the rest are reported as `mixed`. Traffic and quota stay summed over clients.
+// customer. A package is ONE shared traffic pool (like a 3x-ui subscription):
+// its quota is the largest member quota and its usage is the sum of every
+// member's counters. Status follows the package, not each inbound; partially
+// inconsistent members (manual disable, mixed expiry) are reported as `mixed`.
 function statusCounts(userId = 0) {
   const db = getDb();
   const scope = userId ? 'AND c.user_id = ?' : '';
   const params = userId ? [Number(userId)] : [];
   const now = Date.now();
+  const activeMember = `c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
+                   AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes)`;
   const row = db.prepare(
     `SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN active_n = members THEN 1 ELSE 0 END) AS active,
-      SUM(CASE WHEN expired_n = members THEN 1 ELSE 0 END) AS expired,
-      SUM(CASE WHEN depleted_n = members THEN 1 ELSE 0 END) AS depleted,
-      SUM(CASE WHEN disabled_n = members THEN 1 ELSE 0 END) AS disabled,
+      SUM(CASE WHEN expiry_at > 0 AND expiry_at <= ${now} THEN 1 ELSE 0 END) AS expired,
+      SUM(CASE WHEN (expiry_at = 0 OR expiry_at > ${now}) AND quota > 0 AND used >= quota THEN 1 ELSE 0 END) AS depleted,
+      SUM(CASE WHEN (expiry_at = 0 OR expiry_at > ${now}) AND (quota = 0 OR used < quota)
+                AND disabled_n = members THEN 1 ELSE 0 END) AS disabled,
+      SUM(CASE WHEN (expiry_at = 0 OR expiry_at > ${now}) AND (quota = 0 OR used < quota)
+                AND disabled_n < members AND active_n = members THEN 1 ELSE 0 END) AS active,
       COALESCE(SUM(used), 0) AS used,
       COALESCE(SUM(quota), 0) AS quota
      FROM (
        SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey,
          COUNT(*) AS members,
-         SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
-                   AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes) THEN 1 ELSE 0 END) AS active_n,
-         SUM(CASE WHEN c.enabled = 1 AND c.expiry_at > 0 AND c.expiry_at <= ${now} THEN 1 ELSE 0 END) AS expired_n,
-         SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
-                   AND c.total_bytes > 0 AND c.up_bytes + c.down_bytes >= c.total_bytes THEN 1 ELSE 0 END) AS depleted_n,
+         SUM(CASE WHEN ${activeMember} THEN 1 ELSE 0 END) AS active_n,
          SUM(CASE WHEN c.enabled = 0 THEN 1 ELSE 0 END) AS disabled_n,
-         SUM(c.up_bytes + c.down_bytes) AS used,
-         SUM(c.total_bytes) AS quota
+         MAX(c.expiry_at) AS expiry_at,
+         MAX(c.total_bytes) AS quota,
+         SUM(c.up_bytes + c.down_bytes) AS used
        FROM configs c WHERE c.deleted_at = 0 ${scope}
        GROUP BY gkey
      )`

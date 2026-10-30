@@ -712,9 +712,74 @@ function startMockXui(inboundRows) {
     check('package list contains every member exactly once',
       JSON.stringify(packageRow.groupIds) === JSON.stringify(multiConfigs.map((item) => item.id))
       && new Set((packageRow.inbounds || []).map((item) => item.id)).size === 3);
-    check('package quotas stay independent rather than becoming a shared pool',
+    check('package quota is one shared pool, not a per-inbound amount',
       packageRow.totalBytes === 10 * 1024 ** 3
-      && packageRow.inbounds?.every((item) => item.totalBytes === 10 * 1024 ** 3 && item.used === 0));
+      && packageRow.used === 0
+      && packageRow.inbounds?.every((item) => item.totalBytes === 10 * 1024 ** 3));
+    // The entered GB is one pool for the whole package: usage is summed over
+    // every inbound, the subscription advertises that single number, and the
+    // package is cut off only when the combined usage fills the pool.
+    const gbUnit = 1024 ** 3;
+    const bumpClient = (config, up, down) => {
+      const client = mockXui.clients.get(config.email);
+      client.up = up;
+      client.down = down;
+    };
+    bumpClient(multiConfigs[0], 2 * gbUnit, 2 * gbUnit);
+    bumpClient(multiConfigs[1], 1.5 * gbUnit, 1.5 * gbUnit);
+    const poolSync = await request('POST', '/api/admin/sync', { cookies, csrf });
+    const pooledList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
+    const pooledRow = pooledList.json?.data?.rows?.[0] || {};
+    check('shared pool sums usage across every inbound of the package',
+      poolSync.status === 200
+      && pooledRow.used === 7 * gbUnit
+      && pooledRow.totalBytes === 10 * gbUnit
+      && pooledRow.remaining === 3 * gbUnit
+      && pooledRow.status === 'active',
+      `used=${pooledRow.used} remaining=${pooledRow.remaining} status=${pooledRow.status}`);
+    const pooledSub = await request('GET', `/api/sub/${groupToken}`);
+    const subInfo = String(pooledSub.headers['subscription-userinfo'] || '');
+    check('the subscription advertises the shared pool to client apps',
+      pooledSub.status === 200
+      && subInfo.includes(`upload=${3.5 * gbUnit}`)
+      && subInfo.includes(`download=${3.5 * gbUnit}`)
+      && subInfo.includes(`total=${10 * gbUnit}`),
+      `header=${subInfo}`);
+    bumpClient(multiConfigs[2], 3 * gbUnit, 0);
+    const drainedSync = await request('POST', '/api/admin/sync', { cookies, csrf });
+    const drainedList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
+    const drainedRow = drainedList.json?.data?.rows?.[0] || {};
+    check('filling the shared pool marks the whole package depleted',
+      drainedSync.status === 200
+      && drainedRow.used === 10 * gbUnit
+      && drainedRow.status === 'depleted',
+      `used=${drainedRow.used} status=${drainedRow.status}`);
+    check('every inbound of the package is disabled once the pool runs out',
+      multiConfigs.every((config) => mockXui.clients.get(config.email)?.enable === false));
+    const resetPool = await request('POST', `/api/reseller/configs/${multiConfigs[0].id}/reset`, {
+      cookies: shopCookies, csrf: shopCsrf,
+    });
+    for (const config of multiConfigs) bumpClient(config, 0, 0);
+    const resetList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
+    const resetRow = resetList.json?.data?.rows?.[0] || {};
+    check('resetting usage clears the pool and re-enables every inbound',
+      resetPool.status === 200
+      && resetRow.used === 0
+      && resetRow.status === 'active'
+      && multiConfigs.every((config) => mockXui.clients.get(config.email)?.enable !== false),
+      `status=${resetRow.status} enabled=${multiConfigs.map((config) => mockXui.clients.get(config.email)?.enable).join(',')}`);
+    const quotaOnce = await request('POST', `/api/admin/configs/${multiConfigs[1].id}/quota`, {
+      cookies, csrf, body: { gb: 20 },
+    });
+    check('editing quota on one inbound updates the shared pool everywhere',
+      quotaOnce.status === 200
+      && quotaOnce.json?.data?.config?.totalBytes === 20 * gbUnit
+      && multiConfigs.every((config) => mockXui.clients.get(config.email)?.totalGB === 20 * gbUnit));
+    const quotaBack = await request('POST', `/api/admin/configs/${multiConfigs[1].id}/quota`, {
+      cookies, csrf, body: { gb: 10 },
+    });
+    check('the package pool can be restored to its original size',
+      quotaBack.status === 200 && quotaBack.json?.data?.config?.totalBytes === 10 * gbUnit);
     const adminGrouped = await request('GET', `/api/admin/configs?userId=${shopId}&search=${customerSearch}`, { cookies });
     check('admin and reseller see the same complete customer package',
       adminGrouped.status === 200 && adminGrouped.json?.data?.total === 1
@@ -880,7 +945,7 @@ function startMockXui(inboundRows) {
       const original = fixtureDb.prepare('SELECT * FROM configs WHERE id = ?').get(alteredId);
       try {
         fixtureDb.prepare('UPDATE configs SET enabled = 0, total_bytes = 0, expiry_at = 0, up_bytes = 123 WHERE id = ?').run(alteredId);
-        const mixed = await request('GET', `/api/reseller/configs?search=${customerSearch}&status=disabled`, { cookies: shopCookies });
+        const mixed = await request('GET', `/api/reseller/configs?search=${customerSearch}&status=mixed`, { cookies: shopCookies });
         const mixedRow = mixed.json?.data?.rows?.[0];
         check('status filter selects a complete package with mixed states',
           mixed.json?.data?.total === 1 && mixedRow?.groupCount === 3 && mixedRow.groupStatus === 'mixed');

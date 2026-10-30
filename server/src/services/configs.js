@@ -11,6 +11,7 @@ const {
   ApiError,
   dayKey,
   gbToBytes,
+  bytesToGb,
   sanitizeConfig,
   statusOf,
   generateClientEmail,
@@ -203,10 +204,10 @@ async function createConfigs(input, req) {
   if (priced.some((item) => Number(item.server.id) !== orderServer)) {
     throw new ApiError(422, 'server_mismatch', 'همه اینباندهای یک سفارش باید روی یک سرور باشند / All inbounds in one order must belong to the same server');
   }
-  // Every inbound in one order belongs to one customer package, so the whole
-  // order consumes a single slot of the reseller's customer limit.
+  // Every inbound in one order belongs to one customer package: one customer
+  // slot, and the entered GB is the size of the SHARED pool (not per inbound).
   usersService.checkLimits(user, {
-    gb: gb * inboundIds.length,
+    gb,
     days,
     count: 1,
     gbEach: gb,
@@ -278,7 +279,7 @@ async function createConfigs(input, req) {
     // Charge only after every client exists in x-ui; the whole order is rolled
     // back below when the wallet or the panel rejects it.
     if (billingEnabled() && totalPrice > 0) {
-      chargeReseller(user, totalPrice, `ایجاد ${inboundIds.length} کانفیگ (${gb} GB / ${days} روز)`, 'purchase', req);
+      chargeReseller(user, totalPrice, `ایجاد بسته ${inboundIds.length} اینباندی (${gb} GB مشترک / ${days} روز)`, 'purchase', req);
     }
   } catch (err) {
     await rollbackCreated(createdIds, createdEmails);
@@ -299,14 +300,16 @@ async function createConfigs(input, req) {
     notifyUser(req.user.id, {
       type: 'info',
       title: 'کانفیگ جدید ساخته شد',
-      body: `${created.length} کانفیگ با ${gb} گیگابایت و ${days} روز ایجاد شد.`,
+      body: `${created.length} اینباند با ${gb} گیگابایت مشترک و ${days} روز ایجاد شد.`,
       link: '/reseller/configs',
     });
   }
   return created;
 }
 
-function buildWhere(filters, viewer) {
+const CONFIG_STATUSES = ['active', 'expired', 'depleted', 'disabled', 'mixed'];
+
+function buildWhere(filters, viewer, { withStatus = true } = {}) {
   const now = Date.now();
   const where = ['c.deleted_at = 0'];
   const params = [];
@@ -323,11 +326,11 @@ function buildWhere(filters, viewer) {
       WHEN c.expiry_at > 0 AND c.expiry_at <= ${now} THEN 'expired'
       WHEN c.total_bytes > 0 AND (c.up_bytes + c.down_bytes) >= c.total_bytes THEN 'depleted'
       ELSE 'active' END`;
-  if (filters.status) {
-    const allowed = ['active', 'expired', 'depleted', 'disabled'];
-    if (allowed.includes(String(filters.status))) {
-      where.push(`${statusExpr} = '${String(filters.status)}'`);
-    }
+  // Row-level status applies to the flat (API v1) view and CSV exports; the
+  // grouped customer list filters complete packages instead (see listConfigs).
+  if (withStatus && filters.status && CONFIG_STATUSES.includes(String(filters.status))) {
+    where.push(`${statusExpr} = ?`);
+    params.push(String(filters.status));
   }
   if (filters.expiringDays) {
     const until = now + Number(filters.expiringDays) * DAY_MS;
@@ -341,16 +344,40 @@ function buildWhere(filters, viewer) {
 // `flat: true` preserves the original sanitized API v1 response contract.
 const GROUP_KEY_SQL = CONFIG_GROUP_KEY_SQL;
 
-function mergeGroup(members) {
-  const first = members[0];
+// One customer package is ONE shared traffic pool, exactly like tagging several
+// inbounds to a single 3x-ui subscription: the quota is the package size (every
+// member is created with it) and the usage is the sum of all member counters.
+// `base` is the config the caller opened; its identity fields stay on the row.
+function mergeGroup(members, base = null) {
+  const first = base || members[0];
+  const now = Date.now();
+  const used = members.reduce((sum, m) => sum + Number(m.used || 0), 0);
+  const up = members.reduce((sum, m) => sum + Number(m.up || 0), 0);
+  const down = members.reduce((sum, m) => sum + Number(m.down || 0), 0);
+  const quota = members.reduce((max, m) => Math.max(max, Number(m.totalBytes || 0)), 0);
+  const expiryAt = members.reduce((max, m) => Math.max(max, Number(m.expiryAt || 0)), 0);
+  const enabledCount = members.filter((m) => m.enabled).length;
+  let status = 'active';
+  if (expiryAt > 0 && expiryAt <= now) status = 'expired';
+  else if (quota > 0 && used >= quota) status = 'depleted';
+  else if (enabledCount === 0) status = 'disabled';
+  else if (enabledCount < members.length || members.some((m) => m.status !== 'active')) status = 'mixed';
   return {
-    // Scalar quota/usage fields still describe the representative config. Each
-    // inbound enforces its own quota; adding quotas would imply a shared pool.
     ...first,
+    up,
+    down,
+    used,
+    totalBytes: quota,
+    totalGb: bytesToGb(quota),
+    remaining: quota > 0 ? Math.max(0, quota - used) : null,
+    usagePercent: quota > 0 ? Math.min(100, Math.round((used / quota) * 1000) / 10) : null,
+    expiryAt,
+    enabled: enabledCount > 0,
+    status,
     groupCount: members.length,
     groupIds: members.map((m) => m.id),
-    groupStatus: members.every((m) => m.status === first.status) ? first.status : 'mixed',
-    expiryMixed: members.some((m) => m.expiryAt !== first.expiryAt),
+    groupStatus: status,
+    expiryMixed: members.some((m) => Number(m.expiryAt || 0) !== Number(first.expiryAt || 0)),
     inbounds: members.map((m) => ({
       id: m.inboundId,
       configId: m.id,
@@ -367,10 +394,25 @@ function mergeGroup(members) {
   };
 }
 
+// Package-level status expressed over SQL aggregates; must mirror mergeGroup:
+// expired -> depleted (aggregate usage) -> disabled (all members) -> active or mixed.
+function packageStatusSql(now = Date.now()) {
+  return `CASE
+    WHEN MAX(c.expiry_at) > 0 AND MAX(c.expiry_at) <= ${now} THEN 'expired'
+    WHEN MAX(c.total_bytes) > 0 AND SUM(c.up_bytes + c.down_bytes) >= MAX(c.total_bytes) THEN 'depleted'
+    WHEN SUM(c.enabled) = 0 THEN 'disabled'
+    WHEN SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
+              AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes) THEN 1 ELSE 0 END) = COUNT(*)
+      THEN 'active'
+    ELSE 'mixed' END`;
+}
+
 function listConfigs(filters = {}, viewer) {
   const db = getDb();
   const { page, pageSize, offset } = pageParams(filters, 20, 200);
-  const { clause, params, statusExpr } = buildWhere(filters, viewer);
+  // Grouped listings filter whole packages; flat listings keep row semantics.
+  const { clause, params, statusExpr } = buildWhere(filters, viewer, { withStatus: Boolean(filters.flat) });
+  const wantedStatus = !filters.flat && CONFIG_STATUSES.includes(String(filters.status)) ? String(filters.status) : '';
   const inboundCache = new Map();
   const resellerCache = new Map();
   const sanitizeRow = (row) => {
@@ -390,15 +432,19 @@ function listConfigs(filters = {}, viewer) {
     return { total, page, pageSize, rows: rows.map(sanitizeRow) };
   }
 
+  const having = wantedStatus ? `HAVING ${packageStatusSql()} = ?` : '';
+  const havingParams = wantedStatus ? [wantedStatus] : [];
   const total = Number(db.prepare(
-    `SELECT COUNT(*) AS c FROM (SELECT ${GROUP_KEY_SQL} AS gkey FROM configs c ${clause} GROUP BY gkey)`
-  ).get(...params).c || 0);
+    `SELECT COUNT(*) AS c FROM (
+       SELECT ${GROUP_KEY_SQL} AS gkey FROM configs c ${clause} GROUP BY gkey ${having}
+     )`
+  ).get(...params, ...havingParams).c || 0);
   const pageKeys = db.prepare(
     `SELECT ${GROUP_KEY_SQL} AS gkey FROM configs c ${clause}
-     GROUP BY gkey
+     GROUP BY gkey ${having}
      ORDER BY MAX(c.created_at) DESC, MIN(c.id) DESC
      LIMIT ? OFFSET ?`
-  ).all(...params, pageSize, offset);
+  ).all(...params, ...havingParams, pageSize, offset);
   if (!pageKeys.length) return { total, page, pageSize, rows: [] };
 
   const keys = pageKeys.map((item) => item.gkey);
@@ -433,6 +479,21 @@ function configDetail(id, viewer) {
     throw new ApiError(403, 'forbidden', 'You do not have access to this config');
   }
   return { row, config: hydrate(row) };
+}
+
+// The panel drawer always shows the customer package: one shared traffic pool,
+// one expiry and one status, with the opened config's identity kept on top.
+function packageView(row) {
+  const db = getDb();
+  const members = groupRows(row);
+  const list = (members.length ? members : [row]).map((item) => hydrate(item)).filter(Boolean);
+  if (!list.length) return hydrate(row);
+  return mergeGroup(list, list.find((item) => Number(item.id) === Number(row.id)) || list[0]);
+}
+
+function detailView(id, viewer) {
+  const { row } = configDetail(id, viewer);
+  return { row, config: packageView(row) };
 }
 
 async function linksFor(row) {
@@ -502,16 +563,23 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
     throw new ApiError(402, 'insufficient_balance', 'موجودی کیف پول کافی نیست / Insufficient wallet balance');
   }
 
+  // The added GB grows ONE shared pool, so the new pool size is computed once
+  // from the package quota and written to every member (this also heals members
+  // whose stored quota drifted apart).
+  const groupQuota = targets.reduce((max, target) => Math.max(max, Number(target.total_bytes || 0)), 0);
+  const sharedTotal = addBytes > 0 ? (groupQuota > 0 ? groupQuota + addBytes : addBytes) : groupQuota;
+  const groupExpiry = targets.reduce((max, target) => Math.max(max, Number(target.expiry_at || 0)), 0);
+  const sharedExpiry = addDays > 0
+    ? (groupExpiry > 0 ? Math.max(Date.now(), groupExpiry) : Date.now()) + addDays * DAY_MS
+    : 0;
   const updates = targets.map((target) => {
     const currentExpiry = Number(target.expiry_at || 0);
-    const base = currentExpiry > 0 ? Math.max(Date.now(), currentExpiry) : Date.now();
-    const currentTotal = Number(target.total_bytes || 0);
     return {
       row: target,
       currentExpiry,
-      currentTotal,
-      newExpiry: addDays > 0 ? base + addDays * DAY_MS : currentExpiry,
-      newTotal: addBytes > 0 ? (currentTotal > 0 ? currentTotal + addBytes : addBytes) : currentTotal,
+      currentTotal: Number(target.total_bytes || 0),
+      newExpiry: addDays > 0 ? sharedExpiry : currentExpiry,
+      newTotal: addBytes > 0 ? sharedTotal : Number(target.total_bytes || 0),
     };
   });
 
@@ -536,7 +604,7 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
       applied.push(update);
     }
     if (billingEnabled() && amount > 0) {
-      chargeReseller(reseller, amount, `تمدید ${targets.length} کانفیگ (+${gb}GB / +${addDays}d)`, 'renew', req);
+      chargeReseller(reseller, amount, `تمدید بسته ${targets.length} اینباندی (+${gb}GB مشترک / +${addDays}d)`, 'renew', req);
     }
   } catch (err) {
     for (const update of applied.reverse()) {
@@ -584,17 +652,20 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
       type: 'success',
       title: 'کانفیگ تمدید شد',
       body: `${row.email} — ${gb ? `+${gb}GB ` : ''}${addDays ? `+${addDays} روز` : ''}`.trim()
-        + (targets.length > 1 ? ` (${targets.length} اینباند)` : ''),
+        + (targets.length > 1 ? ` (${targets.length} اینباند، حجم مشترک)` : ''),
       link: '/reseller/configs',
     });
   }
-  return hydrate(getConfigRow(row.id));
+  return packageView(getConfigRow(row.id));
 }
 
 function db() {
   return getDb();
 }
 
+// Quota, expiry and enable/disable belong to the PACKAGE. Editing them writes
+// the same value to every inbound of the subscription so the shared pool stays
+// one number, exactly like a 3x-ui client attached to several inbounds.
 async function setQuota(id, patch, req, viewer) {
   const { row } = configDetail(id, viewer);
   const next = {};
@@ -606,35 +677,122 @@ async function setQuota(id, patch, req, viewer) {
   }
   if (patch.enabled !== undefined) next.enabled = Boolean(patch.enabled);
   if (!Object.keys(next).length) throw new ApiError(422, 'nothing_to_change', 'Nothing to change');
-  await applyToXui(row, next);
+
+  const targets = groupRows(row).length ? groupRows(row) : [row];
+  const applied = [];
+  try {
+    for (const target of targets) {
+      try {
+        await applyToXui(target, next);
+      } catch (err) {
+        if (err?.code === 'xui_client_missing' && Number(target.id) !== Number(row.id)) {
+          console.error(`[configs] quota: sibling ${target.email} missing in x-ui, skipped`);
+          continue;
+        }
+        throw err;
+      }
+      applied.push(target);
+    }
+  } catch (err) {
+    for (const target of applied.reverse()) {
+      try {
+        await applyToXui(target, {
+          totalBytes: Number(target.total_bytes || 0),
+          expiryAt: Number(target.expiry_at || 0),
+          enabled: Boolean(target.enabled),
+        });
+      } catch (revertErr) {
+        console.error(`[configs] quota: revert failed for ${target.email}:`, revertErr.message);
+      }
+    }
+    throw err;
+  }
+
   const fields = [];
   const values = [];
   if (next.totalBytes !== undefined) { fields.push('total_bytes = ?'); values.push(next.totalBytes); }
   if (next.expiryAt !== undefined) { fields.push('expiry_at = ?'); values.push(next.expiryAt); }
   if (next.enabled !== undefined) { fields.push('enabled = ?'); values.push(next.enabled ? 1 : 0); }
   fields.push('sync_status = ?', 'last_synced_at = ?', 'updated_at = ?');
-  values.push('', Date.now(), Date.now(), row.id);
-  db().prepare(`UPDATE configs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
-  audit(req, 'config.quota', 'config', row.id, next);
-  return hydrate(getConfigRow(row.id));
+  values.push('', Date.now(), Date.now());
+  const update = db().prepare(`UPDATE configs SET ${fields.join(', ')} WHERE id = ?`);
+  for (const target of applied) update.run(...values, target.id);
+  audit(req, 'config.quota', 'config', row.id, { ...next, groupSize: applied.length });
+  return packageView(getConfigRow(row.id));
 }
 
 async function toggleConfig(id, enabled, req, viewer) {
   const { row } = configDetail(id, viewer);
-  await xui.setEnabled(row.email, Boolean(enabled), serverOfConfig(row));
-  db().prepare('UPDATE configs SET enabled = ?, sync_status = ?, updated_at = ? WHERE id = ?')
-    .run(enabled ? 1 : 0, '', Date.now(), row.id);
-  audit(req, 'config.toggle', 'config', row.id, { enabled: Boolean(enabled) });
-  return hydrate(getConfigRow(row.id));
+  const value = Boolean(enabled);
+  const targets = groupRows(row).length ? groupRows(row) : [row];
+  const applied = [];
+  try {
+    for (const target of targets) {
+      try {
+        await xui.setEnabled(target.email, value, serverOfConfig(target));
+      } catch (err) {
+        if (err?.code === 'xui_client_missing' && Number(target.id) !== Number(row.id)) {
+          console.error(`[configs] toggle: sibling ${target.email} missing in x-ui, skipped`);
+          continue;
+        }
+        throw err;
+      }
+      applied.push(target);
+    }
+  } catch (err) {
+    for (const target of applied.reverse()) {
+      try {
+        await xui.setEnabled(target.email, !value, serverOfConfig(target));
+      } catch (revertErr) {
+        console.error(`[configs] toggle: revert failed for ${target.email}:`, revertErr.message);
+      }
+    }
+    throw err;
+  }
+  const now = Date.now();
+  const update = db().prepare('UPDATE configs SET enabled = ?, sync_status = ?, updated_at = ? WHERE id = ?');
+  for (const target of applied) update.run(value ? 1 : 0, '', now, target.id);
+  audit(req, 'config.toggle', 'config', row.id, { enabled: value, groupSize: applied.length });
+  return packageView(getConfigRow(row.id));
 }
 
+// Resetting usage clears the whole shared pool, so every inbound starts at
+// zero. A package that was cut off for running out of traffic is re-enabled,
+// because the pool is no longer exhausted.
 async function resetUsage(id, req, viewer) {
   const { row } = configDetail(id, viewer);
-  await xui.resetTraffic(row.email, serverOfConfig(row));
-  db().prepare('UPDATE configs SET up_bytes = 0, down_bytes = 0, last_up = 0, last_down = 0, updated_at = ? WHERE id = ?')
-    .run(Date.now(), row.id);
-  audit(req, 'config.reset_usage', 'config', row.id, {});
-  return hydrate(getConfigRow(row.id));
+  const targets = groupRows(row).length ? groupRows(row) : [row];
+  const quota = targets.reduce((max, target) => Math.max(max, Number(target.total_bytes || 0)), 0);
+  const used = targets.reduce((sum, target) => sum + Number(target.up_bytes || 0) + Number(target.down_bytes || 0), 0);
+  const wasDepleted = quota > 0 && used >= quota;
+  let reset = 0;
+  for (const target of targets) {
+    try {
+      await xui.resetTraffic(target.email, serverOfConfig(target));
+      db().prepare('UPDATE configs SET up_bytes = 0, down_bytes = 0, last_up = 0, last_down = 0, updated_at = ? WHERE id = ?')
+        .run(Date.now(), target.id);
+      reset += 1;
+    } catch (err) {
+      if (err?.code === 'xui_client_missing' && Number(target.id) !== Number(row.id)) {
+        console.error(`[configs] reset: sibling ${target.email} missing in x-ui, skipped`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (wasDepleted) {
+    for (const target of targets) {
+      try {
+        await xui.setEnabled(target.email, true, serverOfConfig(target));
+        db().prepare('UPDATE configs SET enabled = 1, sync_status = ?, updated_at = ? WHERE id = ?')
+          .run('', Date.now(), target.id);
+      } catch (err) {
+        console.error(`[configs] reset: re-enable failed for ${target.email}:`, err.message);
+      }
+    }
+  }
+  audit(req, 'config.reset_usage', 'config', row.id, { groupSize: reset, reEnabled: wasDepleted });
+  return packageView(getConfigRow(row.id));
 }
 
 async function updateMeta(id, patch, req, viewer) {
@@ -794,14 +952,17 @@ async function addInbound(id, inboundId, req, viewer) {
     .get(row.sub_id, target);
   if (exists) throw new ApiError(409, 'inbound_exists', 'This customer already has this inbound');
 
-  // The new inbound inherits the customer's current quota and expiry window.
-  const totalBytes = Number(row.total_bytes || 0);
-  const expiryAt = Number(row.expiry_at || 0);
-  const totalGb = totalBytes > 0 ? Math.round((totalBytes / 1024 / 1024 / 1024) * 100) / 100 : 0;
+  // The new inbound joins the package's shared pool: it inherits the pool size
+  // and expiry window (max across members, healing any drift) and adds NO quota.
+  const siblings = groupRows(row);
+  const members = siblings.length ? siblings : [row];
+  const totalBytes = members.reduce((max, item) => Math.max(max, Number(item.total_bytes || 0)), 0);
+  const expiryAt = members.reduce((max, item) => Math.max(max, Number(item.expiry_at || 0)), 0);
+  const totalGb = bytesToGb(totalBytes);
   const remainingDays = expiryAt > 0 ? Math.max(1, Math.ceil((expiryAt - Date.now()) / DAY_MS)) : 0;
   const amount = pricing.priceFor(inbound, totalGb, remainingDays, user.id);
   // This joins the customer's existing package instead of creating a new one.
-  usersService.checkLimits(user, { count: 0, gb: totalGb, gbEach: totalGb, days: remainingDays });
+  usersService.checkLimits(user, { count: 0, gb: 0, gbEach: totalGb, days: remainingDays });
 
   if (billingEnabled() && amount > 0 && Number(user.balance || 0) < amount) {
     throw new ApiError(402, 'insufficient_balance', 'موجودی کیف پول کافی نیست / Insufficient wallet balance');
@@ -891,6 +1052,12 @@ async function syncConfigs({ pruneUsageDays } = {}) {
   );
   let synced = 0;
   let missing = 0;
+  // Package aggregates are collected during the same pass so the shared pool can
+  // be enforced right after the counters are written.
+  const groups = new Map();
+  const groupKeyOf = (row) => (row.sub_id
+    ? `G:${row.user_id}:${row.server_id}:${row.sub_id}`
+    : `C:${row.id}`);
   const tx = db.transaction(() => {
     for (const row of rows) {
       const sid = Number(row.server_id || 0) || (serverList[0] ? Number(serverList[0].id) : 0);
@@ -914,36 +1081,84 @@ async function syncConfigs({ pruneUsageDays } = {}) {
         client.enabled ? 1 : 0, client.uuid || row.uuid, client.subId || row.xui_sub_id,
         '', Date.now(), Date.now(), row.id);
       synced += 1;
+      const gkey = groupKeyOf(row);
+      if (!groups.has(gkey)) groups.set(gkey, { quota: 0, used: 0, members: [] });
+      const group = groups.get(gkey);
+      group.quota = Math.max(group.quota, Number(row.total_bytes || 0));
+      group.used += up + down;
+      group.members.push({
+        id: row.id,
+        email: row.email,
+        serverId: sid,
+        enabled: Boolean(client.enabled),
+      });
     }
   });
   tx();
+
+  // One shared pool: when the package total reaches its quota, stop every
+  // member (x-ui only knows each client's own quota, not the package sum).
+  // Extending or raising the quota re-enables the members.
+  let disabled = 0;
+  const serverCache = new Map();
+  for (const group of groups.values()) {
+    if (group.quota <= 0 || group.used < group.quota) continue;
+    for (const member of group.members) {
+      if (!member.enabled) continue;
+      try {
+        if (!serverCache.has(member.serverId)) {
+          serverCache.set(member.serverId, serversService.resolveServer(member.serverId));
+        }
+        await xui.setEnabled(member.email, false, serverCache.get(member.serverId));
+        db.prepare('UPDATE configs SET enabled = 0, updated_at = ? WHERE id = ?').run(Date.now(), member.id);
+        disabled += 1;
+      } catch (err) {
+        console.error(`[configs] shared pool: could not disable ${member.email}:`, err.message);
+      }
+    }
+  }
+  if (disabled) console.log(`[configs] shared pool: disabled ${disabled} client(s) over quota`);
+
   if (pruneUsageDays) {
     const cutoff = new Date(Date.now() - pruneUsageDays * DAY_MS).toISOString().slice(0, 10);
     db.prepare('DELETE FROM usage_daily WHERE day < ?').run(cutoff);
   }
-  return { synced, missing, total: rows.length, durationMs: Date.now() - started };
+  return { synced, missing, disabled, total: rows.length, durationMs: Date.now() - started };
 }
 
+// Alerts are per CUSTOMER PACKAGE: a five-inbound subscription warns once, about
+// the shared pool, instead of five times about independent inbounds.
 function expiredNotifications() {
   const db = getDb();
   const monitor = settings.getSetting('monitor');
   if (!monitor.expiryAlerts) return { sent: 0 };
   const days = Array.isArray(monitor.expiryDays) ? monitor.expiryDays : [3, 1];
   const now = Date.now();
+  const groupKeyOf = (row) => (row.sub_id
+    ? `G:${row.user_id}:${row.server_id}:${row.sub_id}`
+    : `C:${row.id}`);
+  const labelOf = (row) => row.customer_name || row.label || row.email;
   let sent = 0;
   for (const day of days) {
     const limit = day * DAY_MS;
     const rows = db.prepare(
-      `SELECT c.*, u.phone, u.email, u.lang FROM configs c JOIN users u ON u.id = c.user_id
+      `SELECT c.* FROM configs c
        WHERE c.deleted_at = 0 AND c.enabled = 1 AND c.expiry_at > 0
          AND c.expiry_at > ? AND c.expiry_at <= ?`
     ).all(now, now + limit);
+    // One representative row per package.
+    const packages = new Map();
     for (const row of rows) {
-      const key = `expiry:${row.id}:${day}:${new Date(row.expiry_at).toISOString().slice(0, 10)}`;
+      const gkey = groupKeyOf(row);
+      const current = packages.get(gkey);
+      if (!current || Number(row.expiry_at) > Number(current.expiry_at)) packages.set(gkey, row);
+    }
+    for (const row of packages.values()) {
+      const key = `expiry:${groupKeyOf(row)}:${day}:${new Date(row.expiry_at).toISOString().slice(0, 10)}`;
       const inserted = notifyUser(row.user_id, {
         type: 'warning',
-        title: `کانفیگ ${row.email} به‌زودی منقضی می‌شود`,
-        body: `کمتر از ${day} روز تا پایان اعتبار باقی مانده است.`,
+        title: `بسته ${labelOf(row)} به‌زودی منقضی می‌شود`,
+        body: `کمتر از ${day} روز تا پایان اعتبار این بسته باقی مانده است.`,
         link: '/reseller/configs',
         dedupeKey: key,
         meta: { configId: row.id, days: day },
@@ -953,19 +1168,26 @@ function expiredNotifications() {
   }
   const percent = Number(monitor.trafficAlertPercent || 90);
   const usedRows = db.prepare(
-    `SELECT c.* FROM configs c
-     WHERE c.deleted_at = 0 AND c.enabled = 1 AND c.total_bytes > 0
-       AND (c.up_bytes + c.down_bytes) * 100 >= c.total_bytes * ?`
-  ).all(percent);
+    `SELECT c.* FROM configs c WHERE c.deleted_at = 0 AND c.enabled = 1 AND c.total_bytes > 0`
+  ).all();
+  const pools = new Map();
   for (const row of usedRows) {
-    const key = `traffic:${row.id}:${percent}:${dayKey()}`;
-    const inserted = notifyUser(row.user_id, {
+    const gkey = groupKeyOf(row);
+    if (!pools.has(gkey)) pools.set(gkey, { row, quota: 0, used: 0 });
+    const pool = pools.get(gkey);
+    pool.quota = Math.max(pool.quota, Number(row.total_bytes || 0));
+    pool.used += Number(row.up_bytes || 0) + Number(row.down_bytes || 0);
+  }
+  for (const [gkey, pool] of pools) {
+    if (pool.quota <= 0 || pool.used * 100 < pool.quota * percent) continue;
+    const key = `traffic:${gkey}:${percent}:${dayKey()}`;
+    const inserted = notifyUser(pool.row.user_id, {
       type: 'warning',
-      title: `حجم کانفیگ ${row.email} در حال اتمام است`,
-      body: `بیش از ${percent}٪ از حجم کانفیگ مصرف شده است.`,
+      title: `حجم بسته ${labelOf(pool.row)} در حال اتمام است`,
+      body: `بیش از ${percent}٪ از حجم مشترک این بسته مصرف شده است.`,
       link: '/reseller/configs',
       dedupeKey: key,
-      meta: { configId: row.id, percent },
+      meta: { configId: pool.row.id, percent },
     });
     if (inserted) sent += 1;
   }
@@ -983,7 +1205,10 @@ module.exports = {
   createConfigs,
   listConfigs,
   configDetail,
+  detailView,
+  packageView,
   hydrate,
+  groupRows,
   getConfigRow,
   linksFor,
   subUrlFor,

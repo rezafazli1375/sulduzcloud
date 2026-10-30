@@ -46,22 +46,25 @@ import ConfigForm from '../components/config/ConfigForm.jsx';
 import ConfigDetail from '../components/config/ConfigDetail.jsx';
 import { useToast } from '../components/feedback.jsx';
 
-const STATUSES = ['active', 'expired', 'depleted', 'disabled'];
+const STATUSES = ['active', 'expired', 'depleted', 'disabled', 'mixed'];
 
 function CustomerUsage({ row, compact = false }) {
-  const { t } = useI18n();
-  if (Number(row.groupCount || 1) <= 1) {
-    return <UsageBar used={row.used} total={row.totalBytes} showLabel compact={compact} />;
-  }
+  const { t, lang } = useI18n();
+  const total = Number(row.totalBytes || 0);
+  const used = Number(row.used || 0);
+  const percent = total > 0 ? Math.min(100, Math.round((used / total) * 1000) / 10) : null;
   return (
-    <div className="space-y-2">
-      <p className="text-[9px] text-slate-500">{t('configs.perInboundUsage')}</p>
-      {(row.inbounds || []).map((item) => (
-        <div key={item.configId}>
-          <p className="mb-0.5 max-w-[180px] truncate text-[9px] text-slate-400">{item.remark}</p>
-          <UsageBar used={item.used} total={item.totalBytes} showLabel compact />
-        </div>
-      ))}
+    <div className="space-y-1">
+      <UsageBar used={used} total={total} compact={compact} />
+      <div className="flex items-center justify-between gap-2 text-[10px]">
+        <span className={percent !== null && percent >= 90 ? 'text-rose-300' : 'text-slate-300'}>
+          {formatBytes(used)} / {total > 0 ? formatBytes(total) : '∞'}
+        </span>
+        <span className="shrink-0 text-slate-500">{percent === null ? '∞' : `${formatNumber(percent, lang, 1)}%`}</span>
+      </div>
+      {Number(row.groupCount || 1) > 1 ? (
+        <p className="text-[9px] text-slate-500">{t('configs.sharedPool', { n: formatNumber(row.groupCount, lang) })}</p>
+      ) : null}
     </div>
   );
 }

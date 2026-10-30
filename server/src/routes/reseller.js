@@ -134,13 +134,13 @@ router.post('/configs', asyncH(async (req, res) => {
 }));
 
 router.get('/configs/:id', asyncH(async (req, res) => {
-  const { row, config } = configsService.configDetail(num(req.params.id), req.user);
+  const { row, config } = configsService.detailView(num(req.params.id), req.user);
   const links = await configsService.linksFor(row);
   res.json({ ok: true, data: { config, group: configsService.groupFor(row), ...links } });
 }));
 
 router.get('/configs/:id/links', asyncH(async (req, res) => {
-  const { row, config } = configsService.configDetail(num(req.params.id), req.user);
+  const { row, config } = configsService.detailView(num(req.params.id), req.user);
   const links = await configsService.linksFor(row);
   res.json({ ok: true, data: { config, group: configsService.groupFor(row), ...links } });
 }));
@@ -174,13 +174,13 @@ router.post('/configs/:id/toggle', asyncH(async (req, res) => {
 }));
 
 router.post('/configs/:id/identity', asyncH(async (req, res) => {
-  const config = await configsService.updateIdentity(
+  await configsService.updateIdentity(
     num(req.params.id),
     { uuid: req.body?.uuid, subId: req.body?.subId },
     req,
     req.user
   );
-  const row = configsService.getConfigRow(config.id);
+  const { row, config } = configsService.detailView(num(req.params.id), req.user);
   const links = await configsService.linksFor(row);
   res.json({ ok: true, data: { config, group: configsService.groupFor(row), ...links } });
 }));

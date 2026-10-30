@@ -244,6 +244,7 @@ const STATUS_TONE = {
   answered: 'violet',
   expired: 'amber',
   depleted: 'rose',
+  mixed: 'amber',
   disabled: 'slate',
   closed: 'slate',
   offline: 'rose',

@@ -4,7 +4,7 @@
 
 A bilingual (Persian/English) reseller & config management panel for 3x-ui, with a premium dark UI, per-reseller limits, wallet, tickets, live node status, backups and a reseller REST API.
 
-Version 1.4.3 · Node.js 20+ · SQLite · React 18 · multi-panel
+Version 1.4.4 · Node.js 20+ · SQLite · React 18 · multi-panel
 
 ---
 
