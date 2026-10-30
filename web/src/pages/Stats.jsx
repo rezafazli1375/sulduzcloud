@@ -74,6 +74,7 @@ function AdminStats() {
     { name: t('common.expired'), value: configs.expired || 0, color: '#f59e0b' },
     { name: t('common.depleted'), value: configs.depleted || 0, color: '#f43f5e' },
     { name: t('common.disabled'), value: configs.disabled || 0, color: '#64748b' },
+    ...(Number(configs.mixed) > 0 ? [{ name: t('dash.mixedPackages'), value: Number(configs.mixed), color: '#8b5cf6' }] : []),
   ], [configs, t]);
 
   return (
@@ -90,7 +91,7 @@ function AdminStats() {
       />
 
       <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <StatCard icon={Boxes} label={t('dash.kpiConfigs')} value={formatNumber(configs.total, lang)} hint={`${formatNumber(configs.active, lang)} ${t('common.active')}`} tone="emerald" />
+        <StatCard icon={Boxes} label={t('dash.kpiCustomers')} value={formatNumber(configs.total, lang)} hint={`${formatNumber(configs.active, lang)} ${t('common.active')}`} tone="emerald" />
         <StatCard icon={TrendingUp} label={t('common.month')} value={formatBytes(overview.month?.total, lang, { digits: 1 })} hint={`${t('dash.kpiTrafficToday')}: ${formatBytes(overview.today?.total, lang)}`} tone="cyan" />
         <StatCard icon={CircleDollarSign} label={t('stats.totalSpent')} value={formatMoney(revenue.spent || 0, lang, currency)} hint={`${formatNumber(revenue.transactions, lang)} ${t('stats.txCount')}`} tone="violet" />
         <StatCard icon={CalendarClock} label={t('dash.kpiExpiring')} value={formatNumber(overview.expiring3d, lang)} hint={t('common.days')} tone="amber" />
@@ -100,7 +101,7 @@ function AdminStats() {
         <SectionCard className="xl:col-span-2" title={t('stats.usageChart')} icon={Activity} bodyClass="px-2 pb-3 pt-4 sm:px-4">
           {isLoading ? <Skeleton className="h-[260px] w-full" /> : <TrafficChart data={data?.series || []} height={260} />}
         </SectionCard>
-        <SectionCard title={t('dash.kpiConfigs')} icon={Gauge}>
+        <SectionCard title={t('dash.kpiCustomers')} icon={Gauge}>
           <StatusDonut items={donut} height={190} />
           <div className="mt-2 grid grid-cols-2 gap-2">
             {donut.map((item) => (
@@ -230,6 +231,7 @@ function ResellerStats() {
     { name: t('common.expired'), value: configs.expired || 0, color: '#f59e0b' },
     { name: t('common.depleted'), value: configs.depleted || 0, color: '#f43f5e' },
     { name: t('common.disabled'), value: configs.disabled || 0, color: '#64748b' },
+    ...(Number(configs.mixed) > 0 ? [{ name: t('dash.mixedPackages'), value: Number(configs.mixed), color: '#8b5cf6' }] : []),
   ], [configs, t]);
 
   return (
@@ -241,7 +243,7 @@ function ResellerStats() {
       />
 
       <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <StatCard icon={Boxes} label={t('dash.kpiConfigs')} value={formatNumber(configs.total, lang)} hint={`${formatNumber(configs.active, lang)} ${t('common.active')}`} tone="emerald" />
+        <StatCard icon={Boxes} label={t('dash.kpiCustomers')} value={formatNumber(configs.total, lang)} hint={`${formatNumber(configs.active, lang)} ${t('common.active')}`} tone="emerald" />
         <StatCard icon={Activity} label={t('dash.kpiTrafficToday')} value={formatBytes(data?.today?.total, lang, { digits: 1 })} hint={`${t('common.week')}: ${formatBytes(data?.week?.total, lang)}`} tone="cyan" />
         <StatCard icon={TrendingUp} label={t('common.month')} value={formatBytes(data?.month?.total, lang, { digits: 1 })} hint={t('common.traffic')} tone="violet" />
         <StatCard icon={Gauge} label={t('common.used')} value={formatBytes(configs.usedBytes, lang)} hint={formatBytes(configs.quotaBytes, lang)} tone="amber" />
@@ -251,7 +253,7 @@ function ResellerStats() {
         <SectionCard className="xl:col-span-2" title={t('stats.usageChart')} icon={Activity} bodyClass="px-2 pb-3 pt-4 sm:px-4">
           {isLoading ? <Skeleton className="h-[260px] w-full" /> : <TrafficChart data={data?.series || []} height={260} />}
         </SectionCard>
-        <SectionCard title={t('dash.kpiConfigs')} icon={Gauge}>
+        <SectionCard title={t('dash.kpiCustomers')} icon={Gauge}>
           <StatusDonut items={donut} height={190} />
           <div className="mt-2 grid grid-cols-2 gap-2">
             {donut.map((item) => (

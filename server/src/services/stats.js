@@ -1,7 +1,7 @@
 'use strict';
 
 const { getDb } = require('../db');
-const { dayKey, statusOf } = require('../utils');
+const { dayKey, statusOf, CONFIG_GROUP_KEY_SQL } = require('../utils');
 
 const DAY_MS = 86400000;
 
@@ -12,28 +12,50 @@ function dayRange(days) {
   return out;
 }
 
+// Counts customers (packages), not x-ui clients: a two-inbound package is one
+// customer. A package only counts toward a status when every inbound shares it;
+// the rest are reported as `mixed`. Traffic and quota stay summed over clients.
 function statusCounts(userId = 0) {
   const db = getDb();
-  const scope = userId ? 'AND user_id = ?' : '';
+  const scope = userId ? 'AND c.user_id = ?' : '';
   const params = userId ? [Number(userId)] : [];
   const now = Date.now();
   const row = db.prepare(
     `SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN enabled = 1 AND (expiry_at = 0 OR expiry_at > ?) AND (total_bytes = 0 OR up_bytes + down_bytes < total_bytes) THEN 1 ELSE 0 END) AS active,
-      SUM(CASE WHEN enabled = 1 AND expiry_at > 0 AND expiry_at <= ? THEN 1 ELSE 0 END) AS expired,
-      SUM(CASE WHEN enabled = 1 AND total_bytes > 0 AND up_bytes + down_bytes >= total_bytes THEN 1 ELSE 0 END) AS depleted,
-      SUM(CASE WHEN enabled = 0 THEN 1 ELSE 0 END) AS disabled,
-      COALESCE(SUM(up_bytes + down_bytes), 0) AS used,
-      COALESCE(SUM(total_bytes), 0) AS quota
-     FROM configs WHERE deleted_at = 0 ${scope}`
-  ).get(now, now, ...params);
+      SUM(CASE WHEN active_n = members THEN 1 ELSE 0 END) AS active,
+      SUM(CASE WHEN expired_n = members THEN 1 ELSE 0 END) AS expired,
+      SUM(CASE WHEN depleted_n = members THEN 1 ELSE 0 END) AS depleted,
+      SUM(CASE WHEN disabled_n = members THEN 1 ELSE 0 END) AS disabled,
+      COALESCE(SUM(used), 0) AS used,
+      COALESCE(SUM(quota), 0) AS quota
+     FROM (
+       SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey,
+         COUNT(*) AS members,
+         SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
+                   AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes) THEN 1 ELSE 0 END) AS active_n,
+         SUM(CASE WHEN c.enabled = 1 AND c.expiry_at > 0 AND c.expiry_at <= ${now} THEN 1 ELSE 0 END) AS expired_n,
+         SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
+                   AND c.total_bytes > 0 AND c.up_bytes + c.down_bytes >= c.total_bytes THEN 1 ELSE 0 END) AS depleted_n,
+         SUM(CASE WHEN c.enabled = 0 THEN 1 ELSE 0 END) AS disabled_n,
+         SUM(c.up_bytes + c.down_bytes) AS used,
+         SUM(c.total_bytes) AS quota
+       FROM configs c WHERE c.deleted_at = 0 ${scope}
+       GROUP BY gkey
+     )`
+  ).get(...params);
+  const total = Number(row.total || 0);
+  const active = Number(row.active || 0);
+  const expired = Number(row.expired || 0);
+  const depleted = Number(row.depleted || 0);
+  const disabled = Number(row.disabled || 0);
   return {
-    total: Number(row.total || 0),
-    active: Number(row.active || 0),
-    expired: Number(row.expired || 0),
-    depleted: Number(row.depleted || 0),
-    disabled: Number(row.disabled || 0),
+    total,
+    active,
+    expired,
+    depleted,
+    disabled,
+    mixed: Math.max(0, total - active - expired - depleted - disabled),
     usedBytes: Number(row.used || 0),
     quotaBytes: Number(row.quota || 0),
   };
@@ -127,11 +149,15 @@ function inboundBreakdown(userId = 0) {
 function expiringSoon(days = 3, userId = 0) {
   const db = getDb();
   const now = Date.now();
-  const scope = userId ? 'AND user_id = ?' : '';
+  const scope = userId ? 'AND c.user_id = ?' : '';
   const params = userId ? [Number(userId)] : [];
+  // One customer package counts once even when several inbounds expire together.
   return db.prepare(
-    `SELECT COUNT(*) AS c FROM configs
-     WHERE deleted_at = 0 AND enabled = 1 AND expiry_at > ? AND expiry_at <= ? ${scope}`
+    `SELECT COUNT(*) AS c FROM (
+       SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey FROM configs c
+       WHERE c.deleted_at = 0 AND c.enabled = 1 AND c.expiry_at > ? AND c.expiry_at <= ? ${scope}
+       GROUP BY gkey
+     )`
   ).get(now, now + days * DAY_MS, ...params).c;
 }
 

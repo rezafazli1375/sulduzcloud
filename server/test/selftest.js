@@ -784,6 +784,60 @@ function startMockXui(inboundRows) {
     check('separate customers with the same name are not merged',
       twoList.json?.data?.total === 2 && twoList.json.data.rows.length === 2);
 
+    // The dashboard must report customers, not x-ui client rows: three packages
+    // here (1 + 3 + 2 inbounds) and six clients.
+    const packageOverview = await request('GET', '/api/reseller/overview', { cookies: shopCookies });
+    const packageStats = packageOverview.json?.data?.configs || {};
+    check(
+      'dashboard counts customer packages instead of inbounds',
+      packageOverview.status === 200
+        && packageStats.total === 3
+        && packageStats.active === 3
+        && packageStats.mixed === 0,
+      `total=${packageStats.total} active=${packageStats.active} mixed=${packageStats.mixed}`
+    );
+    const packageMe = await request('GET', '/api/reseller/me', { cookies: shopCookies });
+    check(
+      'reseller profile exposes both package and row counts',
+      packageMe.status === 200
+        && packageMe.json.data.stats.packages === 3
+        && packageMe.json.data.stats.activePackages === 3
+        && packageMe.json.data.stats.configs === 6,
+      `packages=${packageMe.json?.data?.stats?.packages} rows=${packageMe.json?.data?.stats?.configs}`
+    );
+
+    // One order spends exactly one customer slot, no matter how many inbounds it
+    // carries; the next order is then refused by the same limit.
+    const limitSet = await request('PATCH', `/api/admin/users/${shopId}`, {
+      cookies, csrf, body: { max_configs: 4 },
+    });
+    const fourth = await request('POST', '/api/reseller/configs', {
+      cookies: shopCookies, csrf: shopCsrf,
+      body: { inboundIds: [901, 902], gb: 1, days: 1, customerName: 'مشتری چهارم' },
+    });
+    check(
+      'a two-inbound order spends one customer slot',
+      limitSet.status === 200 && fourth.status === 201,
+      `status=${fourth.status} error=${fourth.json?.error?.code || ''}`
+    );
+    const fifth = await request('POST', '/api/reseller/configs', {
+      cookies: shopCookies, csrf: shopCsrf,
+      body: { inboundIds: [901], gb: 1, days: 1, customerName: 'مشتری پنجم' },
+    });
+    check(
+      'the customer limit counts packages, not inbounds',
+      fifth.status === 403 && fifth.json?.error?.code === 'limit_configs',
+      `status=${fifth.status} code=${fifth.json?.error?.code}`
+    );
+    await request('PATCH', `/api/admin/users/${shopId}`, { cookies, csrf, body: { max_configs: 10 } });
+    const expiringOverview = await request('GET', '/api/reseller/overview', { cookies: shopCookies });
+    check(
+      'an expiring package is counted once for the whole group',
+      expiringOverview.json?.data?.configs.total === 4
+        && expiringOverview.json.data.expiring3d === 1,
+      `total=${expiringOverview.json?.data?.configs?.total} expiring=${expiringOverview.json?.data?.expiring3d}`
+    );
+
     // Direct fixtures exist ONLY in the disposable self-test database. They
     // cover legacy rows, token collisions, deletion and mixed member states.
     const fixtureDb = new Database(path.join(DATA_DIR, 'panel.db'));
@@ -830,6 +884,16 @@ function startMockXui(inboundRows) {
         const mixedRow = mixed.json?.data?.rows?.[0];
         check('status filter selects a complete package with mixed states',
           mixed.json?.data?.total === 1 && mixedRow?.groupCount === 3 && mixedRow.groupStatus === 'mixed');
+        // The fixtures above added three more shop packages (foreign server and
+        // two legacy token-less rows), so 4 real + 3 fixtures = 7 customers.
+        const mixedOverview = await request('GET', '/api/reseller/overview', { cookies: shopCookies });
+        check(
+          'a package with one disabled inbound is reported as mixed',
+          mixedOverview.json?.data?.configs.total === 7
+            && mixedOverview.json.data.configs.mixed === 1
+            && mixedOverview.json.data.configs.active === 6,
+          `total=${mixedOverview.json?.data?.configs?.total} mixed=${mixedOverview.json?.data?.configs?.mixed} active=${mixedOverview.json?.data?.configs?.active}`
+        );
         check('finite and unlimited member quotas and expiries are not conflated',
           mixedRow?.expiryMixed === true
           && mixedRow.inbounds.some((item) => item.configId === alteredId && item.totalBytes === 0 && item.expiryAt === 0 && item.used === 123)

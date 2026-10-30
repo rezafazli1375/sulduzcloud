@@ -137,12 +137,15 @@ function AdminDashboard() {
   const users = data?.users || {};
   const revenue = data?.revenue || {};
 
+  // Counts are customer packages: every inbound of one subscription is one row.
+  // A package whose inbounds disagree (one expired, one still active) is mixed.
   const donut = useMemo(
     () => [
       { name: t('common.active'), value: configs.active || 0, color: '#10b981' },
       { name: t('common.expired'), value: configs.expired || 0, color: '#f59e0b' },
       { name: t('common.depleted'), value: configs.depleted || 0, color: '#f43f5e' },
       { name: t('common.disabled'), value: configs.disabled || 0, color: '#64748b' },
+      ...(Number(configs.mixed) > 0 ? [{ name: t('dash.mixedPackages'), value: Number(configs.mixed), color: '#8b5cf6' }] : []),
     ],
     [configs, t]
   );
@@ -165,7 +168,7 @@ function AdminDashboard() {
       />
 
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <Kpi icon={Boxes} label={t('dash.kpiConfigs')} value={formatNumber(configs.total, lang)} hint={`${formatNumber(configs.active, lang)} ${t('common.active')}`} tone="emerald" to="/configs" />
+        <Kpi icon={Boxes} label={t('dash.kpiCustomers')} value={formatNumber(configs.total, lang)} hint={`${formatNumber(configs.active, lang)} ${t('common.active')}`} tone="emerald" to="/configs" />
         <Kpi icon={Users} label={t('dash.kpiUsers')} value={formatNumber(users.resellers, lang)} hint={`${formatNumber(users.active, lang)} ${t('common.active')}`} tone="cyan" to="/resellers" />
         <Kpi icon={Activity} label={t('dash.kpiTrafficToday')} value={data ? formatBytes(data.today?.total, lang, { digits: 1 }) : '—'} hint={data ? `${t('common.week')}: ${formatBytes(data.week?.total, lang)}` : ''} tone="violet" to="/stats" />
         <Kpi icon={Ticket} label={t('dash.kpiOpenTickets')} value={formatNumber(data?.openTickets, lang)} hint={t('dash.kpiExpiring').concat(': ').concat(formatNumber(data?.expiring3d, lang))} tone={data?.openTickets ? 'amber' : 'rose'} to="/tickets" />
@@ -192,7 +195,7 @@ function AdminDashboard() {
       </div>
 
       <div className="mt-4 grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
-        <SectionCard title={t('dash.kpiConfigs')} subtitle={`${formatNumber(configs.total, lang)} ${t('common.configs')}`} icon={Gauge}>
+        <SectionCard title={t('dash.kpiCustomers')} subtitle={`${formatNumber(configs.total, lang)} ${t('common.customers')}`} icon={Gauge}>
           {configs.total ? (
             <>
               <StatusDonut items={donut} height={190} />
@@ -342,7 +345,7 @@ function ResellerDashboard() {
       />
 
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <Kpi icon={Boxes} label={t('dash.kpiConfigs')} value={formatNumber(configs.total, lang)} hint={`${formatNumber(configs.active, lang)} ${t('common.active')}`} tone="emerald" to="/configs" />
+        <Kpi icon={Boxes} label={t('dash.kpiCustomers')} value={formatNumber(configs.total, lang)} hint={`${formatNumber(configs.active, lang)} ${t('common.active')}`} tone="emerald" to="/configs" />
         <Kpi icon={Activity} label={t('dash.kpiTrafficToday')} value={data ? formatBytes(data.today?.total, lang, { digits: 1 }) : '—'} hint={data ? `${t('common.month')}: ${formatBytes(data.month?.total, lang)}` : ''} tone="cyan" to="/stats" />
         <Kpi icon={CreditCard} label={t('dash.kpiBalance')} value={formatMoney(data?.balance ?? user?.balance ?? 0, lang, currency)} hint={t('dash.balanceHint')} tone="violet" to="/wallet" />
         <Kpi icon={CalendarClock} label={t('dash.kpiExpiring')} value={formatNumber(data?.expiring3d, lang)} hint={t('common.days')} tone="amber" to="/configs?expiring=3" />
@@ -373,7 +376,7 @@ function ResellerDashboard() {
             </div>
             <Button size="xs" variant="soft" onClick={() => navigate('/wallet')}>{t('nav.wallet')}</Button>
           </div>
-          <LimitRow label={t('dash.kpiConfigs')} used={configs.total || 0} total={limits.maxConfigs} lang={lang} />
+          <LimitRow label={t('dash.kpiCustomers')} used={configs.total || 0} total={limits.maxConfigs} lang={lang} />
           <LimitRow label={t('resellers.form.maxTotalGb')} used={Math.round((configs.quotaBytes || 0) / 1024 ** 3)} total={limits.maxTotalGb} lang={lang} suffix="GB" />
           <div className="grid grid-cols-2 gap-2 pt-1">
             <div className="rounded-lg bg-white/[0.025] px-2.5 py-2">

@@ -2,7 +2,7 @@
 
 const { getDb } = require('../db');
 const { hashPassword } = require('../auth');
-const { ApiError, sanitizeUser, parsePermissions, safeJsonParse, randomToken, escapeLike } = require('../utils');
+const { ApiError, sanitizeUser, parsePermissions, safeJsonParse, randomToken, escapeLike, CONFIG_GROUP_KEY_SQL } = require('../utils');
 const { audit } = require('../audit');
 
 const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
@@ -26,9 +26,25 @@ function userStats(userId) {
             COALESCE(SUM(up_bytes + down_bytes), 0) AS used
      FROM configs WHERE user_id = ? AND deleted_at = 0`
   ).get(Date.now(), Number(userId));
+  // Row counts above stay for API v1, which is documented as one row per inbound.
+  // Packages are the customer-facing unit: every inbound of one subscription is
+  // a single customer, exactly like the grouped config list and the dashboard.
+  const packages = db.prepare(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN active_n = members THEN 1 ELSE 0 END), 0) AS active
+     FROM (
+       SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey, COUNT(*) AS members,
+         SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${Date.now()})
+                   AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes) THEN 1 ELSE 0 END) AS active_n
+       FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0
+       GROUP BY gkey
+     )`
+  ).get(Number(userId));
   return {
     configs: Number(row.configs || 0),
     active: Number(row.active || 0),
+    packages: Number(packages.total || 0),
+    activePackages: Number(packages.active || 0),
     quotaBytes: Number(row.quota || 0),
     usedBytes: Number(row.used || 0),
   };
@@ -251,16 +267,23 @@ function adjustBalance(id, amount, description, req) {
   return { balance: next, transaction: delta };
 }
 
+// `count` is how many new customer packages this action adds: one per order,
+// zero when an inbound is appended to a customer who already exists.
 function checkLimits(user, { gb = 0, days = 0, count: adding = 1, gbEach = 0 } = {}) {
   const db = getDb();
   const row = db.prepare(
-    `SELECT COUNT(*) AS configs, COALESCE(SUM(total_bytes), 0) AS quota
-     FROM configs WHERE user_id = ? AND deleted_at = 0`
+    `SELECT COUNT(*) AS packages, COALESCE(SUM(total_bytes), 0) AS quota
+     FROM (
+       SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey, SUM(c.total_bytes) AS total_bytes
+       FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0
+       GROUP BY gkey
+     )`
   ).get(Number(user.id));
-  const count = Number(row.configs || 0);
+  const count = Number(row.packages || 0);
   const quota = Number(row.quota || 0);
   const maxConfigs = Number(user.max_configs || 0);
-  if (maxConfigs > 0 && count + Number(adding || 1) > maxConfigs) {
+  const addPackages = Math.max(0, Number(adding || 0));
+  if (maxConfigs > 0 && count + addPackages > maxConfigs) {
     throw new ApiError(403, 'limit_configs', `Config limit reached (${maxConfigs})`);
   }
   const gbBytes = Math.round(Number(gb || 0) * 1024 * 1024 * 1024);

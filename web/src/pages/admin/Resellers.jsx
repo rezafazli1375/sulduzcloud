@@ -596,8 +596,8 @@ function UserDetail({ userId, onClose, onEdit }) {
 
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {[
-                { label: t('common.configs'), value: formatNumber(stats.configs, lang), icon: Boxes },
-                { label: t('common.active'), value: formatNumber(stats.active, lang), icon: Activity },
+                { label: t('common.customers'), value: formatNumber(stats.packages ?? stats.configs, lang), icon: Boxes },
+                { label: t('common.active'), value: formatNumber(stats.activePackages ?? stats.active, lang), icon: Activity },
                 { label: t('common.quota'), value: formatBytes(stats.quotaBytes, lang), icon: Download },
                 { label: t('common.used'), value: formatBytes(stats.usedBytes, lang), icon: CalendarClock },
               ].map((item) => (
@@ -842,7 +842,7 @@ export default function Resellers() {
                         </div>
                       </td>
                       <td>
-                        <p className="text-[11.5px] text-slate-300">{formatNumber(row.stats?.configs, lang)} {t('common.configs')}</p>
+                        <p className="text-[11.5px] text-slate-300">{formatNumber(row.stats?.packages ?? row.stats?.configs, lang)} {t('common.customers')}</p>
                         <p className="text-[10px] text-slate-500">{formatBytes(row.stats?.usedBytes, lang)}</p>
                       </td>
                       <td>
@@ -876,7 +876,7 @@ export default function Resellers() {
                     <Avatar name={row.name || row.username} size="sm" />
                     <div className="min-w-0">
                       <p className="truncate text-[12.5px] font-medium text-slate-100">{row.name || `@${row.username}`}</p>
-                      <p className="truncate text-[9.5px] text-slate-500">{formatNumber(row.stats?.configs, lang)} {t('common.configs')}</p>
+                      <p className="truncate text-[9.5px] text-slate-500">{formatNumber(row.stats?.packages ?? row.stats?.configs, lang)} {t('common.customers')}</p>
                     </div>
                   </div>
                   <StatusBadge status={row.status} />

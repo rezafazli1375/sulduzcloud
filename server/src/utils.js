@@ -107,6 +107,13 @@ function statusOf(configRow, at = Date.now()) {
   return 'active';
 }
 
+// A customer package is every config of one reseller on one server that shares
+// the subscription token. Names are not identities, and legacy rows without a
+// token stay independent. `c` must be the configs table alias in the query.
+const CONFIG_GROUP_KEY_SQL = `(CASE WHEN c.sub_id <> ''
+  THEN 'G:' || c.user_id || ':' || c.server_id || ':' || c.sub_id
+  ELSE 'C:' || c.id END)`;
+
 function sanitizeUser(row) {
   if (!row) return null;
   const permissions = parsePermissions(row.permissions);
@@ -288,6 +295,7 @@ module.exports = {
   parsePermissions,
   parseNumberArray,
   statusOf,
+  CONFIG_GROUP_KEY_SQL,
   sanitizeUser,
   sanitizeConfig,
   pageParams,

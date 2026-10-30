@@ -19,6 +19,7 @@ const {
   escapeLike,
   safeJsonParse,
   pageParams,
+  CONFIG_GROUP_KEY_SQL,
 } = require('../utils');
 const { audit } = require('../audit');
 const { notifyUser } = require('../notify');
@@ -202,10 +203,12 @@ async function createConfigs(input, req) {
   if (priced.some((item) => Number(item.server.id) !== orderServer)) {
     throw new ApiError(422, 'server_mismatch', 'همه اینباندهای یک سفارش باید روی یک سرور باشند / All inbounds in one order must belong to the same server');
   }
+  // Every inbound in one order belongs to one customer package, so the whole
+  // order consumes a single slot of the reseller's customer limit.
   usersService.checkLimits(user, {
     gb: gb * inboundIds.length,
     days,
-    count: inboundIds.length,
+    count: 1,
     gbEach: gb,
   });
 
@@ -336,9 +339,7 @@ function buildWhere(filters, viewer) {
 // Match groupRows(): a package belongs to one reseller on one server. Names
 // are not identities, and legacy rows without a token must stay independent.
 // `flat: true` preserves the original sanitized API v1 response contract.
-const GROUP_KEY_SQL = `(CASE WHEN c.sub_id <> ''
-  THEN 'G:' || c.user_id || ':' || c.server_id || ':' || c.sub_id
-  ELSE 'C:' || c.id END)`;
+const GROUP_KEY_SQL = CONFIG_GROUP_KEY_SQL;
 
 function mergeGroup(members) {
   const first = members[0];
@@ -799,7 +800,8 @@ async function addInbound(id, inboundId, req, viewer) {
   const totalGb = totalBytes > 0 ? Math.round((totalBytes / 1024 / 1024 / 1024) * 100) / 100 : 0;
   const remainingDays = expiryAt > 0 ? Math.max(1, Math.ceil((expiryAt - Date.now()) / DAY_MS)) : 0;
   const amount = pricing.priceFor(inbound, totalGb, remainingDays, user.id);
-  usersService.checkLimits(user, { count: 1, gb: totalGb, gbEach: totalGb, days: remainingDays });
+  // This joins the customer's existing package instead of creating a new one.
+  usersService.checkLimits(user, { count: 0, gb: totalGb, gbEach: totalGb, days: remainingDays });
 
   if (billingEnabled() && amount > 0 && Number(user.balance || 0) < amount) {
     throw new ApiError(402, 'insufficient_balance', 'موجودی کیف پول کافی نیست / Insufficient wallet balance');
