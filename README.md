@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/inst
 - نمایندگان: ساخت/ویرایش/غیرفعال‌سازی، سقف تعداد کانفیگ، سقف حجم هر کانفیگ و حجم کل، محدودیت IP، تاریخ انقضا، دسترسی ماژول‌به‌ماژول، کیف پول، کلید API، ریست رمز
 - کانفیگ‌ها: ساخت روی هر اینباندِ هر نود برای هر نماینده، تمدید، افزایش حجم، فعال/غیرفعال، ریست مصرف، لینک اشتراک و URI + QR، خروجی CSV
 - اینباندها: همگام‌سازی از ۳x-ui، نمایش/مخفی‌سازی برای نمایندگان، ویرایش مشخصات
-- پنل‌های x-ui متعدد: افزودن/ویرایش/حذف چند پنل ۳x-ui هم‌زمان؛ هر اینباند و کانفیگ به سرور خودش وصل است، همگام‌سازی و پایش جدا برای هر پنل
+- پنل‌های x-ui متعدد: افزودن/ویرایش/حذف چند پنل ۳x-ui هم‌زمان؛ هر اینباند و کانفیگ به سرور خودش وصل است، همگام‌سازی و پایش جدا برای هر پنل. حذف تنها سرورِ باقی‌مانده مجاز است و پنل را به همان حالت خام اول برمی‌گرداند؛ سروری که هنوز کانفیگ فعال دارد حذف نمی‌شود تا کلاینت‌های زنده قطع نشوند
 - سرورها و نودها: وضعیت زنده پنل‌ها و نودها، تأخیر، موجودی منابع، بررسی فوری، هشدار قطعی از طریق ایمیل و پیامک
 - آمار و گزارش: روند ترافیک، درآمد، وضعیت کانفیگ‌ها، برترین نمایندگان، تراکنش‌ها
 - تیکت‌ها، اطلاع‌رسانی گروهی (همه/مدیران/انتخابی)، تاریخچه ارسال
@@ -276,7 +276,7 @@ Each reseller signs in with their own username/password and, within the limits t
 
 ### Feature highlights
 
-- **Admin**: dashboard KPIs, resellers with per-module permissions and quotas (configs, GB per config, total GB, IP limit, expiry, balance, API key), configs on any inbound for any reseller, renew/extend/toggle/reset, subscription link + URI + QR, CSV export, inbound sync/visibility, live server/node status with latency and resource usage, email/SMS outage alarms, traffic & revenue reports, tickets, broadcast, manual/auto backups with retention and restore, audit log, settings (general, x-ui, monitoring, email, SMS, wallet, backups, security).
+- **Admin**: dashboard KPIs, resellers with per-module permissions and quotas (configs, GB per config, total GB, IP limit, expiry, balance, API key), configs on any inbound for any reseller, renew/extend/toggle/reset, subscription link + URI + QR, CSV export, inbound sync/visibility, multiple x-ui servers (add/edit/delete; deleting the last server returns the panel to its blank first-run state, while a server that still owns configs is protected so live clients are never cut), live server/node status with latency and resource usage, email/SMS outage alarms, traffic & revenue reports, tickets, broadcast, manual/auto backups with retention and restore, audit log, settings (general, x-ui, monitoring, email, SMS, wallet, backups, security).
 - **Reseller**: self-service configs within limits, renew & add traffic, usage stats, wallet & transactions, tickets, notifications, profile/password, API keys with REST docs.
 - **Security**: JWT in HttpOnly cookie, CSRF double-submit, bcrypt, session revocation, login rate limit, Helmet, zod validation, audit log, per-key API rate limit.
 - **UI**: full fa/en with RTL/LTR, locally bundled Vazirmatn, premium dark theme, charts, skeletons, toasts, responsive mobile layout.
