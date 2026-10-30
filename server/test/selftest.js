@@ -426,9 +426,29 @@ function startMockXui(inboundRows) {
         && savedPatterns.nodeOffline?.code === 'NODE-DOWN'
         && savedPatterns.nodeOffline?.names === 'node,server'
         && savedPatterns.nodeOffline?.var2 === '{server}'
+        && savedPatterns.nodeOffline?.enabled === true
         && savedPatterns.panelOnline?.code === ''
         && savedPatterns.test?.code === '',
       JSON.stringify(savedPatterns)
+    );
+
+    const smsMute = await request('PATCH', '/api/admin/settings/sms', {
+      cookies,
+      csrf,
+      body: {
+        patterns: {
+          nodeOffline: { enabled: false, code: 'NODE-DOWN', names: 'node,server', var1: '{node}', var2: '{server}', var3: '' },
+        },
+      },
+    });
+    const mutedPatterns = smsMute.json?.data?.saved?.patterns || {};
+    check(
+      'a notification can be muted while its pattern is kept',
+      smsMute.status === 200
+        && mutedPatterns.nodeOffline?.enabled === false
+        && mutedPatterns.nodeOffline?.code === 'NODE-DOWN'
+        && mutedPatterns.nodeOnline?.enabled === true,
+      JSON.stringify(mutedPatterns)
     );
 
     const backupListAfter = await request('GET', '/api/admin/backups', { cookies });

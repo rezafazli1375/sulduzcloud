@@ -134,7 +134,13 @@ export default function Settings() {
 
   const testSms = useMutation({
     mutationFn: () => api.post('/admin/settings/test-sms'),
-    onSuccess: (result) => toast.success(`${t('settings.testSent')}${result?.to ? ` · ${result.to}` : ''}${result?.mode ? ` · ${result.mode}` : ''}${result?.pattern ? ` · ${result.pattern}` : ''}`),
+    onSuccess: (result) => {
+      if (result?.skipped === 'event_disabled') {
+        toast.error(t('settings.sms.events.disabledTest'));
+        return;
+      }
+      toast.success(`${t('settings.testSent')}${result?.to ? ` · ${result.to}` : ''}${result?.mode ? ` · ${result.mode}` : ''}${result?.pattern ? ` · ${result.pattern}` : ''}${result?.source === 'event' ? ` · ${t('settings.sms.events.own')}` : ''}`);
+    },
     onError: (err) => toast.error(err?.message || t('errors.generic')),
   });
 
@@ -507,23 +513,30 @@ export default function Settings() {
                   <p className="text-[12px] font-medium text-indigo-100">{t('settings.sms.events.title')}</p>
                   <p className="mt-1 text-[10.5px] leading-5 text-indigo-100/70">{t('settings.sms.events.hint')}</p>
                 </div>
-                {SMS_EVENTS.map(({ value, vars }) => {
-                  const cfg = sms.patterns?.[value] || {};
+                {SMS_EVENTS.map(({ value: eventKey, vars }) => {
+                  const cfg = sms.patterns?.[eventKey] || {};
                   const own = Boolean(String(cfg.code || '').trim());
+                  const enabled = cfg.enabled !== false;
                   return (
-                    <div key={value} className="rounded-lg border border-white/[0.07] bg-slate-950/30 p-3">
+                    <div key={eventKey} className="rounded-lg border border-white/[0.07] bg-slate-950/30 p-3">
                       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                        <p className="text-[12px] font-medium text-slate-200">{t(`settings.sms.events.${value}`)}</p>
-                        <span className={cx(
-                          'chip',
-                          own
-                            ? 'border-emerald-400/20 bg-emerald-500/10 text-emerald-300'
-                            : 'border-white/10 bg-white/[0.04] text-slate-500',
-                        )}>
-                          {own ? t('settings.sms.events.own') : t('settings.sms.events.fallback')}
-                        </span>
+                        <p className="text-[12px] font-medium text-slate-200">{t(`settings.sms.events.${eventKey}`)}</p>
+                        <div className="flex items-center gap-2">
+                          <span className={cx(
+                            'chip',
+                            own
+                              ? 'border-emerald-400/20 bg-emerald-500/10 text-emerald-300'
+                              : 'border-white/10 bg-white/[0.04] text-slate-500',
+                          )}>
+                            {own ? t('settings.sms.events.own') : t('settings.sms.events.fallback')}
+                          </span>
+                          <span className={cx('text-[10.5px]', enabled ? 'text-emerald-300/80' : 'text-slate-500')}>
+                            {enabled ? t('settings.sms.events.on') : t('settings.sms.events.off')}
+                          </span>
+                          <Switch checked={enabled} onChange={(next) => patchPattern(eventKey, 'enabled', next)} />
+                        </div>
                       </div>
-                      <div className="grid gap-3 sm:grid-cols-2">
+                      <div className={cx('grid gap-3 sm:grid-cols-2', enabled ? '' : 'pointer-events-none opacity-40')}>
                         <Field
                           label={sms.provider === 'farazsms' ? t('settings.sms.patternCode') : t('settings.sms.patternTemplate')}
                           hint={sms.pattern ? `↳ ${sms.pattern}` : ''}
@@ -531,7 +544,7 @@ export default function Settings() {
                           <Input
                             dir="ltr"
                             value={cfg.code || ''}
-                            onChange={(e) => patchPattern(value, 'code', e.target.value)}
+                            onChange={(e) => patchPattern(eventKey, 'code', e.target.value)}
                             placeholder={sms.pattern || ''}
                           />
                         </Field>
@@ -540,13 +553,13 @@ export default function Settings() {
                             <Input
                               dir="ltr"
                               value={cfg.names || ''}
-                              onChange={(e) => patchPattern(value, 'names', e.target.value)}
+                              onChange={(e) => patchPattern(eventKey, 'names', e.target.value)}
                               placeholder={sms.patternNames || 'var1,var2'}
                             />
                           </Field>
                         ) : null}
                       </div>
-                      <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                      <div className={cx('mt-3 grid gap-3 sm:grid-cols-3', enabled ? '' : 'pointer-events-none opacity-40')}>
                         {[1, 2, 3].map((index) => (
                           <Field
                             key={index}
@@ -556,14 +569,16 @@ export default function Settings() {
                             <Input
                               dir="ltr"
                               value={cfg[`var${index}`] || ''}
-                              onChange={(e) => patchPattern(value, `var${index}`, e.target.value)}
+                              onChange={(e) => patchPattern(eventKey, `var${index}`, e.target.value)}
                               placeholder={index === 1 ? '{title}' : index === 2 ? '{body}' : ''}
                             />
                           </Field>
                         ))}
                       </div>
                       <p className="mt-2 text-[10px] leading-5 text-indigo-200/60">
-                        {t('settings.sms.events.vars')}: {[...vars, '{title}', '{body}', '{text}', '{date}'].join(' · ')}
+                        {enabled
+                          ? `${t('settings.sms.events.vars')}: ${[...vars, '{title}', '{body}', '{text}', '{date}'].join(' · ')}`
+                          : t('settings.sms.events.disabledHint')}
                       </p>
                     </div>
                   );

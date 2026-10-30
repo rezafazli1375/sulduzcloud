@@ -70,12 +70,13 @@ const DEFAULTS = {
     patternNames: 'var1,var2,var3',
     // Optional per-notification patterns. Empty code = use the default pattern
     // above; empty mapping = the event's built-in placeholders (see notify.js).
+    // `enabled: false` mutes SMS for that notification entirely.
     patterns: {
-      nodeOffline: { code: '', names: '', var1: '', var2: '', var3: '' },
-      nodeOnline: { code: '', names: '', var1: '', var2: '', var3: '' },
-      panelOffline: { code: '', names: '', var1: '', var2: '', var3: '' },
-      panelOnline: { code: '', names: '', var1: '', var2: '', var3: '' },
-      test: { code: '', names: '', var1: '', var2: '', var3: '' },
+      nodeOffline: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
+      nodeOnline: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
+      panelOffline: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
+      panelOnline: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
+      test: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
     },
     customUrl: '',
     customMethod: 'POST',

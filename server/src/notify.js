@@ -329,6 +329,13 @@ async function sendSms(text, to, options = {}) {
   if (!recipients.length) throw new ApiError(400, 'sms_no_recipient', 'No SMS recipient configured');
   const message = String(text || '').slice(0, SMS_TEXT_MAX);
 
+  // The owner can mute any notification without losing its saved pattern; the
+  // in-panel and email channels stay active, only the SMS is skipped.
+  const event = String(options.event || '');
+  if (event && sms.patterns && sms.patterns[event] && sms.patterns[event].enabled === false) {
+    return { ok: true, skipped: 'event_disabled', event, recipients: [] };
+  }
+
   if (sms.provider === 'custom') {
     if (!sms.customUrl) throw new ApiError(400, 'sms_incomplete', 'Custom SMS URL is missing');
     let headers = {};
@@ -400,8 +407,11 @@ async function alertAdmins({ event = '', data = {}, title, body }) {
   }
   if (monitor.alertSms) {
     try {
-      await sendSms(`${title}\n${body}`, undefined, { event, data, title, body });
-      results.sms = true;
+      const result = await sendSms(`${title}\n${body}`, undefined, {
+        event, data, title, body,
+      });
+      results.sms = !result.skipped;
+      if (result.skipped) results.skipped = result.skipped;
     } catch (err) { results.errors.push(`sms: ${err.message}`); }
   }
   return results;

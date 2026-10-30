@@ -303,6 +303,57 @@ async function run() {
     JSON.stringify(verifyBody)
   );
 
+  // --------------------------------------------- per-notification mute switch
+  const muteBase = settings.getSetting('sms').patterns;
+  settings.updateSection('sms', {
+    patterns: {
+      ...muteBase,
+      nodeOffline: { ...muteBase.nodeOffline, enabled: false },
+    },
+  });
+  calls.length = 0;
+  const muted = await notify.alertAdmins({
+    event: 'nodeOffline',
+    data: { node: 'dl20', server: 'dash', address: '1.2.3.4', failures: 3 },
+    title: 'هشدار: نود dl20 قطع شد',
+    body: 'نود dl20 روی dash پاسخ نداد.',
+  });
+  check(
+    'a muted notification sends no SMS but the alert keeps flowing',
+    muted.sms === false && muted.skipped === 'event_disabled' && calls.length === 0,
+    `calls=${calls.length} skipped=${muted.skipped}`
+  );
+
+  settings.updateSection('sms', {
+    patterns: { ...settings.getSetting('sms').patterns, nodeOffline: { ...muteBase.nodeOffline, enabled: true } },
+  });
+  calls.length = 0;
+  const unmuted = await notify.alertAdmins({
+    event: 'nodeOffline',
+    data: { node: 'dl20', server: 'dash', address: '1.2.3.4', failures: 3 },
+    title: 'هشدار: نود dl20 قطع شد',
+    body: 'نود dl20 روی dash پاسخ نداد.',
+  });
+  check(
+    'turning the notification back on restores the same saved pattern',
+    unmuted.sms === true
+      && calls.length === 2
+      && bodyOf(calls[0]).code === 'NODE-DOWN'
+      && bodyOf(calls[0]).attributes?.n === 'dl20',
+    `calls=${calls.length}`
+  );
+
+  settings.updateSection('sms', {
+    patterns: { ...settings.getSetting('sms').patterns, test: { ...settings.getSetting('sms').patterns.test, enabled: false } },
+  });
+  calls.length = 0;
+  const mutedTest = await notify.testSms();
+  check(
+    'a muted test event reports skipped instead of sending',
+    mutedTest.skipped === 'event_disabled' && calls.length === 0,
+    `calls=${calls.length}`
+  );
+
   // ---------------------------------------------------------------- disabled
   settings.updateSection('sms', { enabled: false });
   err = null;
