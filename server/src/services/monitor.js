@@ -134,7 +134,9 @@ async function runCycle(reason = 'timer') {
       result.panels.push({ server: server.id, name: server.name, ...(await checkPanel(server)) });
     }
     result.panel = result.panels[0] || { online: false, error: 'no_server' };
-    if (monitor.enabled) {
+    // A fresh installation has no panel yet; nothing to sync and no error worth
+    // logging every two minutes.
+    if (monitor.enabled && serverList.length > 0) {
       try {
         result.inbounds = await inboundsService.syncInbounds();
       } catch (err) {
