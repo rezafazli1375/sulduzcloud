@@ -286,8 +286,8 @@ async function nodes(server) {
   return Array.isArray(rows) ? rows : [];
 }
 
-async function serverStatus(server) {
-  return request('GET', '/server/status', undefined, { server });
+async function serverStatus(server, opts = {}) {
+  return request('GET', '/server/status', undefined, { server, ...opts });
 }
 
 async function testConnection(server) {

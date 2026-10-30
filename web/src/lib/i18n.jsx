@@ -451,7 +451,10 @@ const fa = {
   servers: {
     title: 'سرورها و نودها',
     subtitle: 'پایش زنده پنل‌های x-ui و نودها با هشدار خودکار',
-    panel: 'پنل مرکزی',
+    panel: 'وضعیت پنل‌ها',
+    panelsStatus: 'وضعیت پنل‌ها',
+    panelsEmptyHint: 'هنوز سروری اضافه نشده است؛ با دکمهٔ «افزودن سرور» اولین پنل x-ui را وصل کنید.',
+    resourcesUnavailable: 'منابع این سرور در دسترس نیست',
     panels: {
       title: 'پنل‌های x-ui',
       subtitle: 'چند پنل ثنایی را همزمان مدیریت کنید؛ هر اینباند به سرور خودش وصل است.',
@@ -460,6 +463,7 @@ const fa = {
       empty: 'هیچ سروری ثبت نشده است.',
       name: 'نام سرور',
       url: 'آدرس پنل',
+      urlHint: 'نوع اتصال را از دکمهٔ کنار انتخاب کنید و دامنه/آی‌پی و مسیر پنل را بدون http بنویسید.',
       token: 'توکن API',
       tokenHint: 'توکن از بخش API پنل ثنایی گرفته می‌شود.',
       tokenKeep: 'خالی بگذارید تا توکن فعلی حفظ شود.',
@@ -766,6 +770,7 @@ const fa = {
     serverInUse: 'این سرور همچنان کانفیگ دارد؛ اول کانفیگ‌هایش را حذف یا منتقل کنید',
     serverNotFound: 'سرور پیدا نشد',
     xuiNotConfigured: 'هیچ سروری متصل نیست؛ اول آدرس و توکن پنل را ذخیره کنید',
+    invalidUrl: 'آدرس پنل معتبر نیست؛ دامنه/آی‌پی و پورت را بدون http وارد کنید',
   },
   pwa: {
     offline: 'اتصال اینترنت قطع است',
@@ -1223,7 +1228,10 @@ const en = {
   servers: {
     title: 'Servers & Nodes',
     subtitle: 'Live monitoring of x-ui panels and nodes with automatic alerts',
-    panel: 'Master panel',
+    panel: 'Panels status',
+    panelsStatus: 'Panels status',
+    panelsEmptyHint: 'No server yet — use “Add server” to connect your first x-ui panel.',
+    resourcesUnavailable: 'Resource usage is unavailable for this server',
     panels: {
       title: 'x-ui panels',
       subtitle: 'Manage several x-ui panels at once; every inbound belongs to its panel.',
@@ -1538,6 +1546,7 @@ const en = {
     serverInUse: 'This server still owns configs; delete or move them first',
     serverNotFound: 'Server not found',
     xuiNotConfigured: 'No server connected yet; save the panel address and token first',
+    invalidUrl: 'The panel address is not valid; enter host and port without http',
   },
   pwa: {
     offline: 'You are offline',
@@ -1606,6 +1615,7 @@ export function translateError(err, t) {
     forbidden: 'errors.forbidden',
     owner_only: 'errors.forbidden',
     server_in_use: 'errors.serverInUse',
+    invalid_url: 'errors.invalidUrl',
     server_not_found: 'errors.serverNotFound',
     xui_not_configured: 'errors.xuiNotConfigured',
   };

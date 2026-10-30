@@ -26,7 +26,7 @@ const KNOWN = {
 export function nodeLabel(name, lang = 'fa') {
   const raw = String(name || '').trim();
   if (!raw || raw.toLowerCase() === 'local') {
-    return lang === 'fa' ? 'پنل مرکزی' : 'Master panel';
+    return lang === 'fa' ? 'نود محلی' : 'Local node';
   }
   const hit = KNOWN[raw.toUpperCase()];
   if (!hit) return raw;

@@ -127,10 +127,29 @@ function serverLabel(server) {
   return server ? `${server.name || 'server'} (#${server.id})` : 'server';
 }
 
+/**
+ * Accept "https://panel.example.com:2053/path" as well as a bare
+ * "panel.example.com:2053/path". An explicit http/https scheme is always kept
+ * (a panel behind TLS must never be silently downgraded); a missing scheme
+ * defaults to http, which is what a fresh x-ui install listens on.
+ * The common "host:2053:/path" copy-paste typo (extra colon before the path) is
+ * repaired, and whitespace from a pasted address is removed.
+ */
 function normalizeUrl(value) {
-  const text = String(value || '').trim().replace(/\/+$/, '');
+  let text = String(value || '').replace(/\s+/g, '');
   if (!text) throw new ApiError(422, 'invalid_url', 'Panel address is required');
-  if (!/^https?:\/\//i.test(text)) return `http://${text}`;
+  // "host:2053:/panel" -> "host:2053/panel" (the :// of a scheme is untouched
+  // because the port group requires digits right before the stray colon).
+  text = text.replace(/^((?:https?:\/\/)?[^/]+?:\d+):\//i, '$1/');
+  if (!/^https?:\/\//i.test(text)) text = `http://${text}`;
+  text = text.replace(/\/+$/, '');
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch (_err) {
+    throw new ApiError(422, 'invalid_url', 'Panel address is not a valid URL');
+  }
+  if (!parsed.hostname) throw new ApiError(422, 'invalid_url', 'Panel address is not a valid URL');
   return text;
 }
 

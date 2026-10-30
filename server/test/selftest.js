@@ -554,6 +554,33 @@ function startMockXui(inboundRows) {
       body: { name: 'Self Test Panel 2b', enabled: false },
     });
     check('admin can edit a server', serverPatch.status === 200 && serverPatch.json.data.server.name === 'Self Test Panel 2b');
+    const httpsPatch = await request('PATCH', `/api/admin/servers/${newServerId}`, {
+      cookies,
+      csrf,
+      body: { url: 'https://dash.example.com:2053/SulduzServer24' },
+    });
+    check(
+      'an https panel address is kept as https',
+      httpsPatch.status === 200 && httpsPatch.json?.data?.server?.url === 'https://dash.example.com:2053/SulduzServer24',
+      `url=${httpsPatch.json?.data?.server?.url}`
+    );
+    const colonPatch = await request('PATCH', `/api/admin/servers/${newServerId}`, {
+      cookies,
+      csrf,
+      body: { url: 'dash.example.com:2053:/SulduzServer24' },
+    });
+    check(
+      'a stray colon between port and path is repaired',
+      colonPatch.status === 200 && colonPatch.json?.data?.server?.url === 'http://dash.example.com:2053/SulduzServer24',
+      `url=${colonPatch.json?.data?.server?.url}`
+    );
+    const serversNow = await request('GET', '/api/admin/servers', { cookies });
+    const primaryPanel = (serversNow.json?.data?.panels || [])[0] || {};
+    check(
+      'resource usage (cpu/memory) is reported per server',
+      serversNow.status === 200 && primaryPanel.resources?.cpu === 0 && primaryPanel.resources?.memTotal === 1,
+      `resources=${JSON.stringify(primaryPanel.resources)}`
+    );
     const serverReseller = await request('GET', '/api/admin/servers', { cookies: shopCookies });
     check('resellers cannot list servers', serverReseller.status === 403);
     const serverDelete = await request('DELETE', `/api/admin/servers/${newServerId}`, { cookies, csrf });

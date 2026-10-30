@@ -46,6 +46,37 @@ function num(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/** First finite number found at one of the given keys (x-ui versions differ). */
+function pickNumber(source, keys) {
+  if (!source || typeof source !== 'object') return null;
+  for (const key of keys) {
+    const value = key.split('.').reduce((acc, part) => (acc && typeof acc === 'object' ? acc[part] : undefined), source);
+    if (value !== undefined && value !== null && Number.isFinite(Number(value))) return Number(value);
+  }
+  return null;
+}
+
+/**
+ * Normalise the x-ui `/panel/api/server/status` payload into the flat resource
+ * shape the dashboard renders for every panel (CPU %, RAM and disk in bytes).
+ */
+function panelResources(raw) {
+  const obj = raw && typeof raw === 'object' ? raw : {};
+  const mem = obj.mem || obj.memory || {};
+  const disk = obj.disk || obj.diskUsage || {};
+  const xray = obj.xray || {};
+  return {
+    cpu: pickNumber(obj, ['cpu', 'cpuUsage', 'cpu.percent', 'cpuPercent']),
+    memCurrent: pickNumber(mem, ['current', 'used']),
+    memTotal: pickNumber(mem, ['total']),
+    diskCurrent: pickNumber(disk, ['current', 'used']),
+    diskTotal: pickNumber(disk, ['total']),
+    uptime: pickNumber(obj, ['uptime', 'uptimeSeconds']),
+    xrayState: String(xray.state || obj.xrayState || ''),
+    coreVersion: String(xray.version || obj.coreVersion || ''),
+  };
+}
+
 function latestStatuses() {
   const db = getDb();
   const rows = db.prepare(
@@ -380,6 +411,23 @@ router.get('/servers', auth.requirePerm('servers'), asyncH(async (req, res) => {
   const statuses = latestStatuses();
   const db = getDb();
   const panelRows = serversService.listServers();
+
+  // Resource usage (CPU / RAM / disk) is read from every enabled panel in
+  // parallel so the dashboard can show one card per server. A slow or offline
+  // panel only loses its own numbers; the others still render.
+  const resources = new Map();
+  const resourceErrors = new Map();
+  await Promise.all(panelRows
+    .filter((server) => server.enabled && server.url && server.token)
+    .map(async (server) => {
+      try {
+        const raw = await xui.serverStatus(server, { timeoutMs: 8000 });
+        resources.set(server.id, panelResources(raw));
+      } catch (err) {
+        resourceErrors.set(server.id, err.message);
+      }
+    }));
+
   const panels = panelRows.map((server) => {
     const st = statuses.get(`panel:${server.id}:0`);
     return {
@@ -388,6 +436,8 @@ router.get('/servers', auth.requirePerm('servers'), asyncH(async (req, res) => {
       latencyMs: st ? st.latency_ms : server.latencyMs,
       message: st ? st.message : server.message,
       checkedAt: st ? st.checked_at : server.lastCheckedAt,
+      resources: resources.get(server.id) || null,
+      resourcesError: resourceErrors.get(server.id) || '',
     };
   });
 
@@ -395,11 +445,10 @@ router.get('/servers', auth.requirePerm('servers'), asyncH(async (req, res) => {
   // status history for every panel in the background.
   const primary = serversService.defaultServer();
   let nodes = [];
-  let live = null;
-  let liveError = '';
+  let live = primary ? resources.get(primary.id) || null : null;
+  let liveError = primary ? resourceErrors.get(primary.id) || '' : '';
   if (primary) {
-    try { nodes = await xui.nodes(primary); } catch (err) { liveError = err.message; }
-    try { live = await xui.serverStatus(primary); } catch (err) { liveError = liveError || err.message; }
+    try { nodes = await xui.nodes(primary); } catch (err) { liveError = liveError || err.message; }
   }
   const series = db.prepare(
     `SELECT server_id, ref_id, status, latency_ms, checked_at FROM server_status
@@ -457,6 +506,8 @@ router.post('/servers', auth.requirePerm('servers'), (req, res) => {
 
 router.patch('/servers/:id', auth.requirePerm('servers'), (req, res) => {
   const server = serversService.updateServer(num(req.params.id), req.body || {}, req);
+  // Re-check in the background so the list shows the new status right away.
+  monitor.runCycle('server-edit').catch(() => {});
   res.json({ ok: true, data: { server } });
 });
 

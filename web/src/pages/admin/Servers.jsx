@@ -1,7 +1,6 @@
 import React, { useMemo } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  Activity,
   AlertTriangle,
   BellRing,
   Cpu,
@@ -15,7 +14,6 @@ import {
   Settings,
   Timer,
   Wifi,
-  WifiOff,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useI18n, translateError } from '../../lib/i18n.jsx';
@@ -37,12 +35,9 @@ import {
 import { useToast } from '../../components/feedback.jsx';
 import ServersPanels from '../../components/ServersPanels.jsx';
 
-function readNumber(source, keys) {
-  for (const key of keys) {
-    const value = key.split('.').reduce((acc, part) => (acc && typeof acc === 'object' ? acc[part] : undefined), source);
-    if (value !== undefined && value !== null && Number.isFinite(Number(value))) return Number(value);
-  }
-  return null;
+function gbText(value, lang) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '—';
+  return `${formatNumber(Number(value) / 1024 ** 3, lang, 1)} GB`;
 }
 
 function MetricBar({ icon: Icon, label, value, total, suffix = '%' }) {
@@ -105,7 +100,6 @@ export default function Servers() {
   const nodes = data?.nodes || [];
   const panels = data?.panels || [];
   const panel = data?.panel || {};
-  const live = data?.live || {};
   const monitor = data?.monitor || {};
   const series = data?.series || [];
 
@@ -119,14 +113,7 @@ export default function Servers() {
   }, [series]);
 
   const online = nodes.filter((node) => node.status === 'online' || node.status === 'up').length;
-  const cpu = readNumber(live, ['cpu', 'cpuUsage', 'cpu.usage', 'cpuPercent']);
-  const memCurrent = readNumber(live, ['mem.current', 'mem.used', 'memory.current', 'memory.used']);
-  const memTotal = readNumber(live, ['mem.total', 'memory.total']);
-  const diskCurrent = readNumber(live, ['disk.current', 'disk.used', 'diskUsage.used']);
-  const diskTotal = readNumber(live, ['disk.total', 'diskUsage.total']);
-  const uptime = readNumber(live, ['uptime', 'uptimeSeconds', 'uptime_seconds']);
-  const xrayState = live?.xray?.state || live?.xrayState || (live?.xray?.running ? 'running' : '');
-  const coreVersion = live?.xray?.version || live?.coreVersion || live?.version || '';
+  const onlinePanels = panels.filter((server) => server.status === 'online').length;
 
   return (
     <>
@@ -142,7 +129,7 @@ export default function Servers() {
       />
 
       <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <StatCard icon={Network} label={t('servers.panel')} value={panel.status === 'online' ? t('common.online') : panel.status === 'offline' ? t('common.offline') : t('common.unknown')} hint={panel.latencyMs ? `${formatNumber(panel.latencyMs, lang)} ms` : ''} tone={panel.status === 'online' ? 'emerald' : 'rose'} />
+        <StatCard icon={Network} label={t('servers.panelsStatus')} value={panels.length ? `${formatNumber(onlinePanels, lang)} / ${formatNumber(panels.length, lang)}` : '—'} hint={panels.length ? t('common.online') : t('servers.panelsEmptyHint')} tone={panels.length ? (onlinePanels === panels.length ? 'emerald' : onlinePanels ? 'amber' : 'rose') : 'cyan'} />
         <StatCard icon={Server} label={t('servers.nodes')} value={`${formatNumber(online, lang)} / ${formatNumber(nodes.length, lang)}`} hint={t('common.online')} tone="cyan" />
         <StatCard icon={BellRing} label={t('servers.alerts')} value={monitor.running ? t('servers.monitorOn') : t('servers.monitorOff')} hint={t('servers.alertsHint')} tone={monitor.running ? 'violet' : 'amber'} />
         <StatCard icon={Timer} label={t('servers.lastCheck')} value={panel.checkedAt ? relativeTime(panel.checkedAt, lang) : '—'} hint={monitor.lastRunAt ? formatDate(monitor.lastRunAt, lang, true) : ''} tone="amber" />
@@ -159,48 +146,70 @@ export default function Servers() {
           </div>
 
           <SectionCard
-            title={t('servers.panel')}
-            subtitle={data?.liveError || panels[0]?.name || 'x-ui'}
+            title={t('servers.panelsStatus')}
+            subtitle={panels.length ? t('servers.subtitle') : t('servers.panelsEmptyHint')}
             icon={Server}
-            actions={
-              <div className="flex items-center gap-2">
-                <StatusBadge status={panel.status} label={panel.status === 'online' ? t('common.online') : t('common.offline')} />
-                <IconButtonRefresh onClick={() => refetch()} spinning={isFetching} label={t('common.refresh')} />
-              </div>
-            }
-            bodyClass="p-4"
+            actions={<IconButtonRefresh onClick={() => refetch()} spinning={isFetching} label={t('common.refresh')} />}
+            bodyClass="p-0"
           >
-            <div className="grid gap-4 lg:grid-cols-3">
-              <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
-                <div className="mb-3 flex items-center justify-between">
-                  <span className="text-[11px] font-medium text-slate-400">{t('servers.cpu')}</span>
-                  <span className="text-[10px] text-slate-500">{data?.liveError ? t('servers.noLive') : ''}</span>
-                </div>
-                <MetricBar icon={Cpu} label={t('servers.cpu')} value={cpu} />
+            {panels.length ? (
+              <div className="divide-y divide-white/[0.05]">
+                {panels.map((server) => {
+                  const res = server.resources || {};
+                  const isOnline = server.status === 'online';
+                  return (
+                    <div key={server.id} className="px-4 py-4">
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <span className={cx('kpi-icon shrink-0', isOnline ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300')}>
+                          <Server className="h-[18px] w-[18px]" />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="truncate text-[12.5px] font-semibold text-slate-100">{server.name}</p>
+                            <StatusBadge status={isOnline ? 'online' : server.status || 'unknown'} />
+                            {server.enabled === false ? <Badge tone="slate">{t('servers.panels.disabled')}</Badge> : null}
+                          </div>
+                          <p className="truncate font-mono text-[10px] text-slate-500" dir="ltr">{server.url}</p>
+                        </div>
+                        <span className="flex items-center gap-1 text-[10.5px] text-slate-500"><Wifi className="h-3 w-3" />{server.latencyMs ?? '—'} ms</span>
+                      </div>
+
+                      <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                        <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+                          <MetricBar icon={Cpu} label={t('servers.cpu')} value={res.cpu ?? null} />
+                        </div>
+                        <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+                          <MetricBar icon={MemoryStick} label={t('servers.memory')} value={res.memCurrent ?? null} total={res.memTotal ?? null} />
+                          <p className="mt-2 text-[10px] text-slate-500">
+                            {gbText(res.memCurrent, lang)}{res.memTotal ? ` / ${gbText(res.memTotal, lang)}` : ''}
+                          </p>
+                        </div>
+                        <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+                          <MetricBar icon={HardDrive} label={t('servers.disk')} value={res.diskCurrent ?? null} total={res.diskTotal ?? null} />
+                          <p className="mt-2 text-[10px] text-slate-500">
+                            {gbText(res.diskCurrent, lang)}{res.diskTotal ? ` / ${gbText(res.diskTotal, lang)}` : ''}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="mt-2.5 flex flex-wrap items-center gap-2 text-[10.5px] text-slate-500">
+                        <Badge tone={res.xrayState === 'running' ? 'emerald' : 'slate'} dot>
+                          {t('servers.xray')}: {res.xrayState === 'running' ? t('servers.xrayRunning') : res.xrayState === 'stopped' ? t('servers.xrayStopped') : res.xrayState || '—'}
+                        </Badge>
+                        {res.coreVersion ? <Badge tone="cyan">{t('servers.coreVersion')}: {res.coreVersion}</Badge> : null}
+                        {res.uptime ? <Badge tone="slate">{t('servers.uptime')}: {formatNumber(Math.floor(res.uptime / 3600), lang)}h</Badge> : null}
+                        {server.resourcesError ? <span className="text-amber-300/80">{t('servers.resourcesUnavailable')}</span> : null}
+                        {server.message ? <span className="truncate">{server.message}</span> : null}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-              <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
-                <MetricBar icon={MemoryStick} label={t('servers.memory')} value={memCurrent} total={memTotal} />
-                <p className="mt-2 text-[10px] text-slate-500">
-                  {memCurrent !== null ? `${formatNumber((memCurrent / 1024 ** 3), lang, 1)} GB` : '—'}
-                  {memTotal ? ` / ${formatNumber((memTotal / 1024 ** 3), lang, 1)} GB` : ''}
-                </p>
+            ) : (
+              <div className="px-4 py-8">
+                <EmptyState icon={Server} title={t('servers.panels.empty')} hint={t('servers.panelsEmptyHint')} />
               </div>
-              <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
-                <MetricBar icon={HardDrive} label={t('servers.disk')} value={diskCurrent} total={diskTotal} />
-                <p className="mt-2 text-[10px] text-slate-500">
-                  {diskCurrent !== null ? `${formatNumber((diskCurrent / 1024 ** 3), lang, 1)} GB` : '—'}
-                  {diskTotal ? ` / ${formatNumber((diskTotal / 1024 ** 3), lang, 1)} GB` : ''}
-                </p>
-              </div>
-            </div>
-            <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/[0.06] pt-3 text-[10.5px] text-slate-500">
-              <Badge tone={xrayState === 'running' ? 'emerald' : 'slate'} dot>
-                {t('servers.xray')}: {xrayState === 'running' ? t('servers.xrayRunning') : xrayState === 'stopped' ? t('servers.xrayStopped') : xrayState || '—'}
-              </Badge>
-              {coreVersion ? <Badge tone="cyan">{t('servers.coreVersion')}: {coreVersion}</Badge> : null}
-              {uptime ? <Badge tone="slate">{t('servers.uptime')}: {formatNumber(Math.floor(uptime / 3600), lang)}h</Badge> : null}
-              <span className="ms-auto flex items-center gap-1"><Wifi className="h-3 w-3" />{panel.latencyMs ?? '—'} ms</span>
-            </div>
+            )}
           </SectionCard>
 
           <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">

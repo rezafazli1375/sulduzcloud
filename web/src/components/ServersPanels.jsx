@@ -17,11 +17,23 @@ import {
 } from './ui.jsx';
 import { useConfirm, useToast } from './feedback.jsx';
 
-const EMPTY = { name: '', url: '', token: '', subBase: '', verifyTls: false, enabled: true };
+const EMPTY = { name: '', token: '', subBase: '', verifyTls: false, enabled: true };
+
+/** "https://host:2053/path" -> { scheme: 'https', host: 'host:2053/path' } */
+function splitUrl(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/^(https?):\/\/(.*)$/i);
+  if (match) return { scheme: match[1].toLowerCase(), host: match[2] };
+  return { scheme: 'https', host: text };
+}
 
 /**
  * Admin CRUD for the x-ui panels ("servers") this dashboard controls.
  * Tokens are write-only: the API returns hasToken and never the secret.
+ *
+ * The scheme is an explicit https/http selector (default https) instead of
+ * free text, so a TLS panel address can always be entered and the server never
+ * has to guess the protocol.
  */
 export default function ServersPanels({ panels = [], onChanged }) {
   const { t, lang } = useI18n();
@@ -31,6 +43,8 @@ export default function ServersPanels({ panels = [], onChanged }) {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(EMPTY);
+  const [scheme, setScheme] = useState('https');
+  const [host, setHost] = useState('');
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ['admin', 'servers'] });
@@ -43,7 +57,7 @@ export default function ServersPanels({ panels = [], onChanged }) {
     mutationFn: () => {
       const payload = {
         name: form.name.trim(),
-        url: form.url.trim(),
+        url: host.trim() ? `${scheme}://${host.trim()}` : '',
         subBase: form.subBase.trim(),
         verifyTls: form.verifyTls,
         enabled: form.enabled,
@@ -58,6 +72,8 @@ export default function ServersPanels({ panels = [], onChanged }) {
       setOpen(false);
       setEditing(null);
       setForm(EMPTY);
+      setHost('');
+      setScheme('https');
       refresh();
     },
     onError: (err) => toast.error(translateError(err, t)),
@@ -94,20 +110,35 @@ export default function ServersPanels({ panels = [], onChanged }) {
   const startCreate = () => {
     setEditing(null);
     setForm(EMPTY);
+    setScheme('https');
+    setHost('');
     setOpen(true);
   };
 
   const startEdit = (server) => {
+    const parsed = splitUrl(server.url);
     setEditing(server);
     setForm({
       name: server.name || '',
-      url: server.url || '',
       token: '',
       subBase: server.subBase || '',
       verifyTls: Boolean(server.verifyTls),
       enabled: server.enabled !== false,
     });
+    setScheme(parsed.scheme);
+    setHost(parsed.host);
     setOpen(true);
+  };
+
+  /** Paste "https://host/path" into the host box: keep it, move the scheme. */
+  const changeHost = (value) => {
+    const match = value.match(/^(https?):\/\/(.*)$/i);
+    if (match) {
+      setScheme(match[1].toLowerCase());
+      setHost(match[2]);
+      return;
+    }
+    setHost(value);
   };
 
   return (
@@ -185,8 +216,34 @@ export default function ServersPanels({ panels = [], onChanged }) {
           <Field label={t('servers.panels.name')} required>
             <Input value={form.name} onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))} placeholder="Panel #2" />
           </Field>
-          <Field label={t('servers.panels.url')} hint="https://1.2.3.4:2053" required>
-            <Input dir="ltr" value={form.url} onChange={(e) => setForm((p) => ({ ...p, url: e.target.value }))} placeholder="http://127.0.0.1:2053" />
+          <Field label={t('servers.panels.url')} hint={t('servers.panels.urlHint')} required>
+            <div className="flex gap-2">
+              <div className="flex shrink-0 items-center rounded-xl bg-white/[0.04] p-0.5" role="group" aria-label="scheme">
+                {['https', 'http'].map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    onClick={() => setScheme(item)}
+                    className={cx(
+                      'rounded-[10px] px-2.5 py-1.5 text-[11px] font-semibold uppercase transition',
+                      scheme === item ? 'bg-cyan-500/20 text-cyan-200 shadow-[0_0_0_1px_rgba(34,211,238,0.25)_inset]' : 'text-slate-500 hover:text-slate-300'
+                    )}
+                  >
+                    {item}
+                  </button>
+                ))}
+              </div>
+              <Input
+                dir="ltr"
+                className="min-w-0 flex-1"
+                value={host}
+                onChange={(e) => changeHost(e.target.value)}
+                placeholder="dash.example.com:2053/panel-path"
+              />
+            </div>
+            {host.trim() ? (
+              <p className="mt-1 truncate font-mono text-[10px] text-slate-500" dir="ltr">{`${scheme}://${host.trim()}`}</p>
+            ) : null}
           </Field>
           <Field label={t('servers.panels.token')} hint={editing?.hasToken ? t('servers.panels.tokenKeep') : t('servers.panels.tokenHint')}>
             <Input dir="ltr" type="password" value={form.token} onChange={(e) => setForm((p) => ({ ...p, token: e.target.value }))} placeholder={editing?.hasToken ? '••••••••' : 'apiToken'} />

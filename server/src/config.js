@@ -90,7 +90,7 @@ const config = {
   xuiTokenFile: process.env.XUI_TOKEN_FILE || path.join(DATA_DIR, 'secrets', 'xui-token'),
   timezone: process.env.PANEL_TZ || 'Asia/Tehran',
   webDist: process.env.WEB_DIST || path.resolve(ROOT, '..', 'web', 'dist'),
-  version: '1.3.7',
+  version: '1.3.8',
   sessionDaysDefault: 7,
 };
 
