@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS configs (
   inbound_id INTEGER NOT NULL,
   email TEXT NOT NULL UNIQUE,
   sub_id TEXT NOT NULL DEFAULT '',
+  xui_sub_id TEXT NOT NULL DEFAULT '',
   uuid TEXT NOT NULL DEFAULT '',
   password TEXT NOT NULL DEFAULT '',
   flow TEXT NOT NULL DEFAULT '',
@@ -253,6 +254,12 @@ function migrate(db) {
   ensureColumn(db, 'configs', 'server_id', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn(db, 'server_status', 'server_id', 'INTEGER NOT NULL DEFAULT 1');
   db.exec('CREATE INDEX IF NOT EXISTS idx_inbounds_server ON inbounds(server_id, sub_sort_index, id)');
+  // Panel v1.4.0: x-ui 3.2.5+ rejects a subId shared by two clients, so the
+  // subscription id stored on the x-ui client (`xui_sub_id`) is unique per
+  // config while `sub_id` remains the customer group token. Existing rows
+  // used one shared value; map it over so their sub links keep working.
+  ensureColumn(db, 'configs', 'xui_sub_id', "TEXT NOT NULL DEFAULT ''");
+  db.prepare("UPDATE configs SET xui_sub_id = sub_id WHERE xui_sub_id = '' AND sub_id <> ''").run();
 }
 
 function rebuildInbounds(db) {

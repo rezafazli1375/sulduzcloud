@@ -7,7 +7,9 @@ const settings = require('../settings');
 const { getDb } = require('../db');
 const auth = require('../auth');
 const usersService = require('../services/users');
+const serversService = require('../services/servers');
 const ticketsService = require('../services/tickets');
+const xui = require('../xui');
 const notify = require('../notify');
 const monitor = require('../services/monitor');
 const { ApiError, asyncH, sanitizeUser } = require('../utils');
@@ -170,6 +172,48 @@ router.post('/tickets/:id/status', auth.requireAuth, (req, res) => {
   const ticket = ticketsService.setStatus(Number(req.params.id), String(req.body?.status || ''), req);
   res.json({ ok: true, data: ticket });
 });
+
+// ------------------------------------------------------------- subscriptions
+// One aggregated subscription per customer package. x-ui 3.2.5+ rejects a
+// subId shared by two clients (`subId already in use`), so a multi-inbound
+// package cannot be served by the x-ui subscription server. The group token
+// (configs.sub_id) is unguessable and acts like an x-ui sub URL: no session.
+const subCache = new Map();
+const SUB_CACHE_MS = 60 * 1000;
+
+router.get('/sub/:token', asyncH(async (req, res) => {
+  const token = String(req.params.token || '').trim();
+  if (!/^[A-Za-z0-9_-]{4,64}$/.test(token)) throw new ApiError(404, 'not_found', 'Subscription not found');
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT c.* FROM configs c LEFT JOIN inbounds i ON i.id = c.inbound_id
+     WHERE c.sub_id = ? AND c.deleted_at = 0
+     ORDER BY COALESCE(i.sub_sort_index, 0), c.inbound_id`
+  ).all(token);
+  if (!rows.length) throw new ApiError(404, 'not_found', 'Subscription not found');
+
+  const cached = subCache.get(token);
+  if (cached && Date.now() - cached.at < SUB_CACHE_MS) {
+    res.set('Cache-Control', 'no-store');
+    return res.type('text/plain').send(cached.body);
+  }
+
+  const links = [];
+  for (const row of rows) {
+    if (!row.enabled) continue;
+    try {
+      const server = serversService.resolveServer(row.server_id || 0);
+      links.push(...await xui.clientLinks(row.email, server));
+    } catch (err) {
+      console.error(`[sub] link fetch failed for ${row.email}:`, err.message);
+    }
+  }
+  if (subCache.size > 1000) subCache.clear();
+  const body = Buffer.from(links.join('\n'), 'utf8').toString('base64');
+  subCache.set(token, { at: Date.now(), body });
+  res.set('Cache-Control', 'no-store');
+  return res.type('text/plain').send(body);
+}));
 
 router.get('/nodes/status', auth.requireAuth, asyncH(async (req, res) => {
   const db = getDb();

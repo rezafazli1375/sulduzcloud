@@ -2,6 +2,7 @@
 
 const { getDb } = require('../db');
 const xui = require('../xui');
+const config = require('../config');
 const settings = require('../settings');
 const usersService = require('./users');
 const pricing = require('./pricing');
@@ -56,7 +57,28 @@ function hydrate(row) {
   return sanitizeConfig(row, inbound, reseller);
 }
 
+function publicBaseUrl() {
+  return String(config.publicUrl || '').trim().replace(/\/+$/, '');
+}
+
+// How many live configs share this customer's subscription token. A package is
+// one group; a single config is a group of one.
+function groupSize(row) {
+  if (!row || !row.sub_id) return 0;
+  return Number(getDb().prepare(
+    'SELECT COUNT(*) AS c FROM configs WHERE sub_id = ? AND user_id = ? AND deleted_at = 0'
+  ).get(row.sub_id, row.user_id).c || 0);
+}
+
 function subUrlFor(config, server) {
+  // x-ui 3.2.5+ refuses to create a second client with an already used subId,
+  // so a multi-inbound package cannot be aggregated by the x-ui subscription
+  // server. The panel serves one aggregated subscription per customer instead
+  // and every x-ui client keeps its own private subId.
+  if (config.sub_id && groupSize(config) > 1) {
+    const base = publicBaseUrl();
+    return base ? `${base}/api/sub/${encodeURIComponent(config.sub_id)}` : '';
+  }
   const xuiCfg = settings.getSetting('xui');
   let base = String((server && server.subBase) || '').replace(/\/+$/, '');
   // The legacy settings.xui.subBase only belongs to the primary panel.
@@ -66,9 +88,10 @@ function subUrlFor(config, server) {
       base = String(xuiCfg.subBase || '').replace(/\/+$/, '');
     }
   }
-  if (!base || !config.sub_id) return '';
+  const subId = String(config.xui_sub_id || config.sub_id || '');
+  if (!base || !subId) return '';
   if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
-  return `${base}/${encodeURIComponent(config.sub_id)}`;
+  return `${base}/${encodeURIComponent(subId)}`;
 }
 
 function priceFor(inbound, gb, days, userId) {
@@ -197,18 +220,24 @@ async function createConfigs(input, req) {
   const created = [];
   const createdIds = [];
   const createdEmails = [];
-  // One subscription ID per order: every inbound of this customer is listed by
-  // the same /sub/<subId> URL instead of handing out one link per inbound.
+  // One group token per order: every inbound of this customer is listed by the
+  // same subscription URL instead of handing out one link per inbound. The
+  // token is served by this panel (see routes/public.js) because x-ui 3.2.5+
+  // rejects a second client carrying an already used subId — every x-ui client
+  // therefore gets its own private xui_sub_id below.
   const subId = randomToken(16);
 
   try {
     for (const { inboundId, inbound, server } of priced) {
       const email = emailFor(user);
       const uuid = randomUUID();
+      // A single-inbound order keeps the classic behaviour: the token is also
+      // the x-ui subId, so the customer link stays on the x-ui sub server.
+      const xuiSubId = inboundIds.length === 1 ? subId : randomToken(16);
       const comment = [input.label, input.customerName, input.customerPhone].filter(Boolean).join(' | ').slice(0, 120);
       const client = {
         email,
-        subId,
+        subId: xuiSubId,
         uuid,
         flow: '',
         totalBytes,
@@ -219,15 +248,16 @@ async function createConfigs(input, req) {
       const createdClient = await xui.addClient(client, [Number(inbound.xui_id)], server);
       createdEmails.push({ email, server });
       const info = db.prepare(
-        `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, uuid, flow, label, customer_name, customer_phone,
-          note, total_bytes, expiry_at, enabled, status, sync_status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 1, 'active', '', ?, ?)`
+        `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label, customer_name,
+          customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 1, 'active', '', ?, ?)`
       ).run(
         user.id,
         inboundId,
         Number(server.id),
         email,
         subId,
+        xuiSubId,
         String(createdClient?.uuid || uuid),
         String(input.label || '').slice(0, 80),
         String(input.customerName || '').slice(0, 80),
@@ -351,6 +381,10 @@ async function linksFor(row) {
       getDb().prepare('UPDATE configs SET uuid = ?, updated_at = ? WHERE id = ?').run(client.uuid, Date.now(), row.id);
       row.uuid = client.uuid;
     }
+    if (client && client.subId && client.subId !== row.xui_sub_id) {
+      getDb().prepare('UPDATE configs SET xui_sub_id = ?, updated_at = ? WHERE id = ?').run(client.subId, Date.now(), row.id);
+      row.xui_sub_id = client.subId;
+    }
   } catch (err) {
     if (!error) error = err.message;
   }
@@ -358,7 +392,9 @@ async function linksFor(row) {
     links,
     subUrl: subUrlFor(row, server),
     error,
-    client: client ? { uuid: client.uuid, subId: client.subId, inboundIds: client.inboundIds } : null,
+    // The customer-facing subscription id is the group token; the per-client
+    // x-ui subId stays private to the panel.
+    client: client ? { uuid: client.uuid, subId: row.sub_id, inboundIds: client.inboundIds } : null,
   };
 }
 
@@ -617,34 +653,44 @@ async function updateIdentity(id, patch = {}, req, viewer) {
     next.subId = value || randomToken(16);
   }
   if (!next.uuid && !next.subId) throw new ApiError(422, 'nothing_to_change', 'Nothing to change');
-
-  await xui.setIdentity(row.email, next, serverOfConfig(row));
+  const subChanged = Boolean(next.subId) && next.subId !== row.sub_id;
+  if (!next.uuid && !subChanged) return hydrate(row);
 
   const db = getDb();
-  const fields = [];
-  const values = [];
-  if (next.uuid) { fields.push('uuid = ?'); values.push(next.uuid); }
-  if (next.subId) { fields.push('sub_id = ?'); values.push(next.subId); }
-  fields.push('updated_at = ?');
-  values.push(Date.now(), row.id);
-  db.prepare(`UPDATE configs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+  const siblings = groupRows(row).filter((sibling) => Number(sibling.id) !== Number(row.id));
 
-  // The subscription URL is keyed by subId; move the whole customer group so
-  // the single link keeps listing every inbound after a rotation.
-  if (next.subId && row.sub_id && next.subId !== row.sub_id) {
-    const siblings = db
-      .prepare('SELECT * FROM configs WHERE sub_id = ? AND user_id = ? AND deleted_at = 0 AND id <> ?')
-      .all(row.sub_id, row.user_id, row.id);
-    for (const sibling of siblings) {
+  if (next.uuid) {
+    await xui.setIdentity(row.email, { uuid: next.uuid }, serverOfConfig(row));
+    db.prepare('UPDATE configs SET uuid = ?, updated_at = ? WHERE id = ?').run(next.uuid, Date.now(), row.id);
+    row.uuid = next.uuid;
+  }
+
+  if (subChanged) {
+    if (siblings.length) {
+      // A package keeps ONE customer-facing subscription URL (served by this
+      // panel), so a rotation only rewrites the group token in the database.
+      db.prepare(
+        'UPDATE configs SET sub_id = ?, updated_at = ? WHERE sub_id = ? AND user_id = ? AND deleted_at = 0'
+      ).run(next.subId, Date.now(), row.sub_id, row.user_id);
+      row.sub_id = next.subId;
+    } else {
+      // A single config still uses the x-ui subscription server directly, so
+      // rotate the real client subId to keep <subBase>/<value> valid.
       try {
-        await xui.setIdentity(sibling.email, { subId: next.subId }, serverOfConfig(sibling));
-        db.prepare('UPDATE configs SET sub_id = ?, updated_at = ? WHERE id = ?').run(next.subId, Date.now(), sibling.id);
+        await xui.setIdentity(row.email, { subId: next.subId }, serverOfConfig(row));
       } catch (err) {
-        console.error(`[configs] subId propagation failed for ${sibling.email}:`, err.message);
+        // x-ui refuses a subId that another client already holds.
+        throw err instanceof ApiError
+          ? err
+          : new ApiError(502, 'xui_error', `تغییر شناسه اشتراک ناموفق بود: ${err.message}`);
       }
+      db.prepare('UPDATE configs SET sub_id = ?, xui_sub_id = ?, updated_at = ? WHERE id = ?')
+        .run(next.subId, next.subId, Date.now(), row.id);
+      row.sub_id = next.subId;
+      row.xui_sub_id = next.subId;
     }
   }
-  audit(req, 'config.identity', 'config', row.id, { uuid: Boolean(next.uuid), subId: Boolean(next.subId) });
+  audit(req, 'config.identity', 'config', row.id, { uuid: Boolean(next.uuid), subId: subChanged });
   return hydrate(getConfigRow(row.id));
 }
 
@@ -690,24 +736,28 @@ async function addInbound(id, inboundId, req, viewer) {
 
   const email = emailFor(user);
   const uuid = randomUUID();
+  // Each x-ui client needs its own subId (3.2.5+ rejects duplicates); the group
+  // token in configs.sub_id is what the panel's aggregated sub link exposes.
+  const xuiSubId = randomToken(16);
   const comment = [row.label, row.customer_name, row.customer_phone].filter(Boolean).join(' | ').slice(0, 120);
   const createdClient = await xui.addClient(
-    { email, subId: row.sub_id, uuid, flow: '', totalBytes, expiryAt, enabled: Boolean(row.enabled), comment },
+    { email, subId: xuiSubId, uuid, flow: '', totalBytes, expiryAt, enabled: Boolean(row.enabled), comment },
     [Number(inbound.xui_id)],
     server
   );
   let insertedId = 0;
   try {
     const info = db.prepare(
-      `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, uuid, flow, label, customer_name, customer_phone,
-        note, total_bytes, expiry_at, enabled, status, sync_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, 'active', '', ?, ?)`
+      `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label, customer_name,
+        customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, 'active', '', ?, ?)`
     ).run(
       row.user_id,
       target,
       Number(server.id),
       email,
       row.sub_id,
+      xuiSubId,
       String(createdClient?.uuid || uuid),
       String(row.label || '').slice(0, 80),
       String(row.customer_name || '').slice(0, 80),
@@ -764,7 +814,7 @@ async function syncConfigs({ pruneUsageDays } = {}) {
   );
   const updateConfig = db.prepare(
     `UPDATE configs SET up_bytes = ?, down_bytes = ?, last_up = ?, last_down = ?, last_online_at = ?,
-       enabled = ?, uuid = ?, sync_status = ?, last_synced_at = ?, updated_at = ? WHERE id = ?`
+       enabled = ?, uuid = ?, xui_sub_id = ?, sync_status = ?, last_synced_at = ?, updated_at = ? WHERE id = ?`
   );
   let synced = 0;
   let missing = 0;
@@ -775,7 +825,7 @@ async function syncConfigs({ pruneUsageDays } = {}) {
       if (!client) {
         missing += 1;
         updateConfig.run(row.up_bytes, row.down_bytes, row.last_up, row.last_down, row.last_online_at,
-          row.enabled, row.uuid, 'missing', Date.now(), Date.now(), row.id);
+          row.enabled, row.uuid, row.xui_sub_id, 'missing', Date.now(), Date.now(), row.id);
         continue;
       }
       const up = Number(client.up || 0);
@@ -788,7 +838,8 @@ async function syncConfigs({ pruneUsageDays } = {}) {
         upsertUsage.run(row.id, row.user_id, today, deltaUp, deltaDown);
       }
       updateConfig.run(up, down, up, down, client.lastOnlineAt || 0,
-        client.enabled ? 1 : 0, client.uuid || row.uuid, '', Date.now(), Date.now(), row.id);
+        client.enabled ? 1 : 0, client.uuid || row.uuid, client.subId || row.xui_sub_id,
+        '', Date.now(), Date.now(), row.id);
       synced += 1;
     }
   });

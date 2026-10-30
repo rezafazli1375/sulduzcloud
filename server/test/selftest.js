@@ -108,7 +108,14 @@ function startMockXui(inboundRows) {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ success: true, msg: '', obj }));
       };
+      const failMsg = (msg) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: false, msg, obj: null }));
+      };
       const emailOf = (suffix) => route.slice(route.indexOf(suffix) + suffix.length);
+      // x-ui 3.2.5+ refuses a subId already held by a different client.
+      const subIdTaken = (subId, exceptEmail = '') => Boolean(subId)
+        && [...clients.values()].some((c) => String(c.email) !== String(exceptEmail) && String(c.subId || '') === String(subId));
       try {
         if (route === '/inbounds/options') return send(inboundRows);
         if (route === '/inbounds/list/slim') {
@@ -123,6 +130,7 @@ function startMockXui(inboundRows) {
         }
         if (route === '/clients/add') {
           const incoming = body.client || {};
+          if (subIdTaken(incoming.subId)) return failMsg(`subId already in use: ${incoming.subId}`);
           clients.set(String(incoming.email), { ...incoming, id: incoming.id, inboundIds: (body.inboundIds || []).map(Number) });
           return send(null);
         }
@@ -131,6 +139,9 @@ function startMockXui(inboundRows) {
           const current = clients.get(email);
           if (!current) return send(null);
           const next = { ...current, ...body, email };
+          if (next.subId && next.subId !== current.subId && subIdTaken(next.subId, email)) {
+            return failMsg(`subId already in use: ${next.subId}`);
+          }
           const inboundIds = url.searchParams.get('inboundIds');
           if (inboundIds) next.inboundIds = inboundIds.split(',').map(Number);
           clients.set(email, next);
@@ -147,7 +158,10 @@ function startMockXui(inboundRows) {
           }
           return send(true);
         }
-        if (route.startsWith('/clients/links/')) return send([]);
+        if (route.startsWith('/clients/links/')) {
+          const email = emailOf('/clients/links/');
+          return send([`vless://mock-${email}@127.0.0.1:1000?type=tcp#${encodeURIComponent(email)}`]);
+        }
         if (route.startsWith('/clients/resetTraffic/')) return send(true);
         return send(null);
       } catch (err) {
@@ -636,6 +650,67 @@ function startMockXui(inboundRows) {
     check('renewal without balance is rejected', zeroOut.status === 200 && poorRenew.status === 402, `status=${poorRenew.status}`);
     const afterPoor = await request('GET', '/api/auth/me', { cookies: shopCookies });
     check('rejected renewal leaves the wallet untouched', Number(afterPoor.json?.data?.user?.balance) === 0, `balance=${afterPoor.json?.data?.user?.balance}`);
+
+    // ------------------------------------------- multi-inbound package (v1.4.0)
+    // The mock rejects a subId shared by two clients exactly like x-ui 3.2.5+
+    // does, so this order is the regression test for "subId already in use".
+    const singleLinks = await request('GET', `/api/reseller/configs/${bought.id}/links`, { cookies: shopCookies });
+    check(
+      'a single config keeps its x-ui subscription link',
+      singleLinks.status === 200 && String(singleLinks.json?.data?.subUrl || '').startsWith('https://sub.example.com/sub/'),
+      `subUrl=${singleLinks.json?.data?.subUrl}`
+    );
+
+    const multiTopup = await request('POST', `/api/admin/users/${shopId}/balance`, {
+      cookies, csrf, body: { amount: 90000, description: 'شارژ تست چند اینباند' },
+    });
+    const multiBuy = await request('POST', '/api/reseller/configs', {
+      cookies: shopCookies, csrf: shopCsrf,
+      body: { inboundIds: [901, 902, 903], gb: 10, days: 30, customerName: 'مشتری چند اینباند' },
+    });
+    const multiConfigs = multiBuy.json?.data?.configs || [];
+    check(
+      'a multi-inbound order succeeds when x-ui rejects shared subIds',
+      multiTopup.status === 200 && multiBuy.status === 201 && multiConfigs.length === 3,
+      `status=${multiBuy.status} err=${multiBuy.json?.error?.message || ''}`
+    );
+    const groupToken = multiConfigs[0]?.subId || '';
+    check(
+      'the package keeps one customer-facing subscription token',
+      Boolean(groupToken) && multiConfigs.every((config) => config.subId === groupToken),
+      `tokens=${multiConfigs.map((config) => config.subId).join(',')}`
+    );
+    const mockSubIds = multiConfigs.map((config) => mockXui.clients.get(config.email)?.subId || '');
+    check(
+      'every x-ui client carries its own subId',
+      mockSubIds.length === 3 && mockSubIds.every(Boolean) && new Set(mockSubIds).size === 3,
+      `subIds=${mockSubIds.join(',')}`
+    );
+    const subFeed = await request('GET', `/api/sub/${groupToken}`);
+    const decoded = Buffer.from(String(subFeed?.raw || ''), 'base64').toString('utf8').split('\n').filter(Boolean);
+    check(
+      'the panel serves one aggregated subscription for the package',
+      subFeed.status === 200
+        && decoded.length === 3
+        && decoded.every((link) => link.startsWith('vless://')),
+      `status=${subFeed.status} links=${decoded.length}`
+    );
+    const multiLinks = await request('GET', `/api/reseller/configs/${multiConfigs[0]?.id}/links`, { cookies: shopCookies });
+    check(
+      'the package subscription URL points at the panel',
+      multiLinks.status === 200 && String(multiLinks.json?.data?.subUrl || '') === `http://127.0.0.1/api/sub/${groupToken}`,
+      `subUrl=${multiLinks.json?.data?.subUrl}`
+    );
+    const rotated = await request('POST', `/api/reseller/configs/${multiConfigs[0]?.id}/identity`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { subId: 'packagerotated1' },
+    });
+    const oldFeed = await request('GET', `/api/sub/${groupToken}`);
+    const newFeed = await request('GET', '/api/sub/packagerotated1');
+    check(
+      'rotating the package token moves the whole group',
+      rotated.status === 200 && newFeed.status === 200 && oldFeed.status === 404,
+      `rotate=${rotated.status} old=${oldFeed.status} new=${newFeed.status}`
+    );
 
 
     // ------------------------------------------------------------------- misc
