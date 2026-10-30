@@ -403,6 +403,34 @@ function startMockXui(inboundRows) {
       tgSettings.botToken === '' && tgSettings.hasBotToken === true && tgSettings.chatId === '-1001234567890'
     );
 
+    const smsPatternsSave = await request('PATCH', '/api/admin/settings/sms', {
+      cookies,
+      csrf,
+      body: {
+        enabled: true,
+        provider: 'farazsms',
+        mode: 'pattern',
+        apiKey: 'selftest-sms-key',
+        sender: '50002178584000',
+        to: '09120000000',
+        pattern: 'DEFAULT-CODE',
+        patterns: {
+          nodeOffline: { code: 'NODE-DOWN', names: 'node,server', var1: '{node}', var2: '{server}', var3: '' },
+        },
+      },
+    });
+    const savedPatterns = smsPatternsSave.json?.data?.saved?.patterns || {};
+    check(
+      'per-notification SMS pattern persists and other events keep defaults',
+      smsPatternsSave.status === 200
+        && savedPatterns.nodeOffline?.code === 'NODE-DOWN'
+        && savedPatterns.nodeOffline?.names === 'node,server'
+        && savedPatterns.nodeOffline?.var2 === '{server}'
+        && savedPatterns.panelOnline?.code === ''
+        && savedPatterns.test?.code === '',
+      JSON.stringify(savedPatterns)
+    );
+
     const backupListAfter = await request('GET', '/api/admin/backups', { cookies });
     check('backup reports telegram delivery state', backupListAfter.status === 200 && backupListAfter.json.data.telegram.configured === true);
 
