@@ -4,7 +4,7 @@
 
 A bilingual (Persian/English) reseller & config management panel for 3x-ui, with a premium dark UI, per-reseller limits, wallet, tickets, live node status, backups and a reseller REST API.
 
-Version 1.3.6 · Node.js 20+ · SQLite · React 18 · multi-panel
+Version 1.3.7 · Node.js 20+ · SQLite · React 18 · multi-panel
 
 ---
 
@@ -313,7 +313,7 @@ Environment variables, the systemd unit and the nginx sample are documented in t
 cd server && npm run selftest
 ```
 
-77 automated checks covering setup, auth, session revocation, CSRF, multi-panel management, config creation and renewal against a mock 3x-ui, wallet charges, quotas, tickets, backups, audit log and API keys, on a temporary database.
+80 automated checks covering setup, auth, session revocation, CSRF, multi-panel management, config creation and renewal against a mock 3x-ui, wallet charges, quotas, tickets, backups, audit log and API keys, on a temporary database.
 
 ### License
 

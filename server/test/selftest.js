@@ -401,21 +401,91 @@ function startMockXui(inboundRows) {
     const audit = await request('GET', '/api/admin/audit?action=setup.complete', { cookies });
     check('audit records setup', audit.status === 200 && audit.json.data.total >= 1);
 
+    // -------------------------------------------------------- panel servers
+    // Admins can register additional x-ui panels; tokens never come back.
+    const serverList = await request('GET', '/api/admin/servers', { cookies });
+    check(
+      'servers list exposes panels without tokens',
+      serverList.status === 200
+        && Array.isArray(serverList.json.data.panels)
+        && serverList.json.data.panels.every((row) => row.token === undefined),
+      `panels=${serverList.json?.data?.panels?.length}`
+    );
+    check(
+      'a fresh installation starts with no x-ui server',
+      Array.isArray(serverList.json?.data?.panels) && serverList.json.data.panels.length === 0,
+      `panels=${serverList.json?.data?.panels?.length}`
+    );
+    // Operators must be able to remove the only server they added.
+    const loneCreate = await request('POST', '/api/admin/servers', {
+      cookies, csrf,
+      body: { name: 'Temp Panel', url: 'http://127.0.0.1:9998', token: 'temp-token' },
+    });
+    const loneId = loneCreate.json?.data?.server?.id || 0;
+    const loneDelete = await request('DELETE', `/api/admin/servers/${loneId}`, { cookies, csrf });
+    const afterLone = await request('GET', '/api/admin/servers', { cookies });
+    check(
+      'the only server can be deleted (panel returns to the blank state)',
+      loneCreate.status === 201 && loneDelete.status === 200 && afterLone.json?.data?.panels?.length === 0,
+      `create=${loneCreate.status} delete=${loneDelete.status} panels=${afterLone.json?.data?.panels?.length}`
+    );
+
+    // ------------------------------------------------ wallet billing (mock x-ui)
+    // Point the primary panel at a fake x-ui so purchases and renewals run the
+    // full code path — x-ui call, wallet charge, DB row — without a live panel.
+    const mockRows = [
+      { id: 901, remark: 'Order 30', protocol: 'vless', tag: 'tag30', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
+      { id: 902, remark: 'Order 10', protocol: 'vless', tag: 'tag10', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
+      { id: 903, remark: 'Order 20', protocol: 'vless', tag: 'tag20', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
+      { id: 904, remark: 'Order 10b', protocol: 'vless', tag: 'tag10b', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
+    ];
+    mockXui = await startMockXui(mockRows);
+    const urlOnly = await request('PATCH', '/api/admin/settings/xui', {
+      cookies, csrf,
+      body: { url: `http://127.0.0.1:${mockXui.port}`, verifyTls: false },
+    });
+    const afterUrlOnly = await request('GET', '/api/admin/servers', { cookies });
+    check(
+      'saving an address without a token does not create a server',
+      urlOnly.status === 200 && afterUrlOnly.json?.data?.panels?.length === 0,
+      `panels=${afterUrlOnly.json?.data?.panels?.length}`
+    );
+    const xuiSave = await request('PATCH', '/api/admin/settings/xui', {
+      cookies, csrf,
+      body: {
+        url: `http://127.0.0.1:${mockXui.port}`,
+        token: 'selftest-token',
+        verifyTls: false,
+        subBase: 'https://sub.example.com/sub',
+      },
+    });
+    check('x-ui settings connect to the mock panel', xuiSave.status === 200 && xuiSave.json.data.xuiTest?.ok === true);
+    const afterXuiSave = await request('GET', '/api/admin/servers', { cookies });
+    check(
+      'saving the first real connection creates the primary server',
+      afterXuiSave.json?.data?.panels?.length === 1 && afterXuiSave.json.data.panels[0].hasToken === true,
+      `panels=${afterXuiSave.json?.data?.panels?.length}`
+    );
+    const primaryId = afterXuiSave.json?.data?.panels?.[0]?.id || 0;
     // --------------------------------------------------------------- inbounds
-    // Subscription order (x-ui subSortIndex) drives the admin list order.
+    // Subscription order (x-ui subSortIndex) drives the admin list order. The rows
+    // belong to the primary server, which now exists because of the x-ui save above.
     const Database = require('better-sqlite3');
     const panelDb = new Database(path.join(DATA_DIR, 'panel.db'));
     try {
       const insertInbound = panelDb.prepare(
         `INSERT INTO inbounds (id, server_id, xui_id, node_id, node_name, remark, protocol, tag, port, network,
            security, listen, price_fixed, price_per_gb, price_per_day, enabled, visible, sub_sort_index, updated_at)
-         VALUES (?, 1, ?, 0, 'local', ?, 'vless', ?, 1000, 'tcp', 'none', '', ?, ?, ?, 1, 1, ?, ?)`
+         VALUES (?, ?, ?, 0, 'local', ?, 'vless', ?, 1000, 'tcp', 'none', '', ?, ?, ?, 1, 1, ?, ?)`
       );
       const now = Date.now();
-      insertInbound.run(901, 901, 'Order 30', 'tag30', 100, 10, 0, 30, now);
-      insertInbound.run(902, 902, 'Order 10', 'tag10', 0, 50, 0, 10, now);
-      insertInbound.run(903, 903, 'Order 20', 'tag20', 300, 0, 5, 20, now);
-      insertInbound.run(904, 904, 'Order 10b', 'tag10b', 0, 0, 0, 10, now);
+      // The monitor may already have synced the mock inbounds; replace them so
+      // the seeded rows keep stable ids for the price and order checks.
+      panelDb.prepare('DELETE FROM inbounds WHERE server_id = ? AND xui_id BETWEEN 901 AND 904').run(primaryId);
+      insertInbound.run(901, primaryId, 901, 'Order 30', 'tag30', 100, 10, 0, 30, now);
+      insertInbound.run(902, primaryId, 902, 'Order 10', 'tag10', 0, 50, 0, 10, now);
+      insertInbound.run(903, primaryId, 903, 'Order 20', 'tag20', 300, 0, 5, 20, now);
+      insertInbound.run(904, primaryId, 904, 'Order 10b', 'tag10b', 0, 0, 0, 10, now);
     } finally {
       panelDb.close();
     }
@@ -457,57 +527,13 @@ function startMockXui(inboundRows) {
       `unlimited=${resellerUnlimited.json?.data?.unlimited}`
     );
 
-    // -------------------------------------------------------- panel servers
-    // Admins can register additional x-ui panels; tokens never come back.
-    const serverList = await request('GET', '/api/admin/servers', { cookies });
+    // The monitor syncs on its own timer; force it here so the billing checks
+    // below do not depend on timing.
+    const forcedSync = await request('POST', '/api/admin/inbounds/sync', { cookies, csrf, body: { force: true } });
     check(
-      'servers list exposes panels without tokens',
-      serverList.status === 200
-        && Array.isArray(serverList.json.data.panels)
-        && serverList.json.data.panels.every((row) => row.token === undefined),
-      `panels=${serverList.json?.data?.panels?.length}`
-    );
-    check(
-      'a fresh installation starts with no x-ui server',
-      Array.isArray(serverList.json?.data?.panels) && serverList.json.data.panels.length === 0,
-      `panels=${serverList.json?.data?.panels?.length}`
-    );
-
-    // ------------------------------------------------ wallet billing (mock x-ui)
-    // Point the primary panel at a fake x-ui so purchases and renewals run the
-    // full code path — x-ui call, wallet charge, DB row — without a live panel.
-    const mockRows = [
-      { id: 901, remark: 'Order 30', protocol: 'vless', tag: 'tag30', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
-      { id: 902, remark: 'Order 10', protocol: 'vless', tag: 'tag10', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
-      { id: 903, remark: 'Order 20', protocol: 'vless', tag: 'tag20', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
-      { id: 904, remark: 'Order 10b', protocol: 'vless', tag: 'tag10b', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
-    ];
-    mockXui = await startMockXui(mockRows);
-    const urlOnly = await request('PATCH', '/api/admin/settings/xui', {
-      cookies, csrf,
-      body: { url: `http://127.0.0.1:${mockXui.port}`, verifyTls: false },
-    });
-    const afterUrlOnly = await request('GET', '/api/admin/servers', { cookies });
-    check(
-      'saving an address without a token does not create a server',
-      urlOnly.status === 200 && afterUrlOnly.json?.data?.panels?.length === 0,
-      `panels=${afterUrlOnly.json?.data?.panels?.length}`
-    );
-    const xuiSave = await request('PATCH', '/api/admin/settings/xui', {
-      cookies, csrf,
-      body: {
-        url: `http://127.0.0.1:${mockXui.port}`,
-        token: 'selftest-token',
-        verifyTls: false,
-        subBase: 'https://sub.example.com/sub',
-      },
-    });
-    check('x-ui settings connect to the mock panel', xuiSave.status === 200 && xuiSave.json.data.xuiTest?.ok === true);
-    const afterXuiSave = await request('GET', '/api/admin/servers', { cookies });
-    check(
-      'saving the first real connection creates the primary server',
-      afterXuiSave.json?.data?.panels?.length === 1 && afterXuiSave.json.data.panels[0].hasToken === true,
-      `panels=${afterXuiSave.json?.data?.panels?.length}`
+      'the primary server syncs the mock inbounds',
+      forcedSync.status === 200 && Number(forcedSync.json?.data?.count ?? 0) >= 1,
+      `count=${forcedSync.json?.data?.count}`
     );
 
     // Admins can register additional x-ui panels; tokens never come back.
@@ -554,6 +580,13 @@ function startMockXui(inboundRows) {
       'purchase deducts exactly the inbound tariff',
       Number(afterBuy.json?.data?.user?.balance) === 99800,
       `balance=${afterBuy.json?.data?.user?.balance}`
+    );
+
+    const deleteBusy = await request('DELETE', `/api/admin/servers/${primaryId}`, { cookies, csrf });
+    check(
+      'a server that still owns configs cannot be deleted',
+      primaryId > 0 && deleteBusy.status === 409 && deleteBusy.json?.error?.code === 'server_in_use',
+      `status=${deleteBusy.status} code=${deleteBusy.json?.error?.code}`
     );
 
     const renew = await request('POST', `/api/reseller/configs/${bought.id}/extend`, {

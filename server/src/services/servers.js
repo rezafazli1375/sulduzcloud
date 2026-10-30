@@ -234,9 +234,9 @@ function deleteServer(id, req) {
   const db = getDb();
   const server = rawRow(id);
   if (!server) throw new ApiError(404, 'server_not_found', 'Server not found');
-  if (countServers() <= 1) {
-    throw new ApiError(422, 'server_last', 'At least one server must stay configured');
-  }
+  // Deleting the last server is allowed: a panel with no server is a valid
+  // state (the fresh-install state). Only servers that still own configs are
+  // protected, because those rows point at live x-ui clients.
   const used = Number(db.prepare('SELECT COUNT(*) AS c FROM configs WHERE server_id = ? AND deleted_at = 0').get(Number(id)).c || 0);
   if (used > 0) {
     throw new ApiError(409, 'server_in_use', 'This server still owns configs; move or delete them first');

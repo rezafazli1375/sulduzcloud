@@ -84,7 +84,7 @@ export default function ServersPanels({ panels = [], onChanged }) {
   const askDelete = async (server) => {
     const ok = await confirm({
       title: t('servers.panels.delete'),
-      body: `${server.name} — ${server.url}`,
+      body: `${server.name} — ${server.url}\n\n${t('servers.panels.deleteWarn')}`,
       danger: true,
       confirmText: t('common.delete'),
     });
@@ -148,9 +148,16 @@ export default function ServersPanels({ panels = [], onChanged }) {
                     {t('servers.panels.test')}
                   </Button>
                   <Button size="xs" variant="ghost" icon={Pencil} onClick={() => startEdit(server)}>{t('common.edit')}</Button>
-                  {panels.length > 1 ? (
-                    <Button size="xs" variant="ghost" icon={Trash2} onClick={() => askDelete(server)}>{t('common.delete')}</Button>
-                  ) : null}
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    icon={Trash2}
+                    className="text-rose-300 hover:bg-rose-500/10 hover:text-rose-200"
+                    loading={remove.isPending && remove.variables === server.id}
+                    onClick={() => askDelete(server)}
+                  >
+                    {t('common.delete')}
+                  </Button>
                 </div>
               </div>
             );

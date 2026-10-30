@@ -475,6 +475,7 @@ const fa = {
       saved: 'سرور ذخیره شد',
       deleted: 'سرور حذف شد',
       delete: 'حذف سرور',
+      deleteWarn: 'این سرور و اینباندهای سینک‌شدهٔ آن (همراه با قیمت‌هایشان) از پنل حذف می‌شوند. اگر کانفیگ فعال دارد، اول باید کانفیگ‌ها حذف شوند.',
       hint: 'هر سرور یک پنل x-ui مستقل است.',
       securityNote: 'توکن API رمزنگاری‌شده ذخیره می‌شود و هرگز به مرورگر برنمی‌گردد.',
     },
@@ -762,6 +763,9 @@ const fa = {
     limitConfigs: 'محدودیت تعداد کانفیگ',
     limitGb: 'محدودیت حجم',
     limitDays: 'محدودیت مدت',
+    serverInUse: 'این سرور همچنان کانفیگ دارد؛ اول کانفیگ‌هایش را حذف یا منتقل کنید',
+    serverNotFound: 'سرور پیدا نشد',
+    xuiNotConfigured: 'هیچ سروری متصل نیست؛ اول آدرس و توکن پنل را ذخیره کنید',
   },
   pwa: {
     offline: 'اتصال اینترنت قطع است',
@@ -1243,6 +1247,7 @@ const en = {
       saved: 'Server saved',
       deleted: 'Server deleted',
       delete: 'Delete server',
+      deleteWarn: 'This server and its synced inbounds (with their prices) are removed from the panel. Servers that still own configs must have those deleted first.',
       hint: 'Each server is an independent x-ui panel.',
       securityNote: 'API tokens are stored encrypted and never sent back to the browser.',
     },
@@ -1530,6 +1535,9 @@ const en = {
     limitConfigs: 'Config count limit',
     limitGb: 'Traffic limit',
     limitDays: 'Duration limit',
+    serverInUse: 'This server still owns configs; delete or move them first',
+    serverNotFound: 'Server not found',
+    xuiNotConfigured: 'No server connected yet; save the panel address and token first',
   },
   pwa: {
     offline: 'You are offline',
@@ -1597,6 +1605,9 @@ export function translateError(err, t) {
     network: 'errors.network',
     forbidden: 'errors.forbidden',
     owner_only: 'errors.forbidden',
+    server_in_use: 'errors.serverInUse',
+    server_not_found: 'errors.serverNotFound',
+    xui_not_configured: 'errors.xuiNotConfigured',
   };
   if (map[code]) return t(map[code]);
   return err?.message || t('errors.generic');
