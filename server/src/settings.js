@@ -54,9 +54,17 @@ const DEFAULTS = {
   sms: {
     enabled: false,
     provider: 'kavenegar',
+    // 'pattern' sends a pre-approved template (delivered without operator
+    // review); 'text' sends free text, which Kavenegar/FarazSMS may hold for
+    // manual approval.
+    mode: 'pattern',
     apiKey: '',
     sender: '',
     to: '',
+    pattern: '',
+    patternVar1: '{title}',
+    patternVar2: '{body}',
+    patternVar3: '',
     customUrl: '',
     customMethod: 'POST',
     customHeaders: '',

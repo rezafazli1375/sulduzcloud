@@ -126,7 +126,7 @@ export default function Settings() {
 
   const testSms = useMutation({
     mutationFn: () => api.post('/admin/settings/test-sms'),
-    onSuccess: (result) => toast.success(`${t('settings.testSent')}${result?.to ? ` · ${result.to}` : ''}`),
+    onSuccess: (result) => toast.success(`${t('settings.testSent')}${result?.to ? ` · ${result.to}` : ''}${result?.mode ? ` · ${result.mode}` : ''}${result?.pattern ? ` · ${result.pattern}` : ''}`),
     onError: (err) => toast.error(err?.message || t('errors.generic')),
   });
 
@@ -410,6 +410,14 @@ export default function Settings() {
                   <option value="custom">{t('settings.sms.custom')}</option>
                 </Select>
               </Field>
+              {sms.provider !== 'custom' ? (
+                <Field label={t('settings.sms.mode')} hint={t('settings.sms.modeHint')}>
+                  <Select value={sms.mode || 'pattern'} onChange={(e) => patch('sms', 'mode', e.target.value)}>
+                    <option value="pattern">{t('settings.sms.modePattern')}</option>
+                    <option value="text">{t('settings.sms.modeText')}</option>
+                  </Select>
+                </Field>
+              ) : null}
               <Field label={t('settings.sms.to')}>
                 <Input dir="ltr" value={sms.to || ''} onChange={(e) => patch('sms', 'to', e.target.value)} placeholder="09xxxxxxxxx" />
               </Field>
@@ -426,6 +434,46 @@ export default function Settings() {
                 <Input dir="ltr" value={sms.sender || ''} onChange={(e) => patch('sms', 'sender', e.target.value)} />
               </Field>
             </div>
+
+            {sms.provider !== 'custom' && (sms.mode || 'pattern') === 'pattern' ? (
+              <div className="space-y-4 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.05] p-3.5">
+                <p className="text-[10.5px] leading-5 text-emerald-100/85">{t('settings.sms.patternHint')}</p>
+                <Field
+                  label={sms.provider === 'farazsms' ? t('settings.sms.patternCode') : t('settings.sms.patternTemplate')}
+                  hint={sms.provider === 'farazsms' ? t('settings.sms.patternCodeHint') : t('settings.sms.patternTemplateHint')}
+                >
+                  <Input
+                    dir="ltr"
+                    value={sms.pattern || ''}
+                    onChange={(e) => patch('sms', 'pattern', e.target.value)}
+                    placeholder={sms.provider === 'farazsms' ? 'SJ3FgPrE0C' : 'sulduz-alert'}
+                  />
+                </Field>
+                <div className="grid gap-4 sm:grid-cols-3">
+                  {[1, 2, 3].map((index) => (
+                    <Field
+                      key={index}
+                      label={t(`settings.sms.var${index}`)}
+                      hint={sms.provider === 'farazsms' ? `var${index}` : index === 1 ? 'token' : `token${index}`}
+                    >
+                      <Input
+                        dir="ltr"
+                        value={sms[`patternVar${index}`] || ''}
+                        onChange={(e) => patch('sms', `patternVar${index}`, e.target.value)}
+                        placeholder={index === 1 ? '{title}' : index === 2 ? '{body}' : ''}
+                      />
+                    </Field>
+                  ))}
+                </div>
+                <p className="text-[10px] leading-5 text-emerald-200/60">{t('settings.sms.varHint')}</p>
+              </div>
+            ) : null}
+
+            {sms.provider !== 'custom' && (sms.mode || 'pattern') === 'text' ? (
+              <p className="rounded-xl border border-amber-400/20 bg-amber-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-amber-100/90">
+                {t('settings.sms.textHint')}
+              </p>
+            ) : null}
 
             {sms.provider === 'farazsms' ? (
               <p className="rounded-xl border border-cyan-400/20 bg-cyan-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-cyan-100/90">

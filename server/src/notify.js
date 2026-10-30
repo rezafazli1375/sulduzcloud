@@ -87,17 +87,136 @@ async function sendMail(to, subject, text, html) {
   return { accepted: info.accepted || [], rejected: info.rejected || [] };
 }
 
-async function sendSms(text, to) {
-  const sms = getSetting('sms');
-  if (!sms.enabled) throw new ApiError(400, 'sms_disabled', 'SMS notifications are disabled');
-  const recipient = String(to || sms.to || '').replace(/[^\d,]/g, '');
-  if (!recipient) throw new ApiError(400, 'sms_no_recipient', 'No SMS recipient configured');
-  const message = String(text || '').slice(0, 900);
+const SMS_TEXT_MAX = 900;
+// Kavenegar caps each verify template token at 100 characters; staying inside
+// the same bound keeps one mapping safe for both providers.
+const SMS_VAR_MAX = 100;
+const SMS_VAR_PLACEHOLDER = /\{(title|body|text|date)\}/g;
 
+// Accept 09…, 0098… and 98… but always use the local 09… form.
+function normalizeSmsNumber(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (/^0098\d{10}$/.test(digits)) return `0${digits.slice(4)}`;
+  if (/^98\d{10}$/.test(digits)) return `0${digits.slice(2)}`;
+  return digits;
+}
+
+function smsTargets(sms, to) {
+  // Numbers are separated by commas/semicolons; spaces inside a number
+  // ("0912 000 0000") are formatting and get stripped.
+  return String(to || sms.to || '')
+    .split(/[,;\n]+/)
+    .map(normalizeSmsNumber)
+    .filter(Boolean);
+}
+
+function smsToday() {
+  const timezone = getSetting('general').timezone || 'Asia/Tehran';
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date());
+  } catch (_) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+// Operator-controlled providers (Kavenegar/FarazSMS) only deliver pre-approved
+// patterns without manual review, so the free-form message is projected onto
+// the configured template variables:
+//   {title} first line · {body} remaining lines · {text} whole message · {date}
+function smsPatternVars(sms, text) {
+  const lines = String(text || '').replace(/\r/g, '').split('\n');
+  const values = {
+    title: (lines[0] || '').trim(),
+    body: lines.slice(1).join('\n').trim(),
+    text: String(text || '').trim(),
+    date: smsToday(),
+  };
+  const rendered = [sms.patternVar1, sms.patternVar2, sms.patternVar3].map((template) => (
+    String(template ?? '')
+      .replace(SMS_VAR_PLACEHOLDER, (_, key) => values[key] || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, SMS_VAR_MAX)
+  ));
+  while (rendered.length && !rendered[rendered.length - 1]) rendered.pop();
+  return rendered;
+}
+
+async function sendSmsPattern(sms, recipients, message) {
+  const pattern = String(sms.pattern || '').trim();
+  if (!pattern) {
+    throw new ApiError(400, 'sms_pattern_missing',
+      'الگوی پیامک (پترن) تنظیم نشده است؛ نام یا کد پترن تأییدشده را در تنظیمات پیامک وارد کنید.');
+  }
+  const vars = smsPatternVars(sms, message);
+  if (!vars.length) throw new ApiError(400, 'sms_empty', 'SMS message is empty');
+
+  if (sms.provider === 'kavenegar') {
+    // Kavenegar verify/lookup: the template name is registered in the panel and
+    // its tokens (token, token2, token3) fill the approved text. One request per
+    // number keeps the quota/error of each delivery separate.
+    if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'Kavenegar API key is missing');
+    for (const recipient of recipients) {
+      const url = new URL(`https://api.kavenegar.com/v1/${encodeURIComponent(sms.apiKey)}/verify/lookup.json`);
+      url.searchParams.set('receptor', recipient);
+      url.searchParams.set('template', pattern);
+      url.searchParams.set('type', 'sms');
+      ['token', 'token2', 'token3'].forEach((name, index) => {
+        if (vars[index]) url.searchParams.set(name, vars[index]);
+      });
+      const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(15000) });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || Number(json.return?.status) !== 200) {
+        throw new ApiError(502, 'sms_failed', `Kavenegar error: ${json.return?.message || `HTTP ${res.status}`}`);
+      }
+    }
+    return { ok: true, provider: 'kavenegar', mode: 'pattern', pattern, recipients, vars };
+  }
+
+  if (sms.provider === 'farazsms') {
+    // FarazSMS pattern endpoint (docs.iranpayamak.com): one request per number,
+    // attributes var1/var2/var3 fill the approved pattern text.
+    if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'FarazSMS API key is missing');
+    const line = String(sms.sender || '').trim();
+    if (!line) throw new ApiError(400, 'sms_incomplete', 'FarazSMS line number (sender) is missing');
+    const attributes = {};
+    vars.forEach((value, index) => { attributes[`var${index + 1}`] = value; });
+    for (const recipient of recipients) {
+      const res = await fetch('https://api.iranpayamak.com/ws/v1/sms/pattern', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'Api-Key': String(sms.apiKey),
+        },
+        body: JSON.stringify({
+          code: pattern,
+          attributes,
+          recipient,
+          line_number: line,
+          number_format: 'english',
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || String(json.status || '').toLowerCase() === 'error') {
+        const reason = (Array.isArray(json.messages) && json.messages[0]) || json.message || `HTTP ${res.status}`;
+        throw new ApiError(502, 'sms_failed', `FarazSMS error: ${reason}`);
+      }
+    }
+    return { ok: true, provider: 'farazsms', mode: 'pattern', pattern, recipients, vars };
+  }
+
+  throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
+}
+
+async function sendSmsText(sms, recipients, message) {
   if (sms.provider === 'kavenegar') {
     if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'Kavenegar API key is missing');
     const url = new URL(`https://api.kavenegar.com/v1/${encodeURIComponent(sms.apiKey)}/sms/send.json`);
-    url.searchParams.set('receptor', recipient);
+    url.searchParams.set('receptor', recipients.join(','));
     url.searchParams.set('message', message);
     if (sms.sender) url.searchParams.set('sender', sms.sender);
     const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(15000) });
@@ -105,7 +224,7 @@ async function sendSms(text, to) {
     if (!res.ok || Number(json.return?.status) !== 200) {
       throw new ApiError(502, 'sms_failed', `SMS provider error: ${json.return?.message || res.status}`);
     }
-    return { ok: true, provider: 'kavenegar' };
+    return { ok: true, provider: 'kavenegar', mode: 'text', recipients };
   }
 
   if (sms.provider === 'farazsms') {
@@ -115,14 +234,6 @@ async function sendSms(text, to) {
     if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'FarazSMS API key is missing');
     const line = String(sms.sender || '').trim();
     if (!line) throw new ApiError(400, 'sms_incomplete', 'FarazSMS line number (sender) is missing');
-    // Accept 09…, 0098… and 98… but always send the local 09… form.
-    const normalize = (value) => {
-      const digits = value.replace(/\D/g, '');
-      if (/^0098\d{10}$/.test(digits)) return `0${digits.slice(4)}`;
-      if (/^98\d{10}$/.test(digits)) return `0${digits.slice(2)}`;
-      return digits;
-    };
-    const recipients = recipient.split(',').map(normalize).filter(Boolean);
     const res = await fetch('https://api.iranpayamak.com/ws/v1/sms/simple', {
       method: 'POST',
       headers: {
@@ -142,8 +253,18 @@ async function sendSms(text, to) {
     if (!res.ok || String(json.status || '').toLowerCase() === 'error') {
       throw new ApiError(502, 'sms_failed', `FarazSMS error: ${json.message || `HTTP ${res.status}`}`);
     }
-    return { ok: true, provider: 'farazsms', recipients };
+    return { ok: true, provider: 'farazsms', mode: 'text', recipients };
   }
+
+  throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
+}
+
+async function sendSms(text, to) {
+  const sms = getSetting('sms');
+  if (!sms.enabled) throw new ApiError(400, 'sms_disabled', 'SMS notifications are disabled');
+  const recipients = smsTargets(sms, to);
+  if (!recipients.length) throw new ApiError(400, 'sms_no_recipient', 'No SMS recipient configured');
+  const message = String(text || '').slice(0, SMS_TEXT_MAX);
 
   if (sms.provider === 'custom') {
     if (!sms.customUrl) throw new ApiError(400, 'sms_incomplete', 'Custom SMS URL is missing');
@@ -151,17 +272,24 @@ async function sendSms(text, to) {
     try { headers = sms.customHeaders ? JSON.parse(sms.customHeaders) : {}; } catch (_) { headers = {}; }
     const bodyTemplate = sms.customBody || '{"to":"{to}","text":"{text}"}';
     const rendered = bodyTemplate
-      .replaceAll('{to}', recipient)
+      .replaceAll('{to}', recipients.join(','))
       .replaceAll('{text}', message.replace(/"/g, '\\"'));
     const method = String(sms.customMethod || 'POST').toUpperCase();
     const init = { method, headers: { 'Content-Type': 'application/json', ...headers }, signal: AbortSignal.timeout(15000) };
     if (method !== 'GET') init.body = rendered;
     const res = await fetch(sms.customUrl, init);
     if (!res.ok) throw new ApiError(502, 'sms_failed', `SMS provider returned HTTP ${res.status}`);
-    return { ok: true, provider: 'custom' };
+    return { ok: true, provider: 'custom', mode: 'text', recipients };
   }
 
-  throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
+  if (sms.provider !== 'kavenegar' && sms.provider !== 'farazsms') {
+    throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
+  }
+
+  // Pattern (pre-approved template) is the default: operator-controlled bulk
+  // text needs manual approval, approved patterns are delivered immediately.
+  if (String(sms.mode || 'pattern') === 'text') return sendSmsText(sms, recipients, message);
+  return sendSmsPattern(sms, recipients, message);
 }
 
 async function testEmail() {
@@ -173,8 +301,10 @@ async function testEmail() {
 
 async function testSms() {
   const sms = getSetting('sms');
-  await sendSms('Sulduz Cloud: پیام آزمایشی', sms.to);
-  return { ok: true, to: sms.to };
+  const panelName = String(getSetting('general').panelName || 'Sulduz Cloud').trim();
+  // Two lines so {title} receives the panel name and {body} the test text.
+  const result = await sendSms(`${panelName}\nپیام آزمایشی`, sms.to);
+  return { ...result, to: sms.to };
 }
 
 async function alertAdmins({ title, body }) {
