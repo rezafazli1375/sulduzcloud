@@ -449,6 +449,16 @@ export default function Settings() {
                     placeholder={sms.provider === 'farazsms' ? 'SJ3FgPrE0C' : 'sulduz-alert'}
                   />
                 </Field>
+                {sms.provider === 'farazsms' ? (
+                  <Field label={t('settings.sms.patternNames')} hint={t('settings.sms.patternNamesHint')}>
+                    <Input
+                      dir="ltr"
+                      value={sms.patternNames || ''}
+                      onChange={(e) => patch('sms', 'patternNames', e.target.value)}
+                      placeholder="var1,var2"
+                    />
+                  </Field>
+                ) : null}
                 <div className="grid gap-4 sm:grid-cols-3">
                   {[1, 2, 3].map((index) => (
                     <Field

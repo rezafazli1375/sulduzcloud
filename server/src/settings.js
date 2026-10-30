@@ -65,6 +65,9 @@ const DEFAULTS = {
     patternVar1: '{title}',
     patternVar2: '{body}',
     patternVar3: '',
+    // FarazSMS matches attributes by the variable names defined in the pattern;
+    // this list (comma separated) names them in the same order as the values.
+    patternNames: 'var1,var2,var3',
     customUrl: '',
     customMethod: 'POST',
     customHeaders: '',

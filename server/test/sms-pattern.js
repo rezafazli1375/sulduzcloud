@@ -94,6 +94,20 @@ async function run() {
       && farazTest.vars?.[1] === 'پیام آزمایشی'
   );
 
+  // FarazSMS matches attribute keys to the pattern's own variable names.
+  settings.updateSection('sms', { patternNames: 'code, msg' });
+  calls.length = 0;
+  await notify.testSms();
+  const renamed = bodyOf(calls[0]);
+  check(
+    'farazsms attribute names follow the pattern definition',
+    renamed.attributes?.code === 'Sulduz Cloud'
+      && renamed.attributes?.msg === 'پیام آزمایشی'
+      && !renamed.attributes?.var1,
+    JSON.stringify(renamed.attributes)
+  );
+  settings.updateSection('sms', { patternNames: 'var1,var2,var3' });
+
   // ------------------------------------------------------------ Kavenegar pattern
   respond = () => ({
     ok: true,

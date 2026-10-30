@@ -176,13 +176,20 @@ async function sendSmsPattern(sms, recipients, message) {
   }
 
   if (sms.provider === 'farazsms') {
-    // FarazSMS pattern endpoint (docs.iranpayamak.com): one request per number,
-    // attributes var1/var2/var3 fill the approved pattern text.
+    // FarazSMS pattern endpoint (docs.iranpayamak.com): one request per number.
+    // Attribute keys must match the variable names defined in the pattern, so
+    // `patternNames` names them in the same order as the rendered values.
     if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'FarazSMS API key is missing');
     const line = String(sms.sender || '').trim();
     if (!line) throw new ApiError(400, 'sms_incomplete', 'FarazSMS line number (sender) is missing');
+    const names = String(sms.patternNames || '')
+      .split(/[,;\s]+/)
+      .map((name) => name.trim())
+      .filter(Boolean);
     const attributes = {};
-    vars.forEach((value, index) => { attributes[`var${index + 1}`] = value; });
+    vars.forEach((value, index) => {
+      attributes[names[index] || `var${index + 1}`] = value;
+    });
     for (const recipient of recipients) {
       const res = await fetch('https://api.iranpayamak.com/ws/v1/sms/pattern', {
         method: 'POST',
