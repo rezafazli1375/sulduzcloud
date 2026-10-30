@@ -68,6 +68,15 @@ const DEFAULTS = {
     // FarazSMS matches attributes by the variable names defined in the pattern;
     // this list (comma separated) names them in the same order as the values.
     patternNames: 'var1,var2,var3',
+    // Optional per-notification patterns. Empty code = use the default pattern
+    // above; empty mapping = the event's built-in placeholders (see notify.js).
+    patterns: {
+      nodeOffline: { code: '', names: '', var1: '', var2: '', var3: '' },
+      nodeOnline: { code: '', names: '', var1: '', var2: '', var3: '' },
+      panelOffline: { code: '', names: '', var1: '', var2: '', var3: '' },
+      panelOnline: { code: '', names: '', var1: '', var2: '', var3: '' },
+      test: { code: '', names: '', var1: '', var2: '', var3: '' },
+    },
     customUrl: '',
     customMethod: 'POST',
     customHeaders: '',
@@ -147,7 +156,23 @@ function getSetting(key) {
   if (!(key in DEFAULTS)) return {};
   const raw = rawGet(key);
   const parsed = raw ? safeJsonParse(raw, {}) : {};
-  return { ...structuredCloneSafe(DEFAULTS[key]), ...decryptSection(key, parsed) };
+  const merged = { ...structuredCloneSafe(DEFAULTS[key]), ...decryptSection(key, parsed) };
+  // Nested per-notification pattern configs need a per-event merge so a new
+  // event added in a later version never wipes the owner's saved values.
+  if (key === 'sms' && DEFAULTS.sms.patterns) {
+    const stored = merged.patterns && typeof merged.patterns === 'object' ? merged.patterns : {};
+    const patterns = {};
+    for (const [event, defaults] of Object.entries(DEFAULTS.sms.patterns)) {
+      patterns[event] = { ...structuredCloneSafe(defaults), ...(stored[event] || {}) };
+    }
+    for (const [event, value] of Object.entries(stored)) {
+      if (!patterns[event] && value && typeof value === 'object') {
+        patterns[event] = { code: '', names: '', var1: '', var2: '', var3: '', ...value };
+      }
+    }
+    merged.patterns = patterns;
+  }
+  return merged;
 }
 
 function structuredCloneSafe(value) {

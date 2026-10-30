@@ -59,6 +59,14 @@ const TAB_LIST = [
   { value: 'security', icon: Lock, label: 'settings.tabs.security' },
 ];
 
+const SMS_EVENTS = [
+  { value: 'nodeOffline', vars: ['{node}', '{server}', '{address}', '{failures}'] },
+  { value: 'nodeOnline', vars: ['{node}', '{server}'] },
+  { value: 'panelOffline', vars: ['{server}', '{error}'] },
+  { value: 'panelOnline', vars: ['{server}'] },
+  { value: 'test', vars: ['{panel}'] },
+];
+
 function SwitchRow({ label, hint, checked, onChange }) {
   return (
     <div className="flex items-center justify-between gap-4 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3.5 py-3">
@@ -144,6 +152,20 @@ export default function Settings() {
 
   const patch = (section, field, value) => {
     setLocal((prev) => ({ ...prev, [section]: { ...prev[section], [field]: value } }));
+  };
+
+  const patchPattern = (event, field, value) => {
+    setLocal((prev) => {
+      const section = prev.sms || {};
+      const patterns = section.patterns || {};
+      return {
+        ...prev,
+        sms: {
+          ...section,
+          patterns: { ...patterns, [event]: { ...(patterns[event] || {}), [field]: value } },
+        },
+      };
+    });
   };
 
   const tabs = useMemo(() => TAB_LIST.map((item) => ({ value: item.value, label: t(item.label), icon: item.icon })), [t]);
@@ -476,6 +498,76 @@ export default function Settings() {
                   ))}
                 </div>
                 <p className="text-[10px] leading-5 text-emerald-200/60">{t('settings.sms.varHint')}</p>
+              </div>
+            ) : null}
+
+            {sms.provider !== 'custom' && (sms.mode || 'pattern') === 'pattern' ? (
+              <div className="space-y-3 rounded-xl border border-indigo-400/20 bg-indigo-500/[0.05] p-3.5">
+                <div>
+                  <p className="text-[12px] font-medium text-indigo-100">{t('settings.sms.events.title')}</p>
+                  <p className="mt-1 text-[10.5px] leading-5 text-indigo-100/70">{t('settings.sms.events.hint')}</p>
+                </div>
+                {SMS_EVENTS.map(({ value, vars }) => {
+                  const cfg = sms.patterns?.[value] || {};
+                  const own = Boolean(String(cfg.code || '').trim());
+                  return (
+                    <div key={value} className="rounded-lg border border-white/[0.07] bg-slate-950/30 p-3">
+                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-[12px] font-medium text-slate-200">{t(`settings.sms.events.${value}`)}</p>
+                        <span className={cx(
+                          'chip',
+                          own
+                            ? 'border-emerald-400/20 bg-emerald-500/10 text-emerald-300'
+                            : 'border-white/10 bg-white/[0.04] text-slate-500',
+                        )}>
+                          {own ? t('settings.sms.events.own') : t('settings.sms.events.fallback')}
+                        </span>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <Field
+                          label={sms.provider === 'farazsms' ? t('settings.sms.patternCode') : t('settings.sms.patternTemplate')}
+                          hint={sms.pattern ? `↳ ${sms.pattern}` : ''}
+                        >
+                          <Input
+                            dir="ltr"
+                            value={cfg.code || ''}
+                            onChange={(e) => patchPattern(value, 'code', e.target.value)}
+                            placeholder={sms.pattern || ''}
+                          />
+                        </Field>
+                        {sms.provider === 'farazsms' ? (
+                          <Field label={t('settings.sms.patternNames')} hint={t('settings.sms.events.namesHint')}>
+                            <Input
+                              dir="ltr"
+                              value={cfg.names || ''}
+                              onChange={(e) => patchPattern(value, 'names', e.target.value)}
+                              placeholder={sms.patternNames || 'var1,var2'}
+                            />
+                          </Field>
+                        ) : null}
+                      </div>
+                      <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                        {[1, 2, 3].map((index) => (
+                          <Field
+                            key={index}
+                            label={t(`settings.sms.var${index}`)}
+                            hint={sms.provider === 'farazsms' ? `var${index}` : index === 1 ? 'token' : `token${index}`}
+                          >
+                            <Input
+                              dir="ltr"
+                              value={cfg[`var${index}`] || ''}
+                              onChange={(e) => patchPattern(value, `var${index}`, e.target.value)}
+                              placeholder={index === 1 ? '{title}' : index === 2 ? '{body}' : ''}
+                            />
+                          </Field>
+                        ))}
+                      </div>
+                      <p className="mt-2 text-[10px] leading-5 text-indigo-200/60">
+                        {t('settings.sms.events.vars')}: {[...vars, '{title}', '{body}', '{text}', '{date}'].join(' · ')}
+                      </p>
+                    </div>
+                  );
+                })}
               </div>
             ) : null}
 

@@ -91,7 +91,18 @@ const SMS_TEXT_MAX = 900;
 // Kavenegar caps each verify template token at 100 characters; staying inside
 // the same bound keeps one mapping safe for both providers.
 const SMS_VAR_MAX = 100;
-const SMS_VAR_PLACEHOLDER = /\{(title|body|text|date)\}/g;
+const SMS_VAR_PLACEHOLDER = /\{([a-zA-Z][a-zA-Z0-9_]*)\}/g;
+
+// Notifications that can carry SMS. Besides {title}/{body}/{text}/{date}, each
+// event exposes its own details as variables so a dedicated pattern can say
+// exactly what happened (e.g. «نود {node} روی {server} قطع شد»).
+const SMS_EVENTS = {
+  test: ['panel'],
+  nodeOffline: ['node', 'server', 'address', 'failures'],
+  nodeOnline: ['node', 'server'],
+  panelOffline: ['server', 'error'],
+  panelOnline: ['server'],
+};
 
 // Accept 09…, 0098… and 98… but always use the local 09… form.
 function normalizeSmsNumber(value) {
@@ -122,20 +133,29 @@ function smsToday() {
 }
 
 // Operator-controlled providers (Kavenegar/FarazSMS) only deliver pre-approved
-// patterns without manual review, so the free-form message is projected onto
-// the configured template variables:
+// patterns without manual review, so the message is projected onto template
+// variables. Every message exposes:
 //   {title} first line · {body} remaining lines · {text} whole message · {date}
-function smsPatternVars(sms, text) {
-  const lines = String(text || '').replace(/\r/g, '').split('\n');
+// plus the event's own keys (see SMS_EVENTS).
+function smsValues({ title = '', body = '', text = '', data = {} } = {}) {
+  const lines = String(text || [title, body].filter(Boolean).join('\n')).replace(/\r/g, '').split('\n');
   const values = {
-    title: (lines[0] || '').trim(),
-    body: lines.slice(1).join('\n').trim(),
-    text: String(text || '').trim(),
+    title: String(title || lines[0] || '').trim(),
+    body: String(body || lines.slice(1).join('\n')).trim(),
+    text: lines.join('\n').trim(),
     date: smsToday(),
   };
-  const rendered = [sms.patternVar1, sms.patternVar2, sms.patternVar3].map((template) => (
+  for (const [key, value] of Object.entries(data || {})) {
+    if (value === null || value === undefined) continue;
+    values[String(key).toLowerCase()] = String(value).replace(/\s+/g, ' ').trim();
+  }
+  return values;
+}
+
+function renderSmsVars(mapping, values) {
+  const rendered = (Array.isArray(mapping) ? mapping : []).slice(0, 3).map((template) => (
     String(template ?? '')
-      .replace(SMS_VAR_PLACEHOLDER, (_, key) => values[key] || '')
+      .replace(SMS_VAR_PLACEHOLDER, (_, key) => values[key.toLowerCase()] || '')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, SMS_VAR_MAX)
@@ -144,14 +164,54 @@ function smsPatternVars(sms, text) {
   return rendered;
 }
 
-async function sendSmsPattern(sms, recipients, message) {
-  const pattern = String(sms.pattern || '').trim();
+// Each notification can use its own approved pattern. An empty per-event code
+// falls back to the shared default pattern (pattern/patternVar1..3); a per-event
+// pattern without its own mapping keeps the built-in title/body split.
+function smsEventConfig(sms, event, values) {
+  const saved = (sms.patterns && sms.patterns[event]) || {};
+  const code = String(saved.code || '').trim();
+  if (!code) {
+    return {
+      event,
+      source: 'default',
+      pattern: String(sms.pattern || '').trim(),
+      names: sms.patternNames,
+      vars: renderSmsVars([sms.patternVar1, sms.patternVar2, sms.patternVar3], values),
+    };
+  }
+  const mapping = [saved.var1, saved.var2, saved.var3];
+  const templates = mapping.some((value) => String(value ?? '').trim())
+    ? mapping
+    : ['{title}', '{body}', ''];
+  return {
+    event,
+    source: 'event',
+    pattern: code,
+    names: String(saved.names || '').trim() || sms.patternNames,
+    vars: renderSmsVars(templates, values),
+  };
+}
+
+async function sendSmsPattern(sms, recipients, config) {
+  const pattern = String(config.pattern || '').trim();
   if (!pattern) {
     throw new ApiError(400, 'sms_pattern_missing',
       'الگوی پیامک (پترن) تنظیم نشده است؛ نام یا کد پترن تأییدشده را در تنظیمات پیامک وارد کنید.');
   }
-  const vars = smsPatternVars(sms, message);
+  const vars = Array.isArray(config.vars) ? config.vars : [];
   if (!vars.length) throw new ApiError(400, 'sms_empty', 'SMS message is empty');
+  const names = String(config.names || '')
+    .split(/[,;\s]+/)
+    .map((name) => name.trim())
+    .filter(Boolean);
+  const meta = {
+    event: config.event || '',
+    source: config.source || 'default',
+    pattern,
+    recipients,
+    vars,
+    names,
+  };
 
   if (sms.provider === 'kavenegar') {
     // Kavenegar verify/lookup: the template name is registered in the panel and
@@ -172,20 +232,16 @@ async function sendSmsPattern(sms, recipients, message) {
         throw new ApiError(502, 'sms_failed', `Kavenegar error: ${json.return?.message || `HTTP ${res.status}`}`);
       }
     }
-    return { ok: true, provider: 'kavenegar', mode: 'pattern', pattern, recipients, vars };
+    return { ok: true, provider: 'kavenegar', mode: 'pattern', ...meta };
   }
 
   if (sms.provider === 'farazsms') {
     // FarazSMS pattern endpoint (docs.iranpayamak.com): one request per number.
     // Attribute keys must match the variable names defined in the pattern, so
-    // `patternNames` names them in the same order as the rendered values.
+    // `names` (per-event or global) labels them in rendered order.
     if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'FarazSMS API key is missing');
     const line = String(sms.sender || '').trim();
     if (!line) throw new ApiError(400, 'sms_incomplete', 'FarazSMS line number (sender) is missing');
-    const names = String(sms.patternNames || '')
-      .split(/[,;\s]+/)
-      .map((name) => name.trim())
-      .filter(Boolean);
     const attributes = {};
     vars.forEach((value, index) => {
       attributes[names[index] || `var${index + 1}`] = value;
@@ -213,7 +269,7 @@ async function sendSmsPattern(sms, recipients, message) {
         throw new ApiError(502, 'sms_failed', `FarazSMS error: ${reason}`);
       }
     }
-    return { ok: true, provider: 'farazsms', mode: 'pattern', pattern, recipients, vars };
+    return { ok: true, provider: 'farazsms', mode: 'pattern', ...meta };
   }
 
   throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
@@ -266,7 +322,7 @@ async function sendSmsText(sms, recipients, message) {
   throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
 }
 
-async function sendSms(text, to) {
+async function sendSms(text, to, options = {}) {
   const sms = getSetting('sms');
   if (!sms.enabled) throw new ApiError(400, 'sms_disabled', 'SMS notifications are disabled');
   const recipients = smsTargets(sms, to);
@@ -296,7 +352,23 @@ async function sendSms(text, to) {
   // Pattern (pre-approved template) is the default: operator-controlled bulk
   // text needs manual approval, approved patterns are delivered immediately.
   if (String(sms.mode || 'pattern') === 'text') return sendSmsText(sms, recipients, message);
-  return sendSmsPattern(sms, recipients, message);
+
+  const values = smsValues({
+    title: options.title,
+    body: options.body,
+    text: message,
+    data: options.data,
+  });
+  const config = options.event
+    ? smsEventConfig(sms, options.event, values)
+    : {
+      event: '',
+      source: 'default',
+      pattern: String(sms.pattern || '').trim(),
+      names: sms.patternNames,
+      vars: renderSmsVars([sms.patternVar1, sms.patternVar2, sms.patternVar3], values),
+    };
+  return sendSmsPattern(sms, recipients, config);
 }
 
 async function testEmail() {
@@ -310,11 +382,16 @@ async function testSms() {
   const sms = getSetting('sms');
   const panelName = String(getSetting('general').panelName || 'Sulduz Cloud').trim();
   // Two lines so {title} receives the panel name and {body} the test text.
-  const result = await sendSms(`${panelName}\nپیام آزمایشی`, sms.to);
+  const result = await sendSms(`${panelName}\nپیام آزمایشی`, sms.to, {
+    event: 'test',
+    title: panelName,
+    body: 'پیام آزمایشی',
+    data: { panel: panelName },
+  });
   return { ...result, to: sms.to };
 }
 
-async function alertAdmins({ title, body }) {
+async function alertAdmins({ event = '', data = {}, title, body }) {
   notifyAdmins({ type: 'alert', title, body, link: '/admin/servers' });
   const monitor = getSetting('monitor');
   const results = { email: false, sms: false, errors: [] };
@@ -322,7 +399,10 @@ async function alertAdmins({ title, body }) {
     try { await sendMail('', title, body); results.email = true; } catch (err) { results.errors.push(`email: ${err.message}`); }
   }
   if (monitor.alertSms) {
-    try { await sendSms(`${title}\n${body}`); results.sms = true; } catch (err) { results.errors.push(`sms: ${err.message}`); }
+    try {
+      await sendSms(`${title}\n${body}`, undefined, { event, data, title, body });
+      results.sms = true;
+    } catch (err) { results.errors.push(`sms: ${err.message}`); }
   }
   return results;
 }

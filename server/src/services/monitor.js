@@ -63,6 +63,10 @@ async function checkNodes(server) {
       if (failures >= threshold && state.nodeAlerts.get(key) !== 'offline') {
         state.nodeAlerts.set(key, 'offline');
         alertAdmins({
+          event: 'nodeOffline',
+          data: {
+            node: name, server: server.name || server.id, address: node.address || 'unknown', failures,
+          },
           title: `هشدار: نود ${name} قطع شد`,
           body: `نود ${name} (${node.address || 'unknown'}) روی ${server.name || server.id} در ${failures} بررسی متوالی پاسخ نداد.`,
         }).catch((err) => logError('[monitor] alert failed:', err.message));
@@ -72,6 +76,8 @@ async function checkNodes(server) {
       if (state.nodeAlerts.get(key) === 'offline') {
         state.nodeAlerts.delete(key);
         alertAdmins({
+          event: 'nodeOnline',
+          data: { node: name, server: server.name || server.id },
           title: `نود ${name} دوباره متصل شد`,
           body: `ارتباط با نود ${name} روی ${server.name || server.id} برقرار شد.`,
         }).catch((err) => logError('[monitor] recovery alert failed:', err.message));
@@ -92,6 +98,8 @@ async function checkPanel(server) {
     if (state.panelAlerts.get(server.id)) {
       state.panelAlerts.delete(server.id);
       alertAdmins({
+        event: 'panelOnline',
+        data: { server: name },
         title: `پنل ${name} دوباره در دسترس است`,
         body: 'ارتباط پنل مدیریت با x-ui برقرار شد.',
       }).catch(() => {});
@@ -103,6 +111,8 @@ async function checkPanel(server) {
     if (!state.panelAlerts.get(server.id)) {
       state.panelAlerts.set(server.id, true);
       alertAdmins({
+        event: 'panelOffline',
+        data: { server: name, error: err.message },
         title: `هشدار: ارتباط با پنل ${name} قطع شد`,
         body: err.message,
       }).catch(() => {});

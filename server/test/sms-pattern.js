@@ -218,6 +218,91 @@ async function run() {
       && alertQuery?.get('token2') === 'نود dl20 پاسخ نداد'
   );
 
+  // ------------------------------------------------- per-notification patterns
+  settings.updateSection('sms', {
+    provider: 'farazsms',
+    mode: 'pattern',
+    pattern: 'DEFAULT',
+    patternNames: 'var1,var2,var3',
+    patterns: {
+      nodeOffline: { code: 'NODE-DOWN', names: 'n,s', var1: '{node}', var2: '{server}', var3: '' },
+      nodeOnline: { code: 'NODE-UP', names: '', var1: '', var2: '', var3: '' },
+      panelOffline: { code: '', names: '', var1: '', var2: '', var3: '' },
+      panelOnline: { code: '', names: '', var1: '', var2: '', var3: '' },
+      test: { code: '', names: '', var1: '', var2: '', var3: '' },
+    },
+  });
+  respond = () => ({ ok: true, status: 200, json: async () => ({ status: 'success', data: 1 }) });
+  calls.length = 0;
+  await notify.alertAdmins({
+    event: 'nodeOffline',
+    data: {
+      node: 'dl20', server: 'dash', address: '1.2.3.4', failures: 3,
+    },
+    title: 'هشدار: نود dl20 قطع شد',
+    body: 'نود dl20 روی dash پاسخ نداد.',
+  });
+  const eventBody = bodyOf(calls[0]);
+  check(
+    'an event pattern replaces the default code and uses its own attributes',
+    eventBody.code === 'NODE-DOWN'
+      && eventBody.attributes?.n === 'dl20'
+      && eventBody.attributes?.s === 'dash'
+      && !eventBody.attributes?.var1,
+    JSON.stringify(eventBody)
+  );
+
+  calls.length = 0;
+  await notify.alertAdmins({
+    event: 'nodeOnline',
+    data: { node: 'dl21', server: 'dash' },
+    title: 'نود dl21 دوباره متصل شد',
+    body: 'ارتباط برقرار شد.',
+  });
+  const upBody = bodyOf(calls[0]);
+  check(
+    'an event pattern without a mapping keeps the title/body split',
+    upBody.code === 'NODE-UP'
+      && upBody.attributes?.var1 === 'نود dl21 دوباره متصل شد'
+      && upBody.attributes?.var2 === 'ارتباط برقرار شد.',
+    JSON.stringify(upBody.attributes)
+  );
+
+  calls.length = 0;
+  const fallbackAlert = await notify.alertAdmins({
+    event: 'panelOnline',
+    data: { server: 'dash' },
+    title: 'پنل dash دوباره در دسترس است',
+    body: 'ارتباط برقرار شد.',
+  });
+  const fallbackBody = bodyOf(calls[0]);
+  check(
+    'an event without its own code falls back to the default pattern',
+    fallbackAlert.sms === true
+      && fallbackBody.code === 'DEFAULT'
+      && fallbackBody.attributes?.var1 === 'پنل dash دوباره در دسترس است',
+    JSON.stringify(fallbackBody)
+  );
+
+  const basePatterns = settings.getSetting('sms').patterns;
+  settings.updateSection('sms', {
+    patterns: {
+      ...basePatterns,
+      test: { code: 'VERIFY', names: '', var1: '{panel}', var2: '', var3: '' },
+    },
+  });
+  calls.length = 0;
+  const testEvent = await notify.testSms();
+  const verifyBody = bodyOf(calls[0]);
+  check(
+    'the test message can use its own pattern and the {panel} variable',
+    verifyBody.code === 'VERIFY'
+      && verifyBody.attributes?.var1 === 'Sulduz Cloud'
+      && testEvent.source === 'event'
+      && testEvent.event === 'test',
+    JSON.stringify(verifyBody)
+  );
+
   // ---------------------------------------------------------------- disabled
   settings.updateSection('sms', { enabled: false });
   err = null;
