@@ -1,0 +1,4 @@
+# Allow the panel service (unprivileged "sulduz" user) to run the update
+# helper as root without a password. The helper only accepts a version tag and
+# pulls code from the configured public repository.
+sulduz ALL=(root) NOPASSWD: /usr/local/bin/sulduzcloud-update

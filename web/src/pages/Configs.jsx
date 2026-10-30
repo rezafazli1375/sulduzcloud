@@ -9,6 +9,7 @@ import {
   Download,
   ExternalLink,
   Filter,
+  Layers,
   Link2,
   Plus,
   QrCode,
@@ -200,6 +201,7 @@ export default function Configs() {
                 <tbody>
                   {rows.map((row) => {
                     const left = daysLeft(row.expiryAt, lang);
+                    const grouped = Number(row.groupCount || 1) > 1;
                     return (
                       <tr key={row.id} className="cursor-pointer" onClick={() => setDetailId(row.id)}>
                         <td>
@@ -209,13 +211,37 @@ export default function Configs() {
                             </span>
                             <div className="min-w-0">
                               <p className="max-w-[190px] truncate text-[12.5px] font-medium text-slate-200">{row.customerName || row.label || '—'}</p>
-                              <p className="max-w-[190px] truncate font-mono text-[10px] text-slate-500" dir="ltr">{row.email}</p>
+                              {grouped ? (
+                                <p className="flex items-center gap-1 text-[10px] text-cyan-300/80">
+                                  <Layers className="h-3 w-3" />
+                                  {t('configs.packageCount', { n: formatNumber(row.groupCount, lang) })}
+                                </p>
+                              ) : (
+                                <p className="max-w-[190px] truncate font-mono text-[10px] text-slate-500" dir="ltr">{row.email}</p>
+                              )}
                             </div>
                           </div>
                         </td>
                         <td>
-                          <p className="max-w-[160px] truncate text-[12px] text-slate-300">{row.inbound?.remark || `#${row.inboundId}`}</p>
-                          <p className="text-[10px] text-slate-500">{row.inbound?.protocol}{row.inbound?.network ? ` · ${row.inbound.network}` : ''}</p>
+                          {grouped ? (
+                            <div className="flex max-w-[220px] flex-wrap gap-1">
+                              {(row.inbounds || []).map((item) => (
+                                <span
+                                  key={item.configId || item.id}
+                                  className="inline-flex max-w-full items-center gap-1 rounded-md border border-white/[0.07] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-slate-300"
+                                  title={`${item.protocol}${item.network ? ` · ${item.network}` : ''}`}
+                                >
+                                  <Server className="h-2.5 w-2.5 shrink-0 text-slate-500" />
+                                  <span className="truncate">{item.remark}</span>
+                                </span>
+                              ))}
+                            </div>
+                          ) : (
+                            <>
+                              <p className="max-w-[160px] truncate text-[12px] text-slate-300">{row.inbound?.remark || `#${row.inboundId}`}</p>
+                              <p className="text-[10px] text-slate-500">{row.inbound?.protocol}{row.inbound?.network ? ` · ${row.inbound.network}` : ''}</p>
+                            </>
+                          )}
                         </td>
                         <td>
                           <UsageBar used={row.used} total={row.totalBytes} showLabel />
@@ -255,6 +281,7 @@ export default function Configs() {
           <div className="space-y-2.5 md:hidden">
             {rows.map((row) => {
               const left = daysLeft(row.expiryAt, lang);
+              const grouped = Number(row.groupCount || 1) > 1;
               return (
                 <button
                   key={row.id}
@@ -265,13 +292,27 @@ export default function Configs() {
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <p className="truncate text-[12.5px] font-semibold text-slate-100">{row.customerName || row.label || row.email}</p>
-                      <p className="truncate font-mono text-[9.5px] text-slate-500" dir="ltr">{row.email}</p>
+                      {grouped ? (
+                        <p className="flex items-center gap-1 text-[9.5px] text-cyan-300/80">
+                          <Layers className="h-3 w-3" />
+                          {t('configs.packageCount', { n: formatNumber(row.groupCount, lang) })}
+                        </p>
+                      ) : (
+                        <p className="truncate font-mono text-[9.5px] text-slate-500" dir="ltr">{row.email}</p>
+                      )}
                     </div>
                     <StatusBadge status={row.status} />
                   </div>
                   <div className="mt-2.5 flex items-center gap-2 text-[10px] text-slate-500">
-                    <span className="flex items-center gap-1"><Server className="h-3 w-3" />{row.inbound?.remark || `#${row.inboundId}`}</span>
-                    <span className="flex items-center gap-1"><CalendarClock className="h-3 w-3" />{row.expiryAt ? (left !== null && left > 0 ? `${formatNumber(left, lang)} ${t('common.days')}` : t('common.expired')) : '∞'}</span>
+                    <span className="flex min-w-0 items-center gap-1">
+                      <Server className="h-3 w-3 shrink-0" />
+                      <span className="truncate">
+                        {grouped
+                          ? (row.inbounds || []).map((item) => item.remark).join(' + ')
+                          : (row.inbound?.remark || `#${row.inboundId}`)}
+                      </span>
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1"><CalendarClock className="h-3 w-3" />{row.expiryAt ? (left !== null && left > 0 ? `${formatNumber(left, lang)} ${t('common.days')}` : t('common.expired')) : '∞'}</span>
                   </div>
                   <div className="mt-2.5"><UsageBar used={row.used} total={row.totalBytes} showLabel compact /></div>
                 </button>
@@ -300,7 +341,7 @@ export default function Configs() {
         open={formOpen}
         onClose={() => setFormOpen(false)}
         onCreated={(created) => {
-          if (created?.length === 1) setDetailId(created[0].id);
+          if (created?.length) setDetailId(created[0].id);
           queryClient.invalidateQueries({ queryKey: ['configs'] });
         }}
       />

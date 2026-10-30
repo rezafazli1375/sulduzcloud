@@ -18,6 +18,7 @@ const backupService = require('../services/backup');
 const telegram = require('../services/telegram');
 const monitor = require('../services/monitor');
 const ticketsService = require('../services/tickets');
+const updater = require('../services/updater');
 const notify = require('../notify');
 const xui = require('../xui');
 const { ApiError, asyncH, sanitizeUser, pageParams, toCsv, bytesToGb } = require('../utils');
@@ -582,6 +583,19 @@ router.get('/transactions', auth.requirePerm('stats'), (req, res) => {
 router.get('/settings', auth.requirePerm('settings'), (req, res) => {
   res.json({ ok: true, data: { settings: settings.allRedacted(), version: config.version } });
 });
+
+// ----------------------------------------------------------------- updates
+
+router.get('/update', auth.requirePerm('settings'), asyncH(async (req, res) => {
+  const data = await updater.status({ force: String(req.query.force || '') === '1' });
+  res.json({ ok: true, data });
+}));
+
+router.post('/update', auth.requirePerm('settings'), asyncH(async (req, res) => {
+  const result = updater.apply(req.body?.tag);
+  audit(req, 'panel.update', 'panel', config.version, { tag: result.tag });
+  res.json({ ok: true, data: result });
+}));
 
 router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (req, res) => {
   const section = String(req.params.section || '');

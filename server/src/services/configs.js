@@ -10,6 +10,7 @@ const serversService = require('./servers');
 const {
   ApiError,
   dayKey,
+  bytesToGb,
   gbToBytes,
   sanitizeConfig,
   statusOf,
@@ -333,25 +334,124 @@ function buildWhere(filters, viewer) {
   return { clause: `WHERE ${where.join(' AND ')}`, params, statusExpr };
 }
 
+// A customer package is every config of one reseller that shares the customer
+// subscription token (sub_id). Packages are listed as a single row so the panel
+// shows "one customer with N inbounds" instead of one row per x-ui client.
+// `flat: true` keeps the old one-row-per-client shape for machine callers (API v1).
+const GROUP_KEY_SQL = `(CASE WHEN c.sub_id <> '' AND EXISTS (
+    SELECT 1 FROM configs g2
+    WHERE g2.sub_id = c.sub_id AND g2.user_id = c.user_id AND g2.deleted_at = 0 AND g2.id <> c.id
+  ) THEN 'G:' || c.user_id || ':' || c.sub_id ELSE 'C:' || c.id END)`;
+
+const STATUS_RANK = { active: 0, disabled: 1, depleted: 2, expired: 3 };
+
+function mergeGroup(members) {
+  const first = members[0];
+  const totalBytes = members.every((m) => m.totalBytes > 0)
+    ? members.reduce((sum, m) => sum + m.totalBytes, 0)
+    : 0;
+  const up = members.reduce((sum, m) => sum + m.up, 0);
+  const down = members.reduce((sum, m) => sum + m.down, 0);
+  const used = up + down;
+  const expiries = members.map((m) => m.expiryAt).filter((value) => value > 0);
+  const status = members.reduce(
+    (worst, m) => (STATUS_RANK[m.status] > STATUS_RANK[worst] ? m.status : worst),
+    'active'
+  );
+  return {
+    ...first,
+    groupCount: members.length,
+    groupIds: members.map((m) => m.id),
+    inbounds: members.map((m) => ({
+      id: m.inboundId,
+      configId: m.id,
+      remark: m.inbound?.remark || `#${m.inboundId}`,
+      protocol: m.inbound?.protocol || '',
+      network: m.inbound?.network || '',
+      serverName: m.inbound?.serverName || '',
+      status: m.status,
+    })),
+    totalBytes,
+    totalGb: bytesToGb(totalBytes),
+    up,
+    down,
+    used,
+    remaining: totalBytes > 0 ? Math.max(0, totalBytes - used) : null,
+    usagePercent: totalBytes > 0 ? Math.min(100, Math.round((used / totalBytes) * 1000) / 10) : null,
+    expiryAt: expiries.length ? Math.max(...expiries) : 0,
+    enabled: members.every((m) => m.enabled),
+    status,
+  };
+}
+
 function listConfigs(filters = {}, viewer) {
   const db = getDb();
   const { page, pageSize, offset } = pageParams(filters, 20, 200);
   const { clause, params, statusExpr } = buildWhere(filters, viewer);
-  const total = db.prepare(`SELECT COUNT(*) AS c FROM configs c ${clause}`).get(...params).c;
-  const rows = db.prepare(
-    `SELECT c.*, ${statusExpr} AS computed_status FROM configs c ${clause}
-     ORDER BY c.created_at DESC LIMIT ? OFFSET ?`
-  ).all(...params, pageSize, offset);
   const inboundCache = new Map();
   const resellerCache = new Map();
-  const result = rows.map((row) => {
+  const sanitizeRow = (row) => {
     if (!inboundCache.has(row.inbound_id)) inboundCache.set(row.inbound_id, getInboundRow(row.inbound_id));
     if (!resellerCache.has(row.user_id)) resellerCache.set(row.user_id, getResellerRow(row.user_id));
     const config = sanitizeConfig(row, inboundCache.get(row.inbound_id), resellerCache.get(row.user_id));
     if (row.computed_status && row.computed_status !== config.status) config.status = row.computed_status;
     return config;
+  };
+  const withInbounds = (config) => ({
+    ...config,
+    groupCount: 1,
+    groupIds: [config.id],
+    inbounds: [{
+      id: config.inboundId,
+      configId: config.id,
+      remark: config.inbound?.remark || `#${config.inboundId}`,
+      protocol: config.inbound?.protocol || '',
+      network: config.inbound?.network || '',
+      serverName: config.inbound?.serverName || '',
+      status: config.status,
+    }],
   });
-  return { total, page, pageSize, rows: result };
+
+  if (filters.flat) {
+    const total = db.prepare(`SELECT COUNT(*) AS c FROM configs c ${clause}`).get(...params).c;
+    const rows = db.prepare(
+      `SELECT c.*, ${statusExpr} AS computed_status FROM configs c ${clause}
+       ORDER BY c.created_at DESC LIMIT ? OFFSET ?`
+    ).all(...params, pageSize, offset);
+    return { total, page, pageSize, rows: rows.map(withInbounds) };
+  }
+
+  const total = Number(db.prepare(
+    `SELECT COUNT(*) AS c FROM (SELECT ${GROUP_KEY_SQL} AS gkey FROM configs c ${clause} GROUP BY gkey)`
+  ).get(...params).c || 0);
+  const pageKeys = db.prepare(
+    `SELECT ${GROUP_KEY_SQL} AS gkey FROM configs c ${clause}
+     GROUP BY gkey
+     ORDER BY MAX(c.created_at) DESC, MIN(c.id) DESC
+     LIMIT ? OFFSET ?`
+  ).all(...params, pageSize, offset);
+  if (!pageKeys.length) return { total, page, pageSize, rows: [] };
+
+  const keys = pageKeys.map((item) => item.gkey);
+  const marks = keys.map(() => '?').join(',');
+  const members = db.prepare(
+    `SELECT c.*, ${GROUP_KEY_SQL} AS gkey, ${statusExpr} AS computed_status FROM configs c
+     ${clause} AND ${GROUP_KEY_SQL} IN (${marks})
+     ORDER BY c.id`
+  ).all(...params, ...keys);
+
+  const byKey = new Map();
+  for (const row of members) {
+    if (!byKey.has(row.gkey)) byKey.set(row.gkey, []);
+    byKey.get(row.gkey).push(sanitizeRow(row));
+  }
+  const rows = [];
+  for (const key of keys) {
+    const groupMembers = byKey.get(key) || [];
+    if (!groupMembers.length) continue;
+    rows.push(groupMembers.length > 1 ? mergeGroup(groupMembers) : withInbounds(groupMembers[0]));
+  }
+  return { total, page, pageSize, rows };
 }
 
 function configDetail(id, viewer) {

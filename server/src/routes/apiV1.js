@@ -63,6 +63,8 @@ router.get('/configs', (req, res) => {
       inboundId: num(req.query.inboundId, 0),
       page: num(req.query.page, 1),
       pageSize: Math.min(100, num(req.query.pageSize, 20)),
+      // API clients work with x-ui clients, so one row per config is expected.
+      flat: true,
     },
     req.user
   );

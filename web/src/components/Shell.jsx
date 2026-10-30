@@ -371,6 +371,10 @@ function SidebarFooter() {
           {t('app.footer')}
         </p>
       )}
+      <p className="flex items-center justify-between gap-2 border-t border-white/[0.05] px-1 pt-2.5 text-[9.5px] text-slate-600">
+        <span dir="ltr">{t('app.version')} {meta?.version || '1.4.1'}</span>
+        <span>{t('app.author')}: {t('app.authorName')}</span>
+      </p>
     </div>
   );
 }

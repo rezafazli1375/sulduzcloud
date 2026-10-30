@@ -306,8 +306,10 @@ export default function Login() {
             {lang === 'fa' ? 'اتصال امن با TLS · نشست رمزنگاری‌شده' : 'Secured with TLS · encrypted session'}
           </div>
 
-          <p className="mt-8 text-center text-[10.5px] text-slate-600">
-            {t('app.footer')} · v{meta?.version || '1.0.0'}
+          <p className="mt-8 text-center text-[10.5px] leading-5 text-slate-600">
+            {t('app.footer')}
+            <br />
+            <span dir="ltr">{t('app.version')} {meta?.version || '1.4.1'}</span> · {t('app.author')}: {t('app.authorName')}
           </p>
         </div>
       </main>
