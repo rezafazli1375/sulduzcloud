@@ -59,12 +59,18 @@ function countServers() {
 /**
  * Seed the first server from the legacy settings.xui section. Runs lazily so
  * old databases upgrade without a manual step.
+ *
+ * A seed only happens when the legacy section holds a real panel address AND an
+ * API token. A fresh installation keeps an empty `servers` table so every
+ * operator adds their own panel; settings.xui ships with a placeholder address
+ * (http://127.0.0.1:2053) and no token, which must never become a row.
  */
 function ensureDefaultServer() {
   if (countServers() > 0) return null;
   const xui = settings.getSetting('xui');
   const url = String(xui.url || '').trim();
-  if (!url) return null;
+  const token = String(xui.token || '').trim();
+  if (!url || !token) return null;
   const db = getDb();
   const ts = now();
   const info = db.prepare(
@@ -73,7 +79,7 @@ function ensureDefaultServer() {
   ).run(
     'پنل اصلی',
     url,
-    xui.token ? encryptSecret(String(xui.token)) : '',
+    encryptSecret(token),
     xui.verifyTls ? 1 : 0,
     String(xui.subBase || ''),
     ts,

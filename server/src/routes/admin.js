@@ -572,7 +572,9 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
   let xuiTest = null;
   if (section === 'xui') {
     // The legacy x-ui settings card keeps working: mirror it onto the primary
-    // server row so both admin screens edit the same connection.
+    // server row so both admin screens edit the same connection. A fresh panel
+    // starts with no server at all, so saving a real address + token here
+    // creates the first one.
     const primary = serversService.defaultServer();
     if (primary) {
       const patch = {
@@ -582,6 +584,17 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
       if (saved.url) patch.url = saved.url;
       if (saved.token) patch.token = saved.token;
       serversService.updateServer(primary.id, patch, req);
+    } else if (saved.url && saved.token) {
+      serversService.createServer(
+        {
+          name: 'پنل اصلی',
+          url: saved.url,
+          token: saved.token,
+          verifyTls: Boolean(saved.verifyTls),
+          subBase: saved.subBase,
+        },
+        req
+      );
     }
     try { xuiTest = await xui.testConnection(); } catch (err) { xuiTest = { ok: false, error: err.message }; }
     monitor.runCycle('settings').catch(() => {});

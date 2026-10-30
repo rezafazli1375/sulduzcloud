@@ -467,6 +467,50 @@ function startMockXui(inboundRows) {
         && serverList.json.data.panels.every((row) => row.token === undefined),
       `panels=${serverList.json?.data?.panels?.length}`
     );
+    check(
+      'a fresh installation starts with no x-ui server',
+      Array.isArray(serverList.json?.data?.panels) && serverList.json.data.panels.length === 0,
+      `panels=${serverList.json?.data?.panels?.length}`
+    );
+
+    // ------------------------------------------------ wallet billing (mock x-ui)
+    // Point the primary panel at a fake x-ui so purchases and renewals run the
+    // full code path — x-ui call, wallet charge, DB row — without a live panel.
+    const mockRows = [
+      { id: 901, remark: 'Order 30', protocol: 'vless', tag: 'tag30', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
+      { id: 902, remark: 'Order 10', protocol: 'vless', tag: 'tag10', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
+      { id: 903, remark: 'Order 20', protocol: 'vless', tag: 'tag20', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
+      { id: 904, remark: 'Order 10b', protocol: 'vless', tag: 'tag10b', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
+    ];
+    mockXui = await startMockXui(mockRows);
+    const urlOnly = await request('PATCH', '/api/admin/settings/xui', {
+      cookies, csrf,
+      body: { url: `http://127.0.0.1:${mockXui.port}`, verifyTls: false },
+    });
+    const afterUrlOnly = await request('GET', '/api/admin/servers', { cookies });
+    check(
+      'saving an address without a token does not create a server',
+      urlOnly.status === 200 && afterUrlOnly.json?.data?.panels?.length === 0,
+      `panels=${afterUrlOnly.json?.data?.panels?.length}`
+    );
+    const xuiSave = await request('PATCH', '/api/admin/settings/xui', {
+      cookies, csrf,
+      body: {
+        url: `http://127.0.0.1:${mockXui.port}`,
+        token: 'selftest-token',
+        verifyTls: false,
+        subBase: 'https://sub.example.com/sub',
+      },
+    });
+    check('x-ui settings connect to the mock panel', xuiSave.status === 200 && xuiSave.json.data.xuiTest?.ok === true);
+    const afterXuiSave = await request('GET', '/api/admin/servers', { cookies });
+    check(
+      'saving the first real connection creates the primary server',
+      afterXuiSave.json?.data?.panels?.length === 1 && afterXuiSave.json.data.panels[0].hasToken === true,
+      `panels=${afterXuiSave.json?.data?.panels?.length}`
+    );
+
+    // Admins can register additional x-ui panels; tokens never come back.
     const serverCreate = await request('POST', '/api/admin/servers', {
       cookies,
       csrf,
@@ -488,27 +532,6 @@ function startMockXui(inboundRows) {
     check('resellers cannot list servers', serverReseller.status === 403);
     const serverDelete = await request('DELETE', `/api/admin/servers/${newServerId}`, { cookies, csrf });
     check('admin can delete an unused server', serverDelete.status === 200);
-
-    // ------------------------------------------------ wallet billing (mock x-ui)
-    // Point the primary panel at a fake x-ui so purchases and renewals run the
-    // full code path — x-ui call, wallet charge, DB row — without a live panel.
-    const mockRows = [
-      { id: 901, remark: 'Order 30', protocol: 'vless', tag: 'tag30', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
-      { id: 902, remark: 'Order 10', protocol: 'vless', tag: 'tag10', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
-      { id: 903, remark: 'Order 20', protocol: 'vless', tag: 'tag20', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
-      { id: 904, remark: 'Order 10b', protocol: 'vless', tag: 'tag10b', port: 1000, network: 'tcp', security: 'none', listen: '', enable: true },
-    ];
-    mockXui = await startMockXui(mockRows);
-    const xuiSave = await request('PATCH', '/api/admin/settings/xui', {
-      cookies, csrf,
-      body: {
-        url: `http://127.0.0.1:${mockXui.port}`,
-        token: 'selftest-token',
-        verifyTls: false,
-        subBase: 'https://sub.example.com/sub',
-      },
-    });
-    check('x-ui settings connect to the mock panel', xuiSave.status === 200 && xuiSave.json.data.xuiTest?.ok === true);
 
     const billingSave = await request('PATCH', '/api/admin/settings/billing', {
       cookies, csrf, body: { enabled: true, currency: 'تومان' },
