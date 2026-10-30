@@ -259,12 +259,21 @@ EOF
   fi
 fi
 
+PUBLIC_URL_SHOWN="$(awk -F= '$1=="PUBLIC_URL" { sub(/^[^=]*=/, ""); print; exit }' "$APP_DIR/server/.env" 2>/dev/null)"
+[ -n "$PUBLIC_URL_SHOWN" ] || PUBLIC_URL_SHOWN="http://$DOMAIN"
+SETUP_STATE="$(curl -fsS --max-time 4 "http://127.0.0.1:$PORT/api/setup/status" 2>/dev/null | sed -n 's/.*"setupRequired":\(true\|false\).*/\1/p')"
+if [ "$SETUP_STATE" = "true" ]; then
+  SETUP_LINE="  First-run setup:  open the panel and create the owner account"
+else
+  SETUP_LINE="  Sign in:          use the owner account you already created"
+fi
+
 cat <<EOF
 
 $(printf '\033[1;32m')Sulduz Cloud is installed.$(printf '\033[0m')
 
-  Panel:            http://$DOMAIN
-  First-run setup:  open the panel and create the owner account
+  Panel:            $PUBLIC_URL_SHOWN
+$SETUP_LINE
   Server menu:      sulduzcloud      (or: sc)  -> accounts, domain, SSL, backups
   Service:          systemctl status sulduzcloud
   Logs:             journalctl -u sulduzcloud -f
