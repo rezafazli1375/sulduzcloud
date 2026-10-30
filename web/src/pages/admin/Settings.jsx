@@ -1,12 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  AlertTriangle,
   BellRing,
   CheckCircle2,
   CreditCard,
   DatabaseBackup,
-  Download,
   Globe2,
   KeyRound,
   Lock,
@@ -18,12 +16,10 @@ import {
   Send,
   ShieldCheck,
   SlidersHorizontal,
-  Sparkles,
 } from 'lucide-react';
 import { useAuth } from '../../lib/auth.jsx';
 import { useI18n, translateError } from '../../lib/i18n.jsx';
 import { api } from '../../lib/api.js';
-import { formatDate } from '../../lib/format.js';
 import {
   Button,
   ErrorState,
@@ -38,7 +34,7 @@ import {
   Textarea,
   cx,
 } from '../../components/ui.jsx';
-import { useConfirm, useToast } from '../../components/feedback.jsx';
+import { useToast } from '../../components/feedback.jsx';
 
 const TIMEZONES = [
   'Asia/Tehran',
@@ -61,7 +57,6 @@ const TAB_LIST = [
   { value: 'backup', icon: DatabaseBackup, label: 'settings.tabs.backup' },
   { value: 'telegram', icon: Send, label: 'settings.tabs.telegram' },
   { value: 'security', icon: Lock, label: 'settings.tabs.security' },
-  { value: 'update', icon: Download, label: 'settings.tabs.update' },
 ];
 
 function SwitchRow({ label, hint, checked, onChange }) {
@@ -86,154 +81,6 @@ function SaveBar({ onSave, saving, extra }) {
         <Button icon={Save} loading={saving} onClick={onSave}>{t('common.save')}</Button>
       </div>
     </div>
-  );
-}
-
-function UpdateTab({ version }) {
-  const { t, lang } = useI18n();
-  const toast = useToast();
-  const confirm = useConfirm();
-  const queryClient = useQueryClient();
-  const [waiting, setWaiting] = useState(false);
-  const [startVersion, setStartVersion] = useState('');
-
-  const info = useQuery({
-    queryKey: ['panel-update'],
-    queryFn: () => api.get('/admin/update'),
-    refetchInterval: (query) => (waiting || query.state.data?.running ? 4000 : false),
-    retry: 1,
-  });
-
-  const data = info.data || {};
-  const latest = data.latest || '';
-  const running = waiting || Boolean(data.running);
-
-  useEffect(() => {
-    if (!waiting) return;
-    if (data.current && startVersion && data.current !== startVersion) {
-      setWaiting(false);
-      toast.success(t('settings.update.done', { version: data.current }));
-      setTimeout(() => window.location.reload(), 1400);
-    }
-  }, [waiting, startVersion, data.current]);
-
-  useEffect(() => {
-    if (!waiting) return undefined;
-    const timer = setTimeout(() => {
-      setWaiting(false);
-      toast.error(t('settings.update.failed'));
-    }, 5 * 60 * 1000);
-    return () => clearTimeout(timer);
-  }, [waiting]);
-
-  const check = useMutation({
-    mutationFn: () => api.get('/admin/update?force=1'),
-    onSuccess: (payload) => queryClient.setQueryData(['panel-update'], payload),
-    onError: (err) => toast.error(translateError(err, t)),
-  });
-
-  const run = async () => {
-    const ok = await confirm({
-      title: t('settings.update.confirmTitle'),
-      body: t('settings.update.confirmBody', { version: latest }),
-      confirmText: t('settings.update.run', { version: latest }),
-    });
-    if (!ok) return;
-    try {
-      await api.post('/admin/update', { tag: latest });
-      setStartVersion(data.current || version || '');
-      setWaiting(true);
-      toast.info(t('settings.update.waitingReload'));
-      queryClient.invalidateQueries({ queryKey: ['panel-update'] });
-    } catch (err) {
-      toast.error(translateError(err, t));
-    }
-  };
-
-  const disabled = data.checkError === 'disabled';
-
-  return (
-    <SectionCard icon={Download} title={t('settings.update.title')}>
-      <div className="space-y-4">
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3.5">
-            <p className="text-[10.5px] text-slate-500">{t('settings.update.current')}</p>
-            <p className="mt-1 font-mono text-lg font-bold text-white" dir="ltr">v{version || '—'}</p>
-          </div>
-          <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3.5">
-            <p className="text-[10.5px] text-slate-500">{t('settings.update.latest')}</p>
-            <p className="mt-1 font-mono text-lg font-bold text-emerald-300" dir="ltr">{latest ? latest : '—'}</p>
-          </div>
-        </div>
-
-        <div className={cx(
-          'flex items-start gap-2.5 rounded-xl border p-3.5 text-[11.5px] leading-6',
-          data.updateAvailable
-            ? 'border-amber-400/25 bg-amber-500/[0.07] text-amber-100/90'
-            : 'border-emerald-400/25 bg-emerald-500/[0.07] text-emerald-100/90'
-        )}>
-          {data.updateAvailable ? <Sparkles className="mt-0.5 h-4 w-4 shrink-0" /> : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />}
-          <p>
-            {data.updateAvailable
-              ? t('settings.update.available', { version: latest })
-              : disabled
-                ? t('settings.update.disabled')
-                : t('settings.update.upToDate')}
-          </p>
-        </div>
-
-        {data.checkError && !disabled ? (
-          <p className="flex items-start gap-2 rounded-xl border border-rose-400/20 bg-rose-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-rose-200">
-            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            {t('settings.update.checkFailed')}: {data.checkError}
-          </p>
-        ) : null}
-
-        {running ? (
-          <p className="flex items-center gap-2 rounded-xl border border-cyan-400/20 bg-cyan-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-cyan-100/90">
-            <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-            {t('settings.update.running')}
-          </p>
-        ) : null}
-
-        <div className="flex flex-wrap gap-2">
-          <Button variant="secondary" size="sm" icon={RefreshCw} loading={check.isPending} onClick={() => check.mutate()}>
-            {check.isPending ? t('settings.update.checking') : t('settings.update.check')}
-          </Button>
-          {data.updateAvailable ? (
-            <Button size="sm" icon={Download} loading={running} disabled={running || disabled} onClick={run}>
-              {t('settings.update.run', { version: latest })}
-            </Button>
-          ) : null}
-        </div>
-
-        <p className="text-[10.5px] leading-6 text-slate-500">{t('settings.update.hint')}</p>
-
-        {data.last ? (
-          <p className="text-[10.5px] text-slate-500">
-            {t('settings.update.lastRun')}: <b className="font-mono text-slate-300" dir="ltr">{data.last.tag}</b>
-            {' · '}
-            {data.last.ok ? t('common.done') : t('settings.update.failed')}
-            {data.last.finishedAt ? ` · ${formatDate(data.last.finishedAt, lang, true)}` : ''}
-          </p>
-        ) : null}
-
-        {data.log ? (
-          <div>
-            <p className="mb-1.5 text-[10.5px] font-medium text-slate-400">{t('settings.update.log')}</p>
-            <pre className="max-h-56 overflow-auto rounded-xl border border-white/[0.06] bg-[#050811]/70 p-3 font-mono text-[10px] leading-5 text-slate-400" dir="ltr">{data.log}</pre>
-          </div>
-        ) : null}
-
-        <p className="flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-white/[0.06] pt-3 text-[10.5px] text-slate-600">
-          <span>{t('app.version')}:</span>
-          <span className="font-mono text-slate-400" dir="ltr">v{version || '—'}</span>
-          <span>·</span>
-          <span>{t('settings.update.author')}:</span>
-          <span className="text-slate-400">{t('app.authorName')}</span>
-        </p>
-      </div>
-    </SectionCard>
   );
 }
 
@@ -754,8 +601,6 @@ export default function Settings() {
           </div>
         </SectionCard>
       ) : null}
-
-      {tab === 'update' ? <UpdateTab version={data?.version} /> : null}
     </>
   );
 }

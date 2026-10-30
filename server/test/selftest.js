@@ -187,6 +187,7 @@ function startMockXui(inboundRows) {
       HOST: '127.0.0.1',
       PORT: String(PORT),
       DATA_DIR,
+      DB_PATH: path.join(DATA_DIR, 'panel.db'),
       BACKUP_DIR: path.join(DATA_DIR, 'backups'),
       XUI_TOKEN_FILE: path.join(DATA_DIR, 'secrets', 'xui-token'),
       ADMIN_USERNAME: '',
@@ -264,7 +265,7 @@ function startMockXui(inboundRows) {
 
     const shop = await request('POST', '/api/admin/users', {
       cookies, csrf,
-      body: { username: SHOP, password: SHOP_PASS, name: 'فروشگاه تست', role: 'reseller', max_configs: 5 },
+      body: { username: SHOP, password: SHOP_PASS, name: 'فروشگاه تست', role: 'reseller', max_configs: 10 },
     });
     const shopId = shop.json?.data?.user?.id;
     check('create reseller', shop.status === 201 && shopId > 0);
@@ -701,6 +702,41 @@ function startMockXui(inboundRows) {
       multiLinks.status === 200 && String(multiLinks.json?.data?.subUrl || '') === `http://127.0.0.1/api/sub/${groupToken}`,
       `subUrl=${multiLinks.json?.data?.subUrl}`
     );
+    // Listing packages must paginate customers, not individual x-ui clients.
+    const customerSearch = encodeURIComponent('مشتری چند اینباند');
+    const groupedList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
+    const packageRow = groupedList.json?.data?.rows?.[0] || {};
+    check('three inbounds appear as one reseller customer row',
+      groupedList.status === 200 && groupedList.json?.data?.total === 1
+      && groupedList.json.data.rows.length === 1 && packageRow.groupCount === 3);
+    check('package list contains every member exactly once',
+      JSON.stringify(packageRow.groupIds) === JSON.stringify(multiConfigs.map((item) => item.id))
+      && new Set((packageRow.inbounds || []).map((item) => item.id)).size === 3);
+    check('package quotas stay independent rather than becoming a shared pool',
+      packageRow.totalBytes === 10 * 1024 ** 3
+      && packageRow.inbounds?.every((item) => item.totalBytes === 10 * 1024 ** 3 && item.used === 0));
+    const adminGrouped = await request('GET', `/api/admin/configs?userId=${shopId}&search=${customerSearch}`, { cookies });
+    check('admin and reseller see the same complete customer package',
+      adminGrouped.status === 200 && adminGrouped.json?.data?.total === 1
+      && JSON.stringify(adminGrouped.json.data.rows[0]?.groupIds) === JSON.stringify(packageRow.groupIds));
+    const emailFiltered = await request('GET', `/api/reseller/configs?search=${encodeURIComponent(multiConfigs[1]?.email)}`, { cookies: shopCookies });
+    check('searching one member email still returns the entire package',
+      emailFiltered.json?.data?.total === 1 && emailFiltered.json.data.rows[0]?.groupCount === 3);
+    const inboundFiltered = await request('GET', '/api/reseller/configs?inboundId=902', { cookies: shopCookies });
+    check('filtering by an inbound does not hide sibling inbounds',
+      inboundFiltered.json?.data?.total === 1 && inboundFiltered.json.data.rows[0]?.groupCount === 3);
+    const firstPage = await request('GET', '/api/reseller/configs?pageSize=1&page=1', { cookies: shopCookies });
+    const secondPage = await request('GET', '/api/reseller/configs?pageSize=1&page=2', { cookies: shopCookies });
+    const emptyPage = await request('GET', '/api/reseller/configs?pageSize=1&page=3', { cookies: shopCookies });
+    check('pagination counts customers and never splits a package',
+      firstPage.json?.data?.total === 2 && secondPage.json?.data?.total === 2
+      && firstPage.json.data.rows[0]?.groupCount === 3
+      && secondPage.json.data.rows[0]?.id === bought.id
+      && secondPage.json.data.rows[0]?.groupCount === 1);
+    check('out-of-range page keeps total without repeating a package',
+      emptyPage.json?.data?.total === 2 && emptyPage.json.data.rows.length === 0);
+    const noMatch = await request('GET', '/api/reseller/configs?search=absent-package-selftest', { cookies: shopCookies });
+    check('unmatched customer search returns an empty list', noMatch.json?.data?.total === 0 && noMatch.json.data.rows.length === 0);
     const rotated = await request('POST', `/api/reseller/configs/${multiConfigs[0]?.id}/identity`, {
       cookies: shopCookies, csrf: shopCsrf, body: { subId: 'packagerotated1' },
     });
@@ -720,6 +756,103 @@ function startMockXui(inboundRows) {
 
     const v1me = await request('GET', '/api/v1/me', { headers: { 'x-api-key': apiKey } });
     check('api v1 authenticates with key', v1me.status === 200 && v1me.json.data.user.username === SHOP);
+
+    const v1List = await request('GET', `/api/v1/configs?search=${customerSearch}`, { headers: { 'x-api-key': apiKey } });
+    const v1Rows = v1List.json?.data?.rows || [];
+    check('API v1 retains one sanitized row per config',
+      v1List.status === 200 && v1List.json?.data?.total === 3 && v1Rows.length === 3
+      && v1Rows.every((item) => item.userId === shopId && item.inboundId > 0 && item.inbound?.remark && item.totalGb === 10));
+    check('API v1 never exposes raw database columns or private x-ui subIds',
+      v1Rows.length === 3 && v1Rows.every((item) => !('user_id' in item) && !('xui_sub_id' in item)
+        && !('password' in item) && !('groupCount' in item)));
+    const v1Filtered = await request('GET', '/api/v1/configs?inboundId=902', { headers: { 'x-api-key': apiKey } });
+    check('API v1 inbound filtering stays flat',
+      v1Filtered.json?.data?.total === 1 && v1Filtered.json.data.rows[0]?.inboundId === 902);
+
+    // Reproduce the reported two-inbound order and a second order with the
+    // same display name. Only shared subscription identity defines a package.
+    const twoBuy = await request('POST', '/api/reseller/configs', {
+      cookies: shopCookies, csrf: shopCsrf,
+      body: { inboundIds: [901, 902], gb: 30, days: 30, customerName: 'مشتری چند اینباند' },
+    });
+    const twoConfigs = twoBuy.json?.data?.configs || [];
+    const twoList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
+    check('a two-inbound purchase produces one row with both inbounds',
+      twoBuy.status === 201 && twoConfigs.length === 2
+      && twoList.json?.data?.rows?.some((item) => item.id === twoConfigs[0].id && item.groupCount === 2),
+      `status=${twoBuy.status} error=${twoBuy.json?.error?.code || ''}`);
+    check('separate customers with the same name are not merged',
+      twoList.json?.data?.total === 2 && twoList.json.data.rows.length === 2);
+
+    // Direct fixtures exist ONLY in the disposable self-test database. They
+    // cover legacy rows, token collisions, deletion and mixed member states.
+    const fixtureDb = new Database(path.join(DATA_DIR, 'panel.db'));
+    const fixtureIds = [];
+    let fixtureServerId;
+    try {
+      fixtureServerId = Number(fixtureDb.prepare("INSERT INTO servers (name, enabled) VALUES ('Grouping fixture', 0)").run().lastInsertRowid);
+      const fixture = (userId, serverId, token, label) => {
+        const info = fixtureDb.prepare(`INSERT INTO configs
+          (user_id, server_id, inbound_id, email, sub_id, label, total_bytes, created_at, updated_at)
+          VALUES (?, ?, 901, ?, ?, ?, ?, ?, ?)`)
+          .run(userId, serverId, `fixture-${crypto.randomBytes(8).toString('hex')}`, token, label, 1024 ** 3, Date.now(), Date.now());
+        const id = Number(info.lastInsertRowid);
+        fixtureIds.push(id);
+        return id;
+      };
+      const otherUserId = setup.json.data.user.id;
+      const foreignId = fixture(otherUserId, primaryId, 'packagerotated1', 'foreign-owner');
+      const otherServerId = fixture(shopId, fixtureServerId, 'packagerotated1', 'foreign-server');
+      const emptyOne = fixture(shopId, primaryId, '', 'empty-token-fixture');
+      const emptyTwo = fixture(shopId, primaryId, '', 'empty-token-fixture');
+      const blankList = await request('GET', '/api/reseller/configs?search=empty-token-fixture', { cookies: shopCookies });
+      check('legacy rows with empty subscription tokens remain separate',
+        blankList.json?.data?.total === 2 && blankList.json.data.rows.every((item) => item.groupCount === 1)
+        && blankList.json.data.rows.some((item) => item.id === emptyOne)
+        && blankList.json.data.rows.some((item) => item.id === emptyTwo));
+      const scoped = await request('GET', `/api/reseller/configs?userId=${otherUserId}&search=${encodeURIComponent(multiConfigs[0].email)}`, { cookies: shopCookies });
+      check('matching tokens cannot expose another owner or server in a package',
+        scoped.json?.data?.total === 1 && scoped.json.data.rows[0]?.groupCount === 3
+        && !scoped.json.data.rows[0].groupIds.includes(foreignId)
+        && !scoped.json.data.rows[0].groupIds.includes(otherServerId));
+      const adminScoped = await request('GET', `/api/admin/configs?userId=${otherUserId}`, { cookies });
+      check('admin user filter does not expand into another reseller',
+        adminScoped.json?.data?.total === 1 && adminScoped.json.data.rows[0]?.id === foreignId
+        && adminScoped.json.data.rows[0]?.groupCount === 1);
+      const denied = await request('GET', `/api/reseller/configs/${foreignId}`, { cookies: shopCookies });
+      check('reseller cannot open another owners config', denied.status === 403);
+
+      const alteredId = multiConfigs[1].id;
+      const original = fixtureDb.prepare('SELECT * FROM configs WHERE id = ?').get(alteredId);
+      try {
+        fixtureDb.prepare('UPDATE configs SET enabled = 0, total_bytes = 0, expiry_at = 0, up_bytes = 123 WHERE id = ?').run(alteredId);
+        const mixed = await request('GET', `/api/reseller/configs?search=${customerSearch}&status=disabled`, { cookies: shopCookies });
+        const mixedRow = mixed.json?.data?.rows?.[0];
+        check('status filter selects a complete package with mixed states',
+          mixed.json?.data?.total === 1 && mixedRow?.groupCount === 3 && mixedRow.groupStatus === 'mixed');
+        check('finite and unlimited member quotas and expiries are not conflated',
+          mixedRow?.expiryMixed === true
+          && mixedRow.inbounds.some((item) => item.configId === alteredId && item.totalBytes === 0 && item.expiryAt === 0 && item.used === 123)
+          && mixedRow.inbounds.some((item) => item.totalBytes === 10 * 1024 ** 3 && item.expiryAt > 0));
+        fixtureDb.prepare('UPDATE configs SET deleted_at = ? WHERE id = ?').run(Date.now(), alteredId);
+        const afterDelete = await request('GET', `/api/reseller/configs?search=${encodeURIComponent(multiConfigs[0].email)}`, { cookies: shopCookies });
+        check('soft-deleted members disappear without duplicating the customer',
+          afterDelete.json?.data?.total === 1 && afterDelete.json.data.rows[0]?.groupCount === 2
+          && !afterDelete.json.data.rows[0].groupIds.includes(alteredId));
+      } finally {
+        fixtureDb.prepare('UPDATE configs SET enabled = ?, total_bytes = ?, expiry_at = ?, up_bytes = ?, deleted_at = ? WHERE id = ?')
+          .run(original.enabled, original.total_bytes, original.expiry_at, original.up_bytes, original.deleted_at, alteredId);
+      }
+      const removeMember = await request('DELETE', `/api/reseller/configs/${twoConfigs[1].id}`, { cookies: shopCookies, csrf: shopCsrf });
+      const remainingMember = await request('GET', `/api/reseller/configs?search=${encodeURIComponent(twoConfigs[0].email)}`, { cookies: shopCookies });
+      check('removing one of two inbounds leaves one customer row',
+        removeMember.status === 200 && remainingMember.json?.data?.total === 1
+        && remainingMember.json.data.rows[0]?.groupCount === 1);
+    } finally {
+      for (const id of fixtureIds) fixtureDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      if (fixtureServerId) fixtureDb.prepare('DELETE FROM servers WHERE id = ?').run(fixtureServerId);
+      fixtureDb.close();
+    }
 
     const v1Bad = await request('GET', '/api/v1/me', { headers: { 'x-api-key': 'sc_invalid' } });
     check('api v1 rejects bad key', v1Bad.status === 401);

@@ -91,9 +91,6 @@ const config = {
   timezone: process.env.PANEL_TZ || 'Asia/Tehran',
   webDist: process.env.WEB_DIST || path.resolve(ROOT, '..', 'web', 'dist'),
   version: '1.4.1',
-  // In-panel updater: public mirror + root helper installed by install.sh.
-  updateRepo: process.env.UPDATE_REPO || 'rezafazli1375/sulduzcloud',
-  updateScript: process.env.UPDATE_SCRIPT || '/usr/local/bin/sulduzcloud-update',
   sessionDaysDefault: 7,
 };
 

@@ -113,7 +113,6 @@ if [ "$(cd "$SRC_DIR" && pwd)" != "$(cd "$APP_DIR" && pwd)" ]; then
   find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.env' -exec rm -rf {} +
   cp -a "$SRC_DIR/server" "$SRC_DIR/web" "$APP_DIR/"
   [ -f "$SRC_DIR/menu.sh" ] && cp -a "$SRC_DIR/menu.sh" "$APP_DIR/menu.sh"
-  [ -d "$SRC_DIR/scripts" ] && cp -a "$SRC_DIR/scripts" "$APP_DIR/scripts"
 else
   warn "Installing from $APP_DIR itself; files are left in place"
 fi
@@ -210,19 +209,6 @@ if [ -f "$APP_DIR/menu.sh" ]; then
   install -m 755 "$APP_DIR/menu.sh" /usr/local/bin/sulduzcloud
   ln -sf /usr/local/bin/sulduzcloud /usr/local/bin/sc
   ln -sf /usr/local/bin/sulduzcloud /usr/local/bin/sulduzcloud-menu
-fi
-
-# --------------------------------------------------------------- in-panel updater
-if [ -f "$APP_DIR/scripts/sulduzcloud-update" ]; then
-  log "Installing the in-panel updater (Settings -> Update)"
-  install -m 755 "$APP_DIR/scripts/sulduzcloud-update" /usr/local/bin/sulduzcloud-update
-  if [ -f "$APP_DIR/scripts/sulduzcloud-update.sudoers" ] && command -v visudo >/dev/null 2>&1; then
-    install -m 440 "$APP_DIR/scripts/sulduzcloud-update.sudoers" /etc/sudoers.d/sulduzcloud-update
-    if ! visudo -cf /etc/sudoers.d/sulduzcloud-update >/dev/null 2>&1; then
-      warn "sudoers entry rejected; the in-panel updater stays disabled"
-      rm -f /etc/sudoers.d/sulduzcloud-update
-    fi
-  fi
 fi
 
 # ------------------------------------------------------------------ nginx

@@ -95,7 +95,7 @@ function randomSubId() {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export default function ConfigDetail({ open, configId, onClose, onChanged }) {
+export default function ConfigDetail({ open, configId, onClose, onChanged, onSelect }) {
   const { t, lang } = useI18n();
   const { isAdmin, meta } = useAuth();
   const toast = useToast();
@@ -177,7 +177,8 @@ export default function ConfigDetail({ open, configId, onClose, onChanged }) {
   }, [detail.data?.client?.uuid, detail.data?.client?.subId]);
 
   const refresh = () => {
-    queryClient.invalidateQueries({ queryKey: ['config', configId] });
+    // Renewal/identity changes can affect siblings already viewed in this drawer.
+    queryClient.invalidateQueries({ queryKey: ['config'] });
     queryClient.invalidateQueries({ queryKey: ['configs'] });
     queryClient.invalidateQueries({ queryKey: ['admin', 'overview'] });
     queryClient.invalidateQueries({ queryKey: ['reseller', 'overview'] });
@@ -427,6 +428,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged }) {
               bodyClass="p-4"
             >
               <p className="mb-3 text-[10.5px] leading-5 text-slate-500">{t('configs.group.hint')}</p>
+              {group.length > 1 ? <p className="mb-3 text-[10.5px] leading-5 text-slate-400">{t('configs.memberActionHint')}</p> : null}
               <div className="space-y-2">
                 {group.map((item) => (
                   <div
@@ -452,6 +454,14 @@ export default function ConfigDetail({ open, configId, onClose, onChanged }) {
                       <span className="hidden text-[10px] text-slate-500 sm:inline">
                         {item.totalBytes ? formatBytes(item.totalBytes, lang) : '∞'}
                       </span>
+                      {onSelect && Number(item.id) !== Number(configId) ? (
+                        <IconButton
+                          icon={ExternalLink}
+                          label={`${t('configs.manageInbound')}: ${item.inbound?.remark || item.inboundId}`}
+                          disabled={[extend, quota, toggle, reset, saveMeta, remove, saveIdentity, addInbound, removeInbound].some((mutation) => mutation.isPending)}
+                          onClick={() => onSelect(item.id)}
+                        />
+                      ) : null}
                       <IconButton
                         icon={Trash2}
                         variant="ghost"

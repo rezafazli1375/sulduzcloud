@@ -662,10 +662,16 @@ function UserDetail({ userId, onClose, onEdit }) {
                     <button key={row.id} type="button" onClick={() => setConfigId(row.id)} className="flex w-full items-center gap-2.5 px-4 py-2.5 text-start transition hover:bg-white/[0.03]">
                       <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-300"><Boxes className="h-3.5 w-3.5" /></span>
                       <div className="min-w-0 flex-1">
-                        <p className="truncate text-[11.5px] text-slate-200">{row.label || row.email}</p>
-                        <p className="truncate text-[9.5px] text-slate-500">{row.inbound?.remark} · {formatBytes(row.used, lang)}</p>
+                        <p className="truncate text-[11.5px] text-slate-200">{row.customerName || row.label || row.email}</p>
+                        <p className="truncate text-[9.5px] text-slate-500">
+                          {row.groupCount > 1
+                            ? `${t('configs.packageCount', { n: formatNumber(row.groupCount, lang) })} · ${(row.inbounds || []).map((item) => item.remark).join(' + ')}`
+                            : `${row.inbound?.remark || ''} · ${formatBytes(row.used, lang)}`}
+                        </p>
                       </div>
-                      <StatusBadge status={row.status} />
+                      {row.groupStatus === 'mixed'
+                        ? <Badge tone="amber" dot>{t('configs.mixedStatus')}</Badge>
+                        : <StatusBadge status={row.groupStatus || row.status} />}
                     </button>
                   ))}
                 </div>
@@ -711,7 +717,7 @@ function UserDetail({ userId, onClose, onEdit }) {
           <Input type="text" value={password} onChange={(e) => setPassword(e.target.value)} dir="ltr" autoComplete="new-password" />
         </Field>
       </Modal>
-      <ConfigDetail open={Boolean(configId)} configId={configId} onClose={() => setConfigId(null)} onChanged={invalidate} />
+      <ConfigDetail key={configId || 'closed'} open={Boolean(configId)} configId={configId} onSelect={setConfigId} onClose={() => setConfigId(null)} onChanged={invalidate} />
     </>
   );
 }

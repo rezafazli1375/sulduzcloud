@@ -48,6 +48,31 @@ import { useToast } from '../components/feedback.jsx';
 
 const STATUSES = ['active', 'expired', 'depleted', 'disabled'];
 
+function CustomerUsage({ row, compact = false }) {
+  const { t } = useI18n();
+  if (Number(row.groupCount || 1) <= 1) {
+    return <UsageBar used={row.used} total={row.totalBytes} showLabel compact={compact} />;
+  }
+  return (
+    <div className="space-y-2">
+      <p className="text-[9px] text-slate-500">{t('configs.perInboundUsage')}</p>
+      {(row.inbounds || []).map((item) => (
+        <div key={item.configId}>
+          <p className="mb-0.5 max-w-[180px] truncate text-[9px] text-slate-400">{item.remark}</p>
+          <UsageBar used={item.used} total={item.totalBytes} showLabel compact />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CustomerStatus({ row }) {
+  const { t } = useI18n();
+  return row.groupStatus === 'mixed'
+    ? <Badge tone="amber" dot>{t('configs.mixedStatus')}</Badge>
+    : <StatusBadge status={row.groupStatus || row.status} />;
+}
+
 export default function Configs() {
   const { t, lang } = useI18n();
   const { isAdmin, can } = useAuth();
@@ -244,10 +269,12 @@ export default function Configs() {
                           )}
                         </td>
                         <td>
-                          <UsageBar used={row.used} total={row.totalBytes} showLabel />
+                          <CustomerUsage row={row} />
                         </td>
                         <td>
-                          {row.expiryAt ? (
+                          {row.expiryMixed ? (
+                            <span className="text-[11px] text-slate-400">{t('configs.variedExpiry')}</span>
+                          ) : row.expiryAt ? (
                             <div>
                               <p className="text-[11.5px] text-slate-300">{formatDate(row.expiryAt, lang)}</p>
                               <p className={cx('text-[10px]', left !== null && left <= 3 ? 'text-amber-300' : 'text-slate-500')}>
@@ -263,7 +290,7 @@ export default function Configs() {
                             <span className="text-[11.5px] text-slate-300">{row.reseller?.name || row.reseller?.username || '—'}</span>
                           </td>
                         ) : null}
-                        <td><StatusBadge status={row.status} /></td>
+                        <td><CustomerStatus row={row} /></td>
                         <td onClick={(event) => event.stopPropagation()}>
                           <div className="flex items-center justify-end gap-0.5">
                             <IconButton icon={Link2} label={t('configs.actions.links')} onClick={() => setDetailId(row.id)} />
@@ -301,7 +328,7 @@ export default function Configs() {
                         <p className="truncate font-mono text-[9.5px] text-slate-500" dir="ltr">{row.email}</p>
                       )}
                     </div>
-                    <StatusBadge status={row.status} />
+                    <CustomerStatus row={row} />
                   </div>
                   <div className="mt-2.5 flex items-center gap-2 text-[10px] text-slate-500">
                     <span className="flex min-w-0 items-center gap-1">
@@ -312,9 +339,9 @@ export default function Configs() {
                           : (row.inbound?.remark || `#${row.inboundId}`)}
                       </span>
                     </span>
-                    <span className="flex shrink-0 items-center gap-1"><CalendarClock className="h-3 w-3" />{row.expiryAt ? (left !== null && left > 0 ? `${formatNumber(left, lang)} ${t('common.days')}` : t('common.expired')) : '∞'}</span>
+                    <span className="flex shrink-0 items-center gap-1"><CalendarClock className="h-3 w-3" />{row.expiryMixed ? t('configs.variedExpiry') : row.expiryAt ? (left !== null && left > 0 ? `${formatNumber(left, lang)} ${t('common.days')}` : t('common.expired')) : '∞'}</span>
                   </div>
-                  <div className="mt-2.5"><UsageBar used={row.used} total={row.totalBytes} showLabel compact /></div>
+                  <div className="mt-2.5"><CustomerUsage row={row} compact /></div>
                 </button>
               );
             })}
@@ -346,8 +373,10 @@ export default function Configs() {
         }}
       />
       <ConfigDetail
+        key={detailId || 'closed'}
         open={Boolean(detailId)}
         configId={detailId}
+        onSelect={setDetailId}
         onClose={() => setDetailId(null)}
         onChanged={() => queryClient.invalidateQueries({ queryKey: ['configs'] })}
       />
