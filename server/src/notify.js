@@ -108,6 +108,43 @@ async function sendSms(text, to) {
     return { ok: true, provider: 'kavenegar' };
   }
 
+  if (sms.provider === 'farazsms') {
+    // FarazSMS v1 web service (docs.farazsms.com): the static panel API key goes
+    // in the Api-Key header, the sender line in `line_number`, and every number
+    // must be plain digits ("english" format, no +98 prefix).
+    if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'FarazSMS API key is missing');
+    const line = String(sms.sender || '').trim();
+    if (!line) throw new ApiError(400, 'sms_incomplete', 'FarazSMS line number (sender) is missing');
+    // Accept 09…, 0098… and 98… but always send the local 09… form.
+    const normalize = (value) => {
+      const digits = value.replace(/\D/g, '');
+      if (/^0098\d{10}$/.test(digits)) return `0${digits.slice(4)}`;
+      if (/^98\d{10}$/.test(digits)) return `0${digits.slice(2)}`;
+      return digits;
+    };
+    const recipients = recipient.split(',').map(normalize).filter(Boolean);
+    const res = await fetch('https://api.iranpayamak.com/ws/v1/sms/simple', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Api-Key': String(sms.apiKey),
+      },
+      body: JSON.stringify({
+        text: message,
+        line_number: line,
+        number_format: 'english',
+        recipients,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || String(json.status || '').toLowerCase() === 'error') {
+      throw new ApiError(502, 'sms_failed', `FarazSMS error: ${json.message || `HTTP ${res.status}`}`);
+    }
+    return { ok: true, provider: 'farazsms', recipients };
+  }
+
   if (sms.provider === 'custom') {
     if (!sms.customUrl) throw new ApiError(400, 'sms_incomplete', 'Custom SMS URL is missing');
     let headers = {};

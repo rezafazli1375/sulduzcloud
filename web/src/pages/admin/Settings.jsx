@@ -406,6 +406,7 @@ export default function Settings() {
               <Field label={t('settings.sms.provider')}>
                 <Select value={sms.provider || 'kavenegar'} onChange={(e) => patch('sms', 'provider', e.target.value)}>
                   <option value="kavenegar">{t('settings.sms.kavenegar')}</option>
+                  <option value="farazsms">{t('settings.sms.farazsms')}</option>
                   <option value="custom">{t('settings.sms.custom')}</option>
                 </Select>
               </Field>
@@ -421,10 +422,16 @@ export default function Settings() {
                   onChange={(e) => patch('sms', 'apiKey', e.target.value)}
                 />
               </Field>
-              <Field label={t('settings.sms.sender')}>
+              <Field label={t('settings.sms.sender')} hint={sms.provider === 'farazsms' ? t('settings.sms.farazsmsSenderHint') : ''}>
                 <Input dir="ltr" value={sms.sender || ''} onChange={(e) => patch('sms', 'sender', e.target.value)} />
               </Field>
             </div>
+
+            {sms.provider === 'farazsms' ? (
+              <p className="rounded-xl border border-cyan-400/20 bg-cyan-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-cyan-100/90">
+                {t('settings.sms.farazsmsHint')}
+              </p>
+            ) : null}
 
             {sms.provider === 'custom' ? (
               <div className="space-y-4 rounded-xl border border-white/[0.07] bg-white/[0.02] p-3.5">

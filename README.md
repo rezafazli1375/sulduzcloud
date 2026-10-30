@@ -4,7 +4,7 @@
 
 A bilingual (Persian/English) reseller & config management panel for 3x-ui, with a premium dark UI, per-reseller limits, wallet, tickets, live node status, backups and a reseller REST API.
 
-Version 1.4.1 · Node.js 20+ · SQLite · React 18 · multi-panel
+Version 1.4.2 · Node.js 20+ · SQLite · React 18 · multi-panel
 
 ---
 
@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/inst
 - کانفیگ‌ها: فهرست گروه‌شده (هر مشتری بستهٔ چند‌اینباندی یک ردیف نمایش داده می‌شود، نه چند ردیف جدا)، ساخت روی هر اینباندِ هر نود برای هر نماینده، ساخت بستهٔ چند‌اینباندی با یک لینک اشتراک واحد (پنل آن را از API همان پنل ۳x-ui می‌سازد؛ ۳x-ui اجازهٔ subId تکراری بین کلاینت‌ها را نمی‌دهد، پس لینک تجمیعی روی خود پنل سرو می‌شود)، تمدید، افزایش حجم، فعال/غیرفعال، ریست مصرف، لینک اشتراک و URI + QR، خروجی CSV
 - اینباندها: همگام‌سازی از ۳x-ui، نمایش/مخفی‌سازی برای نمایندگان، ویرایش مشخصات
 - پنل‌های x-ui متعدد: افزودن/ویرایش/حذف چند پنل ۳x-ui هم‌زمان؛ هر اینباند و کانفیگ به سرور خودش وصل است، همگام‌سازی و پایش جدا برای هر پنل، نمایش زندهٔ مصرف پردازنده/رم/دیسک هر سرور. حذف تنها سرورِ باقی‌مانده مجاز است و پنل را به همان حالت خام اول برمی‌گرداند؛ سروری که هنوز کانفیگ فعال دارد حذف نمی‌شود تا کلاینت‌های زنده قطع نشوند
-- سرورها و نودها: وضعیت زنده پنل‌ها و نودها، تأخیر، موجودی منابع، بررسی فوری، هشدار قطعی از طریق ایمیل و پیامک
+- سرورها و نودها: وضعیت زنده پنل‌ها و نودها، تأخیر، موجودی منابع، بررسی فوری، هشدار قطعی از طریق ایمیل و پیامک (کاوه‌نگار، فراز اس‌ام‌اس یا سرویس سفارشی)
 - آمار و گزارش: روند ترافیک، درآمد، وضعیت کانفیگ‌ها، برترین نمایندگان، تراکنش‌ها
 - تیکت‌ها، اطلاع‌رسانی گروهی (همه/مدیران/انتخابی)، تاریخچه ارسال
 - بکاپ: بکاپ دستی، بکاپ خودکار روزانه، نگهداری N نسخه، دانلود و بازگردانی
@@ -277,7 +277,7 @@ Each reseller signs in with their own username/password and, within the limits t
 
 ### Feature highlights
 
-- **Admin**: dashboard KPIs, resellers with per-module permissions and quotas (configs, GB per config, total GB, IP limit, expiry, balance, API key), configs on any inbound for any reseller (packages are listed as one customer row), multi-inbound packages sharing one subscription URL (aggregated by the panel itself because 3x-ui rejects a subId shared by two clients), renew/extend/toggle/reset, subscription link + URI + QR, CSV export, inbound sync/visibility, multiple x-ui servers (add/edit/delete; deleting the last server returns the panel to its blank first-run state, while a server that still owns configs is protected so live clients are never cut), live per-panel server status with latency plus CPU/RAM/disk usage, and node status, email/SMS outage alarms, traffic & revenue reports, tickets, broadcast, manual/auto backups with retention and restore, audit log, settings (general, x-ui, monitoring, email, SMS, wallet, backups, security), and the app version + author (Sulduz Server Team) shown in the sidebar, login page and settings.
+- **Admin**: dashboard KPIs, resellers with per-module permissions and quotas (configs, GB per config, total GB, IP limit, expiry, balance, API key), configs on any inbound for any reseller (packages are listed as one customer row), multi-inbound packages sharing one subscription URL (aggregated by the panel itself because 3x-ui rejects a subId shared by two clients), renew/extend/toggle/reset, subscription link + URI + QR, CSV export, inbound sync/visibility, multiple x-ui servers (add/edit/delete; deleting the last server returns the panel to its blank first-run state, while a server that still owns configs is protected so live clients are never cut), live per-panel server status with latency plus CPU/RAM/disk usage, and node status, email/SMS outage alarms (Kavenegar, FarazSMS or a custom endpoint), traffic & revenue reports, tickets, broadcast, manual/auto backups with retention and restore, audit log, settings (general, x-ui, monitoring, email, SMS, wallet, backups, security), and the app version + author (Sulduz Server Team) shown in the sidebar, login page and settings.
 - **Reseller**: self-service configs within limits, renew & add traffic, usage stats, wallet & transactions, tickets, notifications, profile/password, API keys with REST docs.
 - **Security**: JWT in HttpOnly cookie, CSRF double-submit, bcrypt, session revocation, login rate limit, Helmet, zod validation, audit log, per-key API rate limit.
 - **UI**: full fa/en with RTL/LTR, locally bundled Vazirmatn, premium dark theme, charts, skeletons, toasts, responsive mobile layout.
