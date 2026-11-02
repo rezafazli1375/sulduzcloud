@@ -7,6 +7,7 @@ const settings = require('../settings');
 const usersService = require('./users');
 const pricing = require('./pricing');
 const serversService = require('./servers');
+const inboundsService = require('./inbounds');
 const {
   ApiError,
   dayKey,
@@ -14,7 +15,6 @@ const {
   bytesToGb,
   sanitizeConfig,
   statusOf,
-  generateClientEmail,
   randomToken,
   randomUUID,
   escapeLike,
@@ -131,16 +131,163 @@ function slug(value) {
     .slice(0, 18);
 }
 
-// Client names follow "<reseller>-<5 random digits>", e.g. shop-85743.
-// The numeric suffix keeps the x-ui email readable while staying unique.
+// Client names follow "<telegram-id>-<5 random digits>", e.g. 123456789-85743.
+// The numeric suffix keeps the x-ui email readable while staying unique, and
+// the prefix ties every subscription to its reseller (see importTelegramClients).
+// Accounts without a Telegram id keep the older "<username>-<digits>" shape.
 function emailFor(user) {
-  const base = slug(user?.username) || `r${Number(user?.id) || 0}`;
+  const telegramId = String(user?.telegram_id ?? user?.telegramId ?? '').trim();
+  const base = telegramId || slug(user?.username) || `r${Number(user?.id) || 0}`;
   const exists = getDb().prepare('SELECT 1 FROM configs WHERE email = ?');
-  for (let i = 0; i < 12; i += 1) {
+  for (let i = 0; i < 24; i += 1) {
     const candidate = `${base}-${Math.floor(10000 + Math.random() * 90000)}`;
     if (!exists.get(candidate)) return candidate;
   }
-  return generateClientEmail(user?.id);
+  return `${base}-${String(Date.now()).slice(-6)}`;
+}
+
+// Clients created by this panel are "<telegramId>-<random>"; subscriptions that
+// predate it are often the bare id or use another separator. A longer id must
+// never match by prefix, so the separator is part of the test.
+function telegramIdMatches(email, telegramId) {
+  const value = String(email || '').trim().toLowerCase();
+  const id = String(telegramId || '').trim().toLowerCase();
+  if (!value || !id) return false;
+  return value === id || value.startsWith(`${id}-`) || value.startsWith(`${id}_`) || value.startsWith(`${id} `);
+}
+
+/**
+ * Adopt every x-ui client that already exists under this reseller's Telegram id.
+ * Called when a reseller is created/edited and from the manual "fetch" action.
+ * Existing subscriptions are never charged and never taken from another
+ * reseller; running it twice is idempotent.
+ */
+async function importTelegramClients(user, req) {
+  const summary = {
+    telegramId: String(user?.telegram_id || '').trim(),
+    servers: 0, imported: 0, restored: 0, skipped: 0, conflicts: 0, failed: 0, errors: [],
+  };
+  if (!user || !summary.telegramId) return summary;
+  const db = getDb();
+  const serverList = serversService.listServers({ includeDisabled: false });
+  summary.servers = serverList.length;
+  const findInbound = db.prepare('SELECT id FROM inbounds WHERE server_id = ? AND xui_id = ?');
+  const findByEmail = db.prepare('SELECT id, user_id, deleted_at FROM configs WHERE email = ?');
+  const insertConfig = db.prepare(
+    `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label,
+      customer_name, customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status,
+      up_bytes, down_bytes, last_up, last_down, last_online_at, last_synced_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, '', ?, ?, ?, '', '', '', ?, ?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const restoreConfig = db.prepare(
+    `UPDATE configs SET user_id = ?, inbound_id = ?, server_id = ?, email = ?, sub_id = '', xui_sub_id = ?,
+       uuid = ?, flow = ?, label = '', customer_name = '', customer_phone = '', note = ?, total_bytes = ?,
+       expiry_at = ?, enabled = ?, status = 'active', sync_status = '', up_bytes = ?, down_bytes = ?,
+       last_up = ?, last_down = ?, last_online_at = ?, last_synced_at = ?, created_at = ?, updated_at = ?,
+       deleted_at = 0
+     WHERE id = ?`
+  );
+
+  for (const server of serverList) {
+    let clients = [];
+    try {
+      clients = await xui.listClients(server);
+    } catch (err) {
+      summary.failed += 1;
+      summary.errors.push(`${server.name || server.id}: ${err.message}`);
+      continue;
+    }
+    const matched = clients.filter((client) => telegramIdMatches(client.email, summary.telegramId));
+    if (!matched.length) continue;
+
+    // A matched client may sit on an inbound this panel has not discovered yet
+    // (fresh panel, first sync). Refresh that server once before mapping.
+    const known = (client) => (client.inboundIds || [])
+      .some((xuiId) => findInbound.get(Number(server.id), Number(xuiId)));
+    if (matched.some((client) => !known(client))) {
+      try {
+        await inboundsService.syncInbounds({ serverId: Number(server.id) });
+      } catch (err) {
+        summary.errors.push(`${server.name || server.id} inbound sync: ${err.message}`);
+      }
+    }
+
+    for (const client of matched) {
+      try {
+        let inboundIds = (client.inboundIds || []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+        if (!inboundIds.length) {
+          // The list endpoint does not always carry the attachment; one lookup
+          // per matched client keeps the imported row attached correctly.
+          const full = await xui.getClient(client.email, server);
+          if (full) {
+            inboundIds = (full.inboundIds || []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+            client.uuid = full.uuid || client.uuid;
+            client.subId = full.subId || client.subId;
+            client.totalBytes = full.totalBytes || client.totalBytes;
+            client.expiryAt = full.expiryAt || client.expiryAt;
+            client.enabled = full.enabled;
+            client.up = full.up;
+            client.down = full.down;
+            client.lastOnlineAt = full.lastOnlineAt || client.lastOnlineAt;
+          }
+        }
+        const inbound = inboundIds.map((id) => findInbound.get(Number(server.id), id)).find(Boolean);
+        if (!inbound) {
+          summary.skipped += 1;
+          continue;
+        }
+
+        const existing = findByEmail.get(client.email);
+        if (existing && !existing.deleted_at) {
+          // Never move a live subscription to another reseller.
+          if (Number(existing.user_id) === Number(user.id)) summary.skipped += 1;
+          else summary.conflicts += 1;
+          continue;
+        }
+
+        const now = Date.now();
+        const up = Number(client.up || 0);
+        const down = Number(client.down || 0);
+        const values = [
+          Number(user.id),
+          Number(inbound.id),
+          Number(server.id),
+          String(client.email),
+          String(client.subId || ''),
+          String(client.uuid || ''),
+          String(client.flow || ''),
+          String(client.comment || '').slice(0, 500),
+          Number(client.totalBytes || 0),
+          Number(client.expiryAt || 0),
+          client.enabled === false ? 0 : 1,
+          up,
+          down,
+          up,
+          down,
+          Number(client.lastOnlineAt || 0),
+          now,
+          Number(client.createdAt || now),
+          now,
+        ];
+        if (existing) {
+          restoreConfig.run(...values, Number(existing.id));
+          summary.restored += 1;
+        } else {
+          insertConfig.run(...values);
+          summary.imported += 1;
+        }
+      } catch (err) {
+        summary.failed += 1;
+        summary.errors.push(`${client.email}: ${err.message}`);
+      }
+    }
+  }
+  // Importing never touches the wallet: these subscriptions were paid for
+  // before the reseller existed in this panel.
+  if (summary.imported || summary.restored) {
+    audit(req, 'config.import', 'user', Number(user.id), summary);
+  }
+  return summary;
 }
 
 async function rollbackCreated(ids, created) {
@@ -1226,4 +1373,7 @@ module.exports = {
   exportRows,
   priceFor,
   getInboundRow,
+  emailFor,
+  telegramIdMatches,
+  importTelegramClients,
 };

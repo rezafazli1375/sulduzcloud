@@ -260,6 +260,11 @@ function migrate(db) {
   // used one shared value; map it over so their sub links keep working.
   ensureColumn(db, 'configs', 'xui_sub_id', "TEXT NOT NULL DEFAULT ''");
   db.prepare("UPDATE configs SET xui_sub_id = sub_id WHERE xui_sub_id = '' AND sub_id <> ''").run();
+  // Panel v1.4.9: a reseller can carry their numeric Telegram id. It names new
+  // x-ui clients ("<id>-<random>") and lets the panel adopt subscriptions that
+  // already exist on a server under that id. Empty values stay unlimited.
+  ensureColumn(db, 'users', 'telegram_id', "TEXT NOT NULL DEFAULT ''");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id) WHERE telegram_id <> '' AND deleted_at = 0");
 }
 
 function rebuildInbounds(db) {

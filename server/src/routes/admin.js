@@ -119,6 +119,7 @@ router.get('/users/export.csv', auth.requirePerm('users'), (req, res) => {
       { label: 'Name', value: 'name' },
       { label: 'Email', value: 'email' },
       { label: 'Phone', value: 'phone' },
+      { label: 'Telegram', value: 'telegram_id' },
       { label: 'Status', value: 'status' },
       { label: 'Balance', value: 'balance' },
       { label: 'Created', value: (r) => new Date(r.created_at).toISOString() },
@@ -128,10 +129,22 @@ router.get('/users/export.csv', auth.requirePerm('users'), (req, res) => {
   res.type('text/csv').set('Content-Disposition', 'attachment; filename="resellers.csv"').send(csv);
 });
 
-router.post('/users', auth.requirePerm('users'), (req, res) => {
+router.post('/users', auth.requirePerm('users'), asyncH(async (req, res) => {
   const user = usersService.createUser(req.body || {}, req);
-  res.status(201).json({ ok: true, data: { user: sanitizeUser(user), stats: usersService.userStats(user.id) } });
-});
+  // A Telegram id lets the panel adopt subscriptions the reseller already owns
+  // on any connected server. Importing never charges the wallet and cannot fail
+  // the account creation.
+  let imported = null;
+  if (String(user.telegram_id || '').trim()) {
+    try {
+      imported = await configsService.importTelegramClients(user, req);
+    } catch (err) {
+      console.error('[admin] telegram import failed on user create:', err.message);
+      imported = { imported: 0, restored: 0, failed: 1, errors: [err.message] };
+    }
+  }
+  res.status(201).json({ ok: true, data: { user: sanitizeUser(user), stats: usersService.userStats(user.id), import: imported } });
+}));
 
 router.get('/users/:id', auth.requirePerm('users'), (req, res) => {
   const user = usersService.getUser(num(req.params.id));
@@ -156,10 +169,32 @@ router.get('/users/:id', auth.requirePerm('users'), (req, res) => {
   });
 });
 
-router.patch('/users/:id', auth.requirePerm('users'), (req, res) => {
+router.patch('/users/:id', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const before = usersService.getUser(num(req.params.id));
   const user = usersService.updateUser(num(req.params.id), req.body || {}, req);
-  res.json({ ok: true, data: { user: sanitizeUser(user), stats: usersService.userStats(user.id) } });
-});
+  // Setting or changing the Telegram id re-runs the adoption pass, so a
+  // reseller added before the id was known still gets their subscriptions.
+  let imported = null;
+  if (String(user.telegram_id || '').trim() && String(before?.telegram_id || '') !== String(user.telegram_id)) {
+    try {
+      imported = await configsService.importTelegramClients(user, req);
+    } catch (err) {
+      console.error('[admin] telegram import failed on user update:', err.message);
+      imported = { imported: 0, restored: 0, failed: 1, errors: [err.message] };
+    }
+  }
+  res.json({ ok: true, data: { user: sanitizeUser(user), stats: usersService.userStats(user.id), import: imported } });
+}));
+
+router.post('/users/:id/import', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const user = usersService.getUser(num(req.params.id));
+  if (!user) throw new ApiError(404, 'not_found', 'User not found');
+  if (!String(user.telegram_id || '').trim()) {
+    throw new ApiError(422, 'telegram_id_required', 'ابتدا شناسه عددی تلگرام این نماینده را ثبت کنید / Set this reseller\'s Telegram ID first');
+  }
+  const result = await configsService.importTelegramClients(user, req);
+  res.json({ ok: true, data: result });
+}));
 
 router.post('/users/:id/status', auth.requirePerm('users'), (req, res) => {
   const user = usersService.setStatus(num(req.params.id), String(req.body?.status || ''), req);

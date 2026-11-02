@@ -190,11 +190,19 @@ async function addClient(client, inboundIds, server) {
 async function updateClient(email, patch, inboundIds, server) {
   const current = await getClient(email, server);
   if (!current) throw new ApiError(404, 'xui_client_missing', 'Client does not exist on the x-ui panel');
+  // A subscription imported from the panel can already be attached to several
+  // inbounds. Updating its quota must never detach the other ones, so the
+  // existing attachments are kept and the requested ones are added.
+  // Detaching is a separate operation (detachInbounds).
+  const mergedIds = [...new Set([
+    ...(current.inboundIds || []).map(Number),
+    ...((inboundIds && inboundIds.length ? inboundIds : []).map(Number)),
+  ])].filter((id) => Number.isFinite(id) && id > 0);
   const merged = {
     ...current,
     ...patch,
     email: current.email,
-    inboundIds: inboundIds && inboundIds.length ? inboundIds.map(Number) : current.inboundIds,
+    inboundIds: mergedIds.length ? mergedIds : current.inboundIds,
   };
   const body = buildClientPayload(merged);
   const query = merged.inboundIds && merged.inboundIds.length

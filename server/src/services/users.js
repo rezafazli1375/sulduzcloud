@@ -64,9 +64,9 @@ function listUsers({ search = '', status = '', role = '', page = 1, pageSize = 2
   const where = ['u.deleted_at = 0'];
   const params = [];
   if (search) {
-    where.push('(u.username LIKE ? ESCAPE \'\\\' OR u.name LIKE ? ESCAPE \'\\\' OR u.email LIKE ? ESCAPE \'\\\' OR u.phone LIKE ? ESCAPE \'\\\')');
+    where.push('(u.username LIKE ? ESCAPE \'\\\' OR u.name LIKE ? ESCAPE \'\\\' OR u.email LIKE ? ESCAPE \'\\\' OR u.phone LIKE ? ESCAPE \'\\\' OR u.telegram_id LIKE ? ESCAPE \'\\\')');
     const like = `%${escapeLike(search)}%`;
-    params.push(like, like, like, like);
+    params.push(like, like, like, like, like);
   }
   if (status) { where.push('u.status = ?'); params.push(status); }
   if (role) { where.push('u.role = ?'); params.push(role); }
@@ -111,6 +111,15 @@ function validateUserPayload(data, { partial = false } = {}) {
   for (const [key, max] of [['name', 80], ['email', 120], ['phone', 32], ['note', 500]]) {
     if (data[key] !== undefined) out[key] = String(data[key] || '').slice(0, max);
   }
+  if (data.telegram_id !== undefined || data.telegramId !== undefined) {
+    // Numeric Telegram user id only; a leading @ is tolerated because admins
+    // often paste the handle form. It names new clients and finds existing ones.
+    const raw = String(data.telegram_id ?? data.telegramId ?? '').trim().replace(/^@/, '');
+    if (raw && !/^\d{4,20}$/.test(raw)) {
+      throw new ApiError(422, 'invalid_telegram_id', 'شناسه تلگرام باید عددی و بین ۴ تا ۲۰ رقم باشد / Telegram ID must be 4-20 digits');
+    }
+    out.telegram_id = raw;
+  }
   if (data.email !== undefined && out.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(out.email)) {
     throw new ApiError(422, 'invalid_email', 'Email address is not valid');
   }
@@ -143,12 +152,16 @@ function createUser(data, req) {
   const clean = validateUserPayload(data, { partial: false });
   const existing = db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').get(clean.username);
   if (existing) throw new ApiError(409, 'username_taken', 'This username is already in use');
+  if (clean.telegram_id) {
+    const taken = db.prepare('SELECT id FROM users WHERE telegram_id = ? AND deleted_at = 0').get(clean.telegram_id);
+    if (taken) throw new ApiError(409, 'telegram_id_taken', 'این شناسه تلگرام قبلاً برای نماینده دیگری ثبت شده است / This Telegram ID already belongs to another user');
+  }
   const now = Date.now();
   const info = db.prepare(
-    `INSERT INTO users (username, password_hash, role, name, email, phone, status, lang, permissions,
+    `INSERT INTO users (username, password_hash, role, name, email, phone, telegram_id, status, lang, permissions,
       max_configs, max_total_gb, max_gb_per_config, max_days_per_config, allowed_inbounds,
       balance, api_key, note, token_version, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   ).run(
     clean.username,
     hashPassword(clean.password),
@@ -156,6 +169,7 @@ function createUser(data, req) {
     clean.name || '',
     clean.email || '',
     clean.phone || '',
+    clean.telegram_id || '',
     clean.status || 'active',
     clean.lang || 'fa',
     JSON.stringify(clean.permissions || (clean.role === 'admin' ? ['*'] : [])),
@@ -184,6 +198,10 @@ function updateUser(id, data, req) {
     const clash = db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE AND id != ?').get(clean.username, Number(id));
     if (clash) throw new ApiError(409, 'username_taken', 'This username is already in use');
   }
+  if (clean.telegram_id && clean.telegram_id !== String(current.telegram_id || '')) {
+    const clash = db.prepare('SELECT id FROM users WHERE telegram_id = ? AND deleted_at = 0 AND id != ?').get(clean.telegram_id, Number(id));
+    if (clash) throw new ApiError(409, 'telegram_id_taken', 'این شناسه تلگرام قبلاً برای نماینده دیگری ثبت شده است / This Telegram ID already belongs to another user');
+  }
   if (current.role === 'admin' && clean.role === 'reseller') {
     const owners = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND permissions LIKE '%\"*\"%' AND deleted_at = 0 AND status = 'active'").get().c;
     if (owners <= 1 && parsePermissions(current.permissions).includes('*')) {
@@ -195,7 +213,7 @@ function updateUser(id, data, req) {
   const assign = (column, value) => { fields.push(`${column} = ?`); values.push(value); };
   if (clean.username) assign('username', clean.username);
   if (clean.password) { assign('password_hash', hashPassword(clean.password)); assign('token_version', Number(current.token_version || 1) + 1); }
-  for (const key of ['name', 'email', 'phone', 'note', 'role', 'status', 'lang']) {
+  for (const key of ['name', 'email', 'phone', 'note', 'role', 'status', 'lang', 'telegram_id']) {
     if (clean[key] !== undefined) assign(key, clean[key]);
   }
   if (clean.permissions !== undefined) assign('permissions', JSON.stringify(clean.permissions));

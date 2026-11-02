@@ -125,6 +125,7 @@ function sanitizeUser(row) {
     name: row.name || '',
     email: row.email || '',
     phone: row.phone || '',
+    telegramId: row.telegram_id || '',
     status: row.status,
     lang: row.lang || 'fa',
     permissions,

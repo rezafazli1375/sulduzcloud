@@ -8,6 +8,7 @@ import {
   Copy,
   CreditCard,
   Download,
+  DownloadCloud,
   Eye,
   EyeOff,
   KeyRound,
@@ -64,6 +65,7 @@ const EMPTY_FORM = {
   name: '',
   email: '',
   phone: '',
+  telegramId: '',
   role: 'reseller',
   status: 'active',
   permissions: [],
@@ -75,6 +77,15 @@ const EMPTY_FORM = {
   balance: 0,
   note: '',
 };
+
+// A single sentence describing what a Telegram adoption pass did.
+function importMessage(result, t) {
+  const added = Number(result?.imported || 0) + Number(result?.restored || 0);
+  if (added) return t('resellers.import.done', { n: added });
+  if (Number(result?.conflicts || 0)) return t('resellers.import.conflicts', { n: result.conflicts });
+  if (Number(result?.failed || 0)) return t('resellers.import.failed', { n: result.failed });
+  return t('resellers.import.none');
+}
 
 function LimitBadge({ icon: Icon, value, suffix }) {
   return (
@@ -107,6 +118,7 @@ function UserForm({ open, onClose, editing }) {
         name: editing.name || '',
         email: editing.email || '',
         phone: editing.phone || '',
+        telegramId: editing.telegramId || '',
         role: editing.role || 'reseller',
         status: editing.status || 'active',
         permissions: editing.permissions || [],
@@ -126,8 +138,19 @@ function UserForm({ open, onClose, editing }) {
 
   const save = useMutation({
     mutationFn: (payload) => (editing ? api.patch(`/admin/users/${editing.id}`, payload) : api.post('/admin/users', payload)),
-    onSuccess: () => {
+    onSuccess: (result) => {
       toast.success(editing ? t('common.updated') : t('common.created'));
+      // Creating/saving a reseller with a Telegram id adopts the subscriptions
+      // that already exist under that id on the panels.
+      if (result?.import) {
+        const added = Number(result.import.imported || 0) + Number(result.import.restored || 0);
+        if (added) {
+          toast.success(importMessage(result.import, t));
+          queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
+        } else if (Number(result.import.conflicts || 0) || Number(result.import.failed || 0)) {
+          toast.warning(importMessage(result.import, t));
+        }
+      }
       queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
       queryClient.invalidateQueries({ queryKey: ['admin', 'user'] });
       onClose?.();
@@ -142,6 +165,7 @@ function UserForm({ open, onClose, editing }) {
       name: form.name.trim(),
       email: form.email.trim(),
       phone: form.phone.trim(),
+      telegram_id: form.telegramId.trim(),
       role: form.role,
       status: form.status,
       note: form.note.trim(),
@@ -212,6 +236,17 @@ function UserForm({ open, onClose, editing }) {
           </Field>
           <Field label={t('resellers.form.email')}>
             <Input type="email" value={form.email} onChange={(e) => setForm((prev) => ({ ...prev, email: e.target.value }))} dir="ltr" />
+          </Field>
+          <Field label={t('resellers.form.telegramId')} hint={t('resellers.form.telegramHint')}>
+            <Input
+              value={form.telegramId}
+              onChange={(e) => setForm((prev) => ({ ...prev, telegramId: e.target.value.replace(/[^\d]/g, '') }))}
+              dir="ltr"
+              inputMode="numeric"
+              maxLength={20}
+              placeholder="123456789"
+              autoComplete="off"
+            />
           </Field>
           <div className="grid grid-cols-2 gap-3">
             <Field label={t('resellers.form.role')}>
@@ -526,6 +561,24 @@ function UserDetail({ userId, onClose, onEdit }) {
     onError: (err) => toast.error(translateError(err, t)),
   });
 
+  const fetchSubscriptions = useMutation({
+    mutationFn: () => api.post(`/admin/users/${userId}/import`),
+    onSuccess: (result) => {
+      const added = Number(result?.imported || 0) + Number(result?.restored || 0);
+      if (added) toast.success(importMessage(result, t));
+      else if (Number(result?.conflicts || 0) || Number(result?.failed || 0)) toast.warning(importMessage(result, t));
+      else toast.info(importMessage(result, t));
+      invalidate();
+      queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
+    },
+    onError: (err) => toast.error(translateError(err, t)),
+  });
+
+  const askFetch = () => {
+    if (!user?.telegramId) { toast.error(t('resellers.import.noId')); return; }
+    fetchSubscriptions.mutate();
+  };
+
   const remove = useMutation({
     mutationFn: (purge) => api.del(`/admin/users/${userId}?purge=${purge ? 1 : 0}`),
     onSuccess: () => { toast.success(t('common.deleted')); invalidate(); onClose?.(); },
@@ -623,6 +676,7 @@ function UserDetail({ userId, onClose, onEdit }) {
                 <InfoRow label={t('resellers.form.maxDaysPerConfig')} value={user.limits.maxDaysPerConfig ? `${formatNumber(user.limits.maxDaysPerConfig, lang)}` : '∞'} />
                 <InfoRow label={t('common.email')} value={user.email || '—'} />
                 <InfoRow label={t('common.phone')} value={user.phone || '—'} />
+                <InfoRow label={t('resellers.detail.telegramId')} value={user.telegramId || '—'} />
                 <InfoRow label={t('resellers.table.lastLogin')} value={user.lastLoginAt ? relativeTime(user.lastLoginAt, lang) : '—'} />
                 <InfoRow label={t('common.createdAt')} value={formatDate(user.createdAt, lang)} />
               </div>
@@ -633,6 +687,7 @@ function UserDetail({ userId, onClose, onEdit }) {
               ) : null}
               {user.note ? <p className="mt-2 rounded-lg bg-white/[0.03] px-2.5 py-2 text-[11px] text-slate-400">{user.note}</p> : null}
               <div className="mt-3 flex flex-wrap gap-2 border-t border-white/[0.06] pt-3">
+                <Button size="xs" variant="soft" icon={DownloadCloud} onClick={askFetch} loading={fetchSubscriptions.isPending}>{t('resellers.detail.fetch')}</Button>
                 <Button size="xs" variant="soft" icon={Wallet} onClick={() => setBalanceOpen(true)}>{t('resellers.detail.adjustBalance')}</Button>
                 <Button size="xs" variant="soft" icon={Percent} onClick={() => setDiscountsOpen(true)}>{t('resellers.detail.discounts')}</Button>
                 <Button size="xs" variant="ghost" icon={KeyRound} onClick={() => setPasswordOpen(true)}>{t('resellers.detail.resetPassword')}</Button>
@@ -830,7 +885,7 @@ export default function Resellers() {
                           <Avatar name={row.name || row.username} />
                           <div className="min-w-0">
                             <p className="max-w-[180px] truncate text-[12.5px] font-medium text-slate-200">{row.name || `@${row.username}`}</p>
-                            <p className="max-w-[180px] truncate text-[10px] text-slate-500">@{row.username} · {row.role === 'admin' ? t('common.admin') : t('common.reseller')}</p>
+                            <p className="max-w-[180px] truncate text-[10px] text-slate-500">@{row.username} · {row.role === 'admin' ? t('common.admin') : t('common.reseller')}{row.telegramId ? ` · TG ${row.telegramId}` : ''}</p>
                           </div>
                         </div>
                       </td>

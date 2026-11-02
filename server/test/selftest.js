@@ -599,6 +599,108 @@ function startMockXui(inboundRows) {
       `count=${forcedSync.json?.data?.count}`
     );
 
+    // ------------------------------------------- telegram subscription adoption
+    // A reseller carries a numeric Telegram id: new clients are named
+    // "<id>-<random>" and subscriptions that already live on a panel under that
+    // id are adopted, without a wallet charge.
+    const TG_ID = '700555111';
+    const TG_GB = 1024 ** 3;
+    const tgCreate = await request('POST', '/api/admin/users', {
+      cookies, csrf,
+      body: { username: 'tgshop', password: 'password123', role: 'reseller', telegram_id: TG_ID, balance: 5000000 },
+    });
+    const tgUserId = tgCreate.json?.data?.user?.id || 0;
+    check(
+      'a reseller stores its numeric telegram id',
+      tgCreate.status === 201 && tgCreate.json.data.user.telegramId === TG_ID,
+      `status=${tgCreate.status} id=${tgCreate.json?.data?.user?.telegramId}`
+    );
+    const tgBad = await request('POST', '/api/admin/users', {
+      cookies, csrf, body: { username: 'tgbad', password: 'password123', role: 'reseller', telegram_id: '12ab' },
+    });
+    check('a non-numeric telegram id is rejected', tgBad.status === 422 && tgBad.json?.error?.code === 'invalid_telegram_id');
+    const tgDup = await request('POST', '/api/admin/users', {
+      cookies, csrf, body: { username: 'tgdup', password: 'password123', role: 'reseller', telegram_id: TG_ID },
+    });
+    check(
+      'a telegram id belongs to one reseller only',
+      tgDup.status === 409 && tgDup.json?.error?.code === 'telegram_id_taken',
+      `status=${tgDup.status} code=${tgDup.json?.error?.code}`
+    );
+
+    // Pre-existing clients on the panel, created before this reseller existed.
+    mockXui.clients.set(`${TG_ID}-11111`, {
+      email: `${TG_ID}-11111`, id: 'tg-uuid-1', subId: 'tg-sub-1', security: 'auto',
+      totalGB: 5 * TG_GB, expiryTime: Date.now() + 30 * 86400000, enable: true,
+      up: 11, down: 22, inboundIds: [901, 902],
+    });
+    mockXui.clients.set(`${TG_ID}-22222`, {
+      email: `${TG_ID}-22222`, id: 'tg-uuid-2', subId: 'tg-sub-2', security: 'auto',
+      totalGB: 2 * TG_GB, expiryTime: 0, enable: true, up: 1, down: 2, inboundIds: [903],
+    });
+    mockXui.clients.set(`${TG_ID}9-33333`, {
+      email: `${TG_ID}9-33333`, id: 'tg-uuid-3', subId: 'tg-sub-3', security: 'auto',
+      totalGB: 1 * TG_GB, expiryTime: 0, enable: true, up: 0, down: 0, inboundIds: [901],
+    });
+
+    const tgImport = await request('POST', `/api/admin/users/${tgUserId}/import`, { cookies, csrf, body: {} });
+    check(
+      'existing subscriptions are adopted by telegram id',
+      tgImport.status === 200
+        && tgImport.json.data.imported === 2
+        && tgImport.json.data.restored === 0
+        && tgImport.json.data.servers === 1,
+      `imported=${tgImport.json?.data?.imported} servers=${tgImport.json?.data?.servers}`
+    );
+    const tgDetail = await request('GET', `/api/admin/users/${tgUserId}`, { cookies });
+    const tgEmails = (tgDetail.json?.data?.configs?.rows || []).map((row) => row.email);
+    check(
+      'a longer id is never matched by prefix',
+      tgEmails.includes(`${TG_ID}-11111`)
+        && tgEmails.includes(`${TG_ID}-22222`)
+        && !tgEmails.some((email) => email.startsWith(`${TG_ID}9-`)),
+      tgEmails.join(',')
+    );
+    const tgImportAgain = await request('POST', `/api/admin/users/${tgUserId}/import`, { cookies, csrf, body: {} });
+    check(
+      'adopting twice does not duplicate subscriptions',
+      tgImportAgain.json?.data?.imported === 0 && tgImportAgain.json?.data?.skipped === 2,
+      `imported=${tgImportAgain.json?.data?.imported} skipped=${tgImportAgain.json?.data?.skipped}`
+    );
+
+    const tgLogin = await request('POST', '/api/auth/login', { body: { username: 'tgshop', password: 'password123' } });
+    const tgCookies = cookiesFrom(tgLogin.headers);
+    const tgCsrf = tgLogin.json?.data?.csrf;
+    const tgList = await request('GET', '/api/reseller/configs', { cookies: tgCookies });
+    const tgRows = tgList.json?.data?.rows || [];
+    check(
+      'the reseller can manage the subscriptions they already had',
+      tgLogin.status === 200 && tgRows.length === 2,
+      `rows=${tgRows.length}`
+    );
+    const adopted = tgRows.find((row) => row.email === `${TG_ID}-11111`);
+    const tgExtend = await request('POST', `/api/reseller/configs/${adopted?.id}/extend`, {
+      cookies: tgCookies, csrf: tgCsrf, body: { gb: 1, days: 0 },
+    });
+    const adoptedClient = mockXui.clients.get(`${TG_ID}-11111`);
+    check(
+      'renewing an adopted multi-inbound client keeps every inbound attached',
+      tgExtend.status === 200
+        && (adoptedClient?.inboundIds || []).map(Number).sort().join(',') === '901,902'
+        && Number(adoptedClient?.totalGB) === 6 * TG_GB,
+      `status=${tgExtend.status} inbounds=${adoptedClient?.inboundIds} total=${adoptedClient?.totalGB}`
+    );
+
+    const tgNew = await request('POST', '/api/reseller/configs', {
+      cookies: tgCookies, csrf: tgCsrf, body: { inboundIds: [904], gb: 1, days: 1, customerName: 'مشتری تلگرام' },
+    });
+    const tgNewEmail = tgNew.json?.data?.configs?.[0]?.email || '';
+    check(
+      'a new client is named "<telegramId>-<random>"',
+      tgNew.status === 201 && tgNewEmail.startsWith(`${TG_ID}-`) && /^\d{5}$/.test(tgNewEmail.slice(TG_ID.length + 1)),
+      `email=${tgNewEmail}`
+    );
+
     // Admins can register additional x-ui panels; tokens never come back.
     const serverCreate = await request('POST', '/api/admin/servers', {
       cookies,
