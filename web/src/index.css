@@ -120,6 +120,15 @@ body::after {
     backdrop-filter: blur(18px);
   }
 
+  /* Opaque variant for dialogs. Intentionally no backdrop-filter: a blurred
+     dialog stacked on the blurred modal backdrop is a known cause of Chrome
+     blanking the whole page when the dialog repaints. */
+  .surface-solid {
+    background: linear-gradient(165deg, #111c31, #070c17);
+    border: 1px solid var(--border);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.035) inset, 0 26px 70px -40px rgba(0, 0, 0, 0.95);
+  }
+
   .card {
     @apply surface rounded-2xl;
   }
@@ -405,6 +414,12 @@ html[data-theme='light'] ::-webkit-scrollbar-thumb {
 /* ---- surfaces & controls ---- */
 
 html[data-theme='light'] .surface {
+  background: linear-gradient(165deg, #ffffff, #f8fafc);
+  border-color: rgba(15, 23, 42, 0.09);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.9) inset, 0 22px 55px -40px rgba(15, 23, 42, 0.35);
+}
+
+html[data-theme='light'] .surface-solid {
   background: linear-gradient(165deg, #ffffff, #f8fafc);
   border-color: rgba(15, 23, 42, 0.09);
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.9) inset, 0 22px 55px -40px rgba(15, 23, 42, 0.35);

@@ -146,14 +146,19 @@ function emailFor(user) {
   return `${base}-${String(Date.now()).slice(-6)}`;
 }
 
-// Clients created by this panel are "<telegramId>-<random>"; subscriptions that
-// predate it are often the bare id or use another separator. A longer id must
-// never match by prefix, so the separator is part of the test.
+// A Telegram id can appear anywhere in a client name: this panel writes
+// "<telegramId>-<random>", while seller panels prefix the plan ("german🇩🇪-<id>-<random>",
+// "SG-<id>-<random>"). Comparing whole digit runs keeps a longer id from matching
+// by prefix; the id must not be the last run, because the last run is the random
+// suffix and could accidentally equal a short id.
 function telegramIdMatches(email, telegramId) {
-  const value = String(email || '').trim().toLowerCase();
-  const id = String(telegramId || '').trim().toLowerCase();
+  const value = String(email || '').trim();
+  const id = String(telegramId || '').trim();
   if (!value || !id) return false;
-  return value === id || value.startsWith(`${id}-`) || value.startsWith(`${id}_`) || value.startsWith(`${id} `);
+  if (value === id) return true;
+  if (value.startsWith(`${id}-`) || value.startsWith(`${id}_`) || value.startsWith(`${id} `)) return true;
+  const runs = value.match(/\d+/g) || [];
+  return runs.some((run, index) => run === id && index < runs.length - 1);
 }
 
 /**
@@ -165,26 +170,41 @@ function telegramIdMatches(email, telegramId) {
 async function importTelegramClients(user, req) {
   const summary = {
     telegramId: String(user?.telegram_id || '').trim(),
-    servers: 0, imported: 0, restored: 0, skipped: 0, conflicts: 0, failed: 0, errors: [],
+    enabled: true, matched: 0, servers: 0, imported: 0, restored: 0, refreshed: 0,
+    skipped: 0, conflicts: 0, failed: 0, errors: [],
   };
   if (!user || !summary.telegramId) return summary;
+  // The reseller (or the admin on their behalf) turned adoption off: nothing is
+  // imported and the already-adopted rows stay hidden by listConfigs.
+  if (Number(user.import_configs ?? 1) === 0) {
+    summary.enabled = false;
+    return summary;
+  }
   const db = getDb();
   const serverList = serversService.listServers({ includeDisabled: false });
   summary.servers = serverList.length;
   const findInbound = db.prepare('SELECT id FROM inbounds WHERE server_id = ? AND xui_id = ?');
-  const findByEmail = db.prepare('SELECT id, user_id, deleted_at FROM configs WHERE email = ?');
+  const findByEmail = db.prepare('SELECT id, user_id, origin, deleted_at FROM configs WHERE email = ?');
   const insertConfig = db.prepare(
     `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label,
       customer_name, customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status,
-      up_bytes, down_bytes, last_up, last_down, last_online_at, last_synced_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, '', ?, ?, ?, '', '', '', ?, ?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?)`
+      up_bytes, down_bytes, last_up, last_down, last_online_at, last_synced_at, created_at, updated_at, origin)
+     VALUES (?, ?, ?, ?, '', ?, ?, ?, '', '', '', ?, ?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?, 'external')`
   );
   const restoreConfig = db.prepare(
     `UPDATE configs SET user_id = ?, inbound_id = ?, server_id = ?, email = ?, sub_id = '', xui_sub_id = ?,
        uuid = ?, flow = ?, label = '', customer_name = '', customer_phone = '', note = ?, total_bytes = ?,
        expiry_at = ?, enabled = ?, status = 'active', sync_status = '', up_bytes = ?, down_bytes = ?,
        last_up = ?, last_down = ?, last_online_at = ?, last_synced_at = ?, created_at = ?, updated_at = ?,
-       deleted_at = 0
+       origin = 'external', deleted_at = 0
+     WHERE id = ?`
+  );
+  // Live quota/usage/expiry of an already adopted subscription. Notes and the
+  // customer fields stay as the reseller edited them.
+  const refreshConfig = db.prepare(
+    `UPDATE configs SET inbound_id = ?, server_id = ?, xui_sub_id = ?, uuid = ?, flow = ?,
+       total_bytes = ?, expiry_at = ?, enabled = ?, up_bytes = ?, down_bytes = ?,
+       last_up = ?, last_down = ?, last_online_at = ?, last_synced_at = ?, sync_status = '', updated_at = ?
      WHERE id = ?`
   );
 
@@ -197,8 +217,12 @@ async function importTelegramClients(user, req) {
       summary.errors.push(`${server.name || server.id}: ${err.message}`);
       continue;
     }
-    const matched = clients.filter((client) => telegramIdMatches(client.email, summary.telegramId));
+    const matched = clients.filter((client) => (
+      String(client.tgId || '') === summary.telegramId
+      || telegramIdMatches(client.email, summary.telegramId)
+    ));
     if (!matched.length) continue;
+    summary.matched += matched.length;
 
     // A matched client may sit on an inbound this panel has not discovered yet
     // (fresh panel, first sync). Refresh that server once before mapping.
@@ -237,17 +261,44 @@ async function importTelegramClients(user, req) {
           continue;
         }
 
-        const existing = findByEmail.get(client.email);
-        if (existing && !existing.deleted_at) {
-          // Never move a live subscription to another reseller.
-          if (Number(existing.user_id) === Number(user.id)) summary.skipped += 1;
-          else summary.conflicts += 1;
-          continue;
-        }
-
         const now = Date.now();
         const up = Number(client.up || 0);
         const down = Number(client.down || 0);
+
+        const existing = findByEmail.get(client.email);
+        if (existing && !existing.deleted_at) {
+          // Never move a live subscription to another reseller.
+          if (Number(existing.user_id) !== Number(user.id)) {
+            summary.conflicts += 1;
+            continue;
+          }
+          // Re-running the fetch refreshes the adopted subscriptions. Rows that
+          // were created through this panel are left to the normal sync.
+          if (existing.origin === 'external') {
+            refreshConfig.run(
+              Number(inbound.id),
+              Number(server.id),
+              String(client.subId || ''),
+              String(client.uuid || ''),
+              String(client.flow || ''),
+              Number(client.totalBytes || 0),
+              Number(client.expiryAt || 0),
+              client.enabled === false ? 0 : 1,
+              up,
+              down,
+              up,
+              down,
+              Number(client.lastOnlineAt || 0),
+              now,
+              now,
+              Number(existing.id)
+            );
+            summary.refreshed += 1;
+          } else {
+            summary.skipped += 1;
+          }
+          continue;
+        }
         const values = [
           Number(user.id),
           Number(inbound.id),
@@ -284,7 +335,7 @@ async function importTelegramClients(user, req) {
   }
   // Importing never touches the wallet: these subscriptions were paid for
   // before the reseller existed in this panel.
-  if (summary.imported || summary.restored) {
+  if (summary.imported || summary.restored || summary.refreshed) {
     audit(req, 'config.import', 'user', Number(user.id), summary);
   }
   return summary;
@@ -462,6 +513,14 @@ function buildWhere(filters, viewer, { withStatus = true } = {}) {
   const params = [];
   if (viewer && viewer.role !== 'admin') { where.push('c.user_id = ?'); params.push(Number(viewer.id)); }
   else if (filters.userId) { where.push('c.user_id = ?'); params.push(Number(filters.userId)); }
+  // Adopted subscriptions (origin='external') leave the list while their owner
+  // has the adoption switch off. Nothing is deleted; turning it back on shows
+  // the exact same rows again.
+  where.push("(c.origin <> 'external' OR c.user_id IN (SELECT id FROM users WHERE import_configs = 1))");
+  if (filters.origin === 'panel' || filters.origin === 'external') {
+    where.push('c.origin = ?');
+    params.push(String(filters.origin));
+  }
   if (filters.inboundId) { where.push('c.inbound_id = ?'); params.push(Number(filters.inboundId)); }
   if (filters.search) {
     where.push('(c.email LIKE ? ESCAPE \'\\\' OR c.label LIKE ? ESCAPE \'\\\' OR c.customer_name LIKE ? ESCAPE \'\\\' OR c.customer_phone LIKE ? ESCAPE \'\\\')');

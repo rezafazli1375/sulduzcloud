@@ -642,12 +642,22 @@ function startMockXui(inboundRows) {
       email: `${TG_ID}9-33333`, id: 'tg-uuid-3', subId: 'tg-sub-3', security: 'auto',
       totalGB: 1 * TG_GB, expiryTime: 0, enable: true, up: 0, down: 0, inboundIds: [901],
     });
+    // Seller panels prefix the plan ("german🇩🇪-<id>-<random>") and some clients
+    // carry the owner in x-ui's own tgId field; both are adopted.
+    mockXui.clients.set(`german🇩🇪-${TG_ID}-44444`, {
+      email: `german🇩🇪-${TG_ID}-44444`, id: 'tg-uuid-4', subId: 'tg-sub-4', security: 'auto',
+      totalGB: 3 * TG_GB, expiryTime: 0, enable: true, up: 4, down: 5, inboundIds: [902],
+    });
+    mockXui.clients.set('tgid-only-666', {
+      email: 'tgid-only-666', id: 'tg-uuid-6', subId: 'tg-sub-6', security: 'auto',
+      tgId: Number(TG_ID), totalGB: 2 * TG_GB, expiryTime: 0, enable: true, up: 6, down: 7, inboundIds: [903],
+    });
 
     const tgImport = await request('POST', `/api/admin/users/${tgUserId}/import`, { cookies, csrf, body: {} });
     check(
       'existing subscriptions are adopted by telegram id',
       tgImport.status === 200
-        && tgImport.json.data.imported === 2
+        && tgImport.json.data.imported === 4
         && tgImport.json.data.restored === 0
         && tgImport.json.data.servers === 1,
       `imported=${tgImport.json?.data?.imported} servers=${tgImport.json?.data?.servers}`
@@ -661,11 +671,18 @@ function startMockXui(inboundRows) {
         && !tgEmails.some((email) => email.startsWith(`${TG_ID}9-`)),
       tgEmails.join(',')
     );
+    check(
+      'prefixed seller names and x-ui tgId are adopted as old-panel rows',
+      tgEmails.includes(`german🇩🇪-${TG_ID}-44444`)
+        && tgEmails.includes('tgid-only-666')
+        && (tgDetail.json?.data?.configs?.rows || []).every((row) => row.origin === 'external'),
+      tgEmails.join(',')
+    );
     const tgImportAgain = await request('POST', `/api/admin/users/${tgUserId}/import`, { cookies, csrf, body: {} });
     check(
-      'adopting twice does not duplicate subscriptions',
-      tgImportAgain.json?.data?.imported === 0 && tgImportAgain.json?.data?.skipped === 2,
-      `imported=${tgImportAgain.json?.data?.imported} skipped=${tgImportAgain.json?.data?.skipped}`
+      'adopting twice refreshes instead of duplicating',
+      tgImportAgain.json?.data?.imported === 0 && tgImportAgain.json?.data?.refreshed === 4,
+      `imported=${tgImportAgain.json?.data?.imported} refreshed=${tgImportAgain.json?.data?.refreshed}`
     );
 
     const tgLogin = await request('POST', '/api/auth/login', { body: { username: 'tgshop', password: 'password123' } });
@@ -675,7 +692,7 @@ function startMockXui(inboundRows) {
     const tgRows = tgList.json?.data?.rows || [];
     check(
       'the reseller can manage the subscriptions they already had',
-      tgLogin.status === 200 && tgRows.length === 2,
+      tgLogin.status === 200 && tgRows.length === 4,
       `rows=${tgRows.length}`
     );
     const adopted = tgRows.find((row) => row.email === `${TG_ID}-11111`);
@@ -699,6 +716,51 @@ function startMockXui(inboundRows) {
       'a new client is named "<telegramId>-<random>"',
       tgNew.status === 201 && tgNewEmail.startsWith(`${TG_ID}-`) && /^\d{5}$/.test(tgNewEmail.slice(TG_ID.length + 1)),
       `email=${tgNewEmail}`
+    );
+
+    // v1.4.10: adopted rows carry origin=external, the list can isolate them and
+    // a per-reseller switch hides them without deleting anything in x-ui.
+    const tgExtList = await request('GET', `/api/admin/configs?origin=external&userId=${tgUserId}&pageSize=50`, { cookies });
+    const tgPanelList = await request('GET', `/api/admin/configs?origin=panel&userId=${tgUserId}&pageSize=50`, { cookies });
+    check(
+      'the config list isolates old-panel subscriptions from panel customers',
+      tgExtList.status === 200 && tgExtList.json.data.total === 4
+        && tgExtList.json.data.rows.every((row) => row.origin === 'external')
+        && tgPanelList.status === 200 && tgPanelList.json.data.total === 1
+        && tgPanelList.json.data.rows.every((row) => row.origin === 'panel'),
+      `external=${tgExtList.json?.data?.total} panel=${tgPanelList.json?.data?.total}`
+    );
+    const tgOff = await request('PATCH', `/api/admin/users/${tgUserId}`, { cookies, csrf, body: { import_configs: false } });
+    check(
+      'the adoption switch can be turned off',
+      tgOff.status === 200 && tgOff.json.data.user.importConfigs === false,
+      `status=${tgOff.status} importConfigs=${tgOff.json?.data?.user?.importConfigs}`
+    );
+    const tgOffImport = await request('POST', `/api/admin/users/${tgUserId}/import`, { cookies, csrf, body: {} });
+    check(
+      'a switched-off reseller cannot run an adoption pass',
+      tgOffImport.status === 409 && tgOffImport.json?.error?.code === 'import_disabled',
+      `status=${tgOffImport.status} code=${tgOffImport.json?.error?.code}`
+    );
+    const tgOffList = await request('GET', '/api/reseller/configs', { cookies: tgCookies });
+    const tgOffRows = tgOffList.json?.data?.rows || [];
+    check(
+      'switching off hides only the adopted subscriptions',
+      tgOffList.status === 200 && tgOffRows.length === 1 && tgOffRows[0].origin === 'panel',
+      `rows=${tgOffRows.length}`
+    );
+    const tgOn = await request('PATCH', `/api/admin/users/${tgUserId}`, { cookies, csrf, body: { import_configs: true } });
+    check(
+      'turning the switch back on re-runs adoption',
+      tgOn.status === 200 && tgOn.json.data.user.importConfigs === true
+        && tgOn.json.data.import?.refreshed === 4,
+      `refreshed=${tgOn.json?.data?.import?.refreshed}`
+    );
+    const tgOnList = await request('GET', '/api/reseller/configs', { cookies: tgCookies });
+    check(
+      'the adopted subscriptions come back after switching on',
+      (tgOnList.json?.data?.rows || []).length === 5,
+      `rows=${(tgOnList.json?.data?.rows || []).length}`
     );
 
     // Admins can register additional x-ui panels; tokens never come back.

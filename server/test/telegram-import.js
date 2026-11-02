@@ -1,14 +1,16 @@
 'use strict';
 
 /**
- * Telegram-id adoption test.
+ * Telegram-id adoption test (v1.4.10).
  *
  * Creates a throwaway data directory, seeds one reachable server plus one
  * disabled/broken server, and stubs the x-ui client list. It checks that
- * pre-existing subscriptions are adopted by "<telegramId>-", that unrelated
- * ids never match, that re-running is idempotent, that live rows owned by
- * someone else are never stolen, that soft-deleted rows are restored and that
- * importing never charges the wallet.
+ * pre-existing subscriptions are adopted by telegram id — whether the client is
+ * named "<id>-<random>" or "<plan>-<id>-<random>" like the seller panels do —
+ * that unrelated ids never match, that re-running refreshes instead of
+ * duplicating, that live rows owned by someone else are never stolen, that
+ * soft-deleted rows are restored, and that the per-reseller adoption switch
+ * hides (never deletes) the adopted rows.
  *
  *   npm run telegram-test
  */
@@ -37,6 +39,7 @@ function check(name, ok, note = '') {
 const GB = 1024 * 1024 * 1024;
 const NOW = Date.now();
 const FUTURE = NOW + 30 * 86400000;
+const TG = '700100200';
 
 const clients = new Map();
 const requestedServers = [];
@@ -101,10 +104,27 @@ function seed() {
     email: '999999-44444', inboundIds: [11], subId: 'sub-y', uuid: 'uuid-y',
     totalBytes: 1, expiryAt: 0, enabled: true, up: 0, down: 0, createdAt: 0,
   });
+  // The id sitting in the random-suffix position is not an owner marker.
+  clients.set('abc-700100200', {
+    email: 'abc-700100200', inboundIds: [11], subId: 'sub-trap', uuid: 'uuid-trap',
+    totalBytes: 1, expiryAt: 0, enabled: true, up: 0, down: 0, createdAt: 0,
+  });
   // Matched but its inbound is unknown on this server -> skipped, never invented.
   clients.set('700100200-55555', {
     email: '700100200-55555', inboundIds: [99], subId: 'sub-z', uuid: 'uuid-z',
     totalBytes: 1, expiryAt: 0, enabled: true, up: 0, down: 0, createdAt: 0,
+  });
+  // Seller-panel naming: "<plan>-<id>-<random>".
+  clients.set('german🇩🇪-700100200-39960', {
+    email: 'german🇩🇪-700100200-39960', inboundIds: [12], subId: 'sub-de', uuid: 'uuid-de',
+    totalBytes: 6 * GB, expiryAt: FUTURE, enabled: true,
+    up: 20, down: 30, lastOnlineAt: 0, createdAt: 0, comment: 'DE plan',
+  });
+  // Ownership may also be carried by x-ui's own tgId field.
+  clients.set('unrelated-name-111-000', {
+    email: 'unrelated-name-111-000', inboundIds: [11], subId: 'sub-tgid', uuid: 'uuid-tgid',
+    tgId: TG, totalBytes: 2 * GB, expiryAt: FUTURE, enabled: true,
+    up: 40, down: 50, lastOnlineAt: 0, createdAt: 0,
   });
 }
 
@@ -153,7 +173,9 @@ async function run() {
   const shop = usersService.createUser({
     username: 'tgshop', password: 'password123', role: 'reseller', telegram_id: '@700100200',
   });
-  check('a leading @ is accepted and stripped', shop.telegram_id === '700100200');
+  check('a leading @ is accepted and stripped', shop.telegram_id === TG);
+  check('the adoption switch defaults to on and is exposed to the UI',
+    shop.import_configs === 1 && sanitizeUser(shop).importConfigs === true);
 
   // ------------------------------------------------------ client naming x-y
   check('new clients are named "<telegramId>-<number>"',
@@ -176,8 +198,10 @@ async function run() {
 
   // ------------------------------------------------------------- first run
   const first = await configsService.importTelegramClients(shop);
+  check('the matcher finds every naming style (own, prefixed, tgId, bare id)',
+    first.matched === 9, `matched=${first.matched}`);
   check('imported new subscriptions + restored the deleted one',
-    first.imported === 4 && first.restored === 1,
+    first.imported === 6 && first.restored === 1,
     `imported=${first.imported} restored=${first.restored} skipped=${first.skipped} conflicts=${first.conflicts}`);
   check('an unreachable panel is reported, not fatal', first.failed === 1 && first.errors.length === 1, first.errors.join(' | '));
   check('disabled panels are never queried',
@@ -189,8 +213,9 @@ async function run() {
 
   const rows = db.prepare('SELECT * FROM configs WHERE user_id = ? ORDER BY email').all(Number(shop.id));
   const byEmail = new Map(rows.map((row) => [row.email, row]));
-  check('prefix traps and foreign ids stay out of the reseller list',
-    !byEmail.has('7001002000-33333') && !byEmail.has('999999-44444') && !byEmail.has('700100200-55555'));
+  check('prefix traps, suffix traps and foreign ids stay out of the reseller list',
+    !byEmail.has('7001002000-33333') && !byEmail.has('999999-44444')
+      && !byEmail.has('700100200-55555') && !byEmail.has('abc-700100200'));
   const multi = byEmail.get('700100200-11111');
   check('imported row keeps quota, usage, subId and uuid',
     multi
@@ -202,6 +227,12 @@ async function run() {
       && Number(multi.server_id) === 1
       && multi.sub_id === '',
     multi ? `${multi.total_bytes}/${multi.up_bytes}/${multi.down_bytes}` : 'missing');
+  check('imported rows are marked as external (old panel)',
+    Boolean(byEmail.get('german🇩🇪-700100200-39960'))
+      && byEmail.get('german🇩🇪-700100200-39960').origin === 'external',
+    byEmail.get('german🇩🇪-700100200-39960')?.origin);
+  check('a seller-panel style name is adopted', Boolean(byEmail.get('german🇩🇪-700100200-39960')));
+  check('x-ui tgId is enough to adopt a differently named client', Boolean(byEmail.get('unrelated-name-111-000')));
   check('a multi-inbound client maps to its first known inbound',
     multi && Number(multi.inbound_id) === 10);
   check('the attachment lookup fills an inbound missing from the list',
@@ -228,10 +259,36 @@ async function run() {
   check('importing never charges the wallet', Number(tx) === 0, `transactions=${tx}`);
 
   // ------------------------------------------------------------ second run
+  // The panel changed under us: quota, usage, expiry, uuid, subId and enable
+  // must follow; a reseller-edited note must survive the refresh.
+  db.prepare("UPDATE configs SET note = 'keep me', customer_name = 'Cust' WHERE email = '700100200-11111'").run();
+  const live = clients.get('700100200-11111');
+  const newExpiry = FUTURE + 86400000;
+  Object.assign(live, {
+    totalBytes: 15 * GB, up: 500, down: 600, enabled: false,
+    uuid: 'uuid-1b', subId: 'sub-1b', expiryAt: newExpiry,
+  });
+
   const second = await configsService.importTelegramClients(shop);
-  check('re-running is idempotent',
-    second.imported === 0 && second.restored === 0 && second.skipped === 6 && second.conflicts === 1,
-    `imported=${second.imported} restored=${second.restored} skipped=${second.skipped} conflicts=${second.conflicts}`);
+  check('re-running refreshes, never duplicates',
+    second.imported === 0 && second.restored === 0 && second.refreshed === 7
+      && second.skipped === 1 && second.conflicts === 1,
+    `imported=${second.imported} restored=${second.restored} refreshed=${second.refreshed} skipped=${second.skipped} conflicts=${second.conflicts}`);
+  const refreshed = db.prepare("SELECT * FROM configs WHERE email = '700100200-11111'").get();
+  check('a refresh copies live quota, usage, expiry, uuid and enabled',
+    Number(refreshed.total_bytes) === 15 * GB
+      && Number(refreshed.up_bytes) === 500
+      && Number(refreshed.down_bytes) === 600
+      && Number(refreshed.expiry_at) === newExpiry
+      && refreshed.uuid === 'uuid-1b'
+      && refreshed.xui_sub_id === 'sub-1b'
+      && Number(refreshed.enabled) === 0,
+    `total=${refreshed.total_bytes} up=${refreshed.up_bytes} expiry=${refreshed.expiry_at} enabled=${refreshed.enabled}`);
+  check('a refresh keeps the reseller note and customer name',
+    refreshed.note === 'keep me' && refreshed.customer_name === 'Cust',
+    `${refreshed.note}/${refreshed.customer_name}`);
+  check('refreshing does not create a second row',
+    db.prepare("SELECT COUNT(*) AS c FROM configs WHERE email = '700100200-11111'").get().c === 1);
 
   const noId = await configsService.importTelegramClients(legacy);
   check('a user without a telegram id imports nothing', noId.imported === 0 && noId.servers === 0);
@@ -239,11 +296,91 @@ async function run() {
   // ------------------------------------------------ package + stats integration
   const stats = usersService.userStats(shop.id);
   check('imported subscriptions appear in the reseller stats',
-    stats.packages === 5 && stats.configs === 5, `packages=${stats.packages} rows=${stats.configs}`);
+    stats.packages === 7 && stats.configs === 7 && stats.externalPackages === 7,
+    `packages=${stats.packages} rows=${stats.configs} external=${stats.externalPackages}`);
   const listing = configsService.listConfigs({}, { role: 'admin', id: 1 });
   const shopRows = listing.rows.filter((row) => Number(row.userId) === Number(shop.id));
   check('the grouped config list shows every imported subscription',
-    shopRows.length === 5, `rows=${shopRows.length}`);
+    shopRows.length === 7, `rows=${shopRows.length}`);
+  check('every adopted row reports origin=external',
+    shopRows.every((row) => row.origin === 'external'));
+
+  // --------------------------------------------------------- origin filters
+  const externalOnly = configsService.listConfigs({ origin: 'external' }, { role: 'admin', id: 1 });
+  const panelOnly = configsService.listConfigs({ origin: 'panel' }, { role: 'admin', id: 1 });
+  check('the origin filter separates old-panel subscriptions',
+    externalOnly.rows.filter((row) => Number(row.userId) === Number(shop.id)).length === 7
+      && panelOnly.rows.filter((row) => Number(row.userId) === Number(shop.id)).length === 0,
+    `external=${externalOnly.total} panel=${panelOnly.total}`);
+  const csvRows = configsService.exportRows({ origin: 'external' }, { role: 'admin' });
+  check('CSV export honours the origin filter',
+    csvRows.length === 7 && csvRows.every((row) => row.origin === 'external'), `rows=${csvRows.length}`);
+
+  // ------------------------------------------------- adoption switch off/on
+  const off = usersService.updateUser(shop.id, { import_configs: false });
+  check('the switch can be turned off', sanitizeUser(off).importConfigs === false);
+  const offImport = await configsService.importTelegramClients(off);
+  check('a switched-off reseller imports nothing', offImport.enabled === false && offImport.matched === 0);
+  check('switching off deletes nothing from the database',
+    db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external'").get(Number(shop.id)).c === 7);
+  const offStats = usersService.userStats(shop.id);
+  check('hidden adopted subscriptions leave the stats',
+    offStats.packages === 0 && offStats.configs === 0 && offStats.externalPackages === 0,
+    `packages=${offStats.packages} rows=${offStats.configs}`);
+  const offAdminList = configsService.listConfigs({ userId: shop.id }, { role: 'admin', id: 1 });
+  const offResellerList = configsService.listConfigs({}, { role: 'reseller', id: shop.id });
+  const offCsv = configsService.exportRows({}, { role: 'admin' });
+  check('switching off hides the adopted rows from admin and reseller lists',
+    offAdminList.rows.length === 0 && offResellerList.rows.length === 0
+      && offCsv.filter((row) => Number(row.userId) === Number(shop.id)).length === 0,
+    `admin=${offAdminList.rows.length} reseller=${offResellerList.rows.length}`);
+
+  const backOn = usersService.updateUser(shop.id, { import_configs: true });
+  const onImport = await configsService.importTelegramClients(backOn);
+  check('turning it back on re-adopts the same rows',
+    sanitizeUser(backOn).importConfigs === true && onImport.refreshed === 7
+      && db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external'").get(Number(shop.id)).c === 7,
+    `refreshed=${onImport.refreshed}`);
+  const onList = configsService.listConfigs({ userId: shop.id }, { role: 'admin', id: 1 });
+  check('turning it back on shows the rows again', onList.rows.length === 7, `rows=${onList.rows.length}`);
+
+  // -------------------------------------------- separation from real customers
+  db.prepare(
+    `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, total_bytes,
+       expiry_at, enabled, status, created_at, updated_at)
+     VALUES (?, 10, 1, 'panel-made-1', '', 'p-sub', 'p-uuid', ?, ?, 1, 'active', ?, ?)`
+  ).run(Number(shop.id), 2 * GB, FUTURE, NOW, NOW);
+  const mixedStats = usersService.userStats(shop.id);
+  check('customers created in this panel are counted apart from adopted ones',
+    mixedStats.packages === 8 && mixedStats.externalPackages === 7,
+    `packages=${mixedStats.packages} external=${mixedStats.externalPackages}`);
+  const mixedExternal = configsService.listConfigs({ userId: shop.id, origin: 'external' }, { role: 'admin', id: 1 });
+  const mixedPanel = configsService.listConfigs({ userId: shop.id, origin: 'panel' }, { role: 'admin', id: 1 });
+  check('the two lists never mix',
+    mixedExternal.rows.length === 7 && mixedPanel.rows.length === 1
+      && mixedExternal.rows.every((row) => row.origin === 'external')
+      && mixedPanel.rows.every((row) => row.origin === 'panel'),
+    `external=${mixedExternal.rows.length} panel=${mixedPanel.rows.length}`);
+  const off2 = usersService.updateUser(shop.id, { import_configs: false });
+  const off2List = configsService.listConfigs({ userId: shop.id }, { role: 'admin', id: 1 });
+  const off2Stats = usersService.userStats(shop.id);
+  check('switching off hides only the adopted rows, the panel customer stays',
+    off2List.rows.length === 1 && off2List.rows[0].origin === 'panel'
+      && off2Stats.packages === 1 && off2Stats.externalPackages === 0,
+    `rows=${off2List.rows.length} packages=${off2Stats.packages}`);
+  check('the reseller still owns the hidden rows after switching off',
+    Number(off2.import_configs) === 0
+      && db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external' AND deleted_at = 0").get(Number(shop.id)).c === 7);
+
+  // A reseller created with the switch already off imports nothing on create.
+  const offUser = usersService.createUser({
+    username: 'offshop', password: 'password123', role: 'reseller', telegram_id: '555666777', import_configs: false,
+  });
+  check('the switch can be set at creation time',
+    sanitizeUser(offUser).importConfigs === false && offUser.import_configs === 0);
+  const offUserImport = await configsService.importTelegramClients(offUser);
+  check('a reseller created switched off has no adoption pass',
+    offUserImport.enabled === false && offUserImport.matched === 0);
 }
 
 run()

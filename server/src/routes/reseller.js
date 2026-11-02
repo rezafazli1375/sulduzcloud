@@ -80,6 +80,7 @@ router.get('/configs', (req, res) => {
       inboundId: num(req.query.inboundId, 0),
       status: String(req.query.status || ''),
       search: String(req.query.search || ''),
+      origin: String(req.query.origin || ''),
       expiringDays: num(req.query.expiringDays, 0),
       page: num(req.query.page, 1),
       pageSize: Math.min(100, num(req.query.pageSize, 20)),
@@ -95,6 +96,7 @@ router.get('/configs/export.csv', (req, res) => {
       inboundId: num(req.query.inboundId, 0),
       status: String(req.query.status || ''),
       search: String(req.query.search || ''),
+      origin: String(req.query.origin || ''),
     },
     req.user
   );
@@ -105,6 +107,7 @@ router.get('/configs/export.csv', (req, res) => {
       { label: 'Label', value: 'label' },
       { label: 'Customer', value: 'customerName' },
       { label: 'Status', value: 'status' },
+      { label: 'Origin', value: 'origin' },
       { label: 'Total GB', value: 'totalGb' },
       { label: 'Used GB', value: (r) => bytesToGb(r.used) },
       { label: 'Expiry', value: (r) => (r.expiryAt ? new Date(r.expiryAt).toISOString() : 'unlimited') },

@@ -265,6 +265,14 @@ function migrate(db) {
   // already exist on a server under that id. Empty values stay unlimited.
   ensureColumn(db, 'users', 'telegram_id', "TEXT NOT NULL DEFAULT ''");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id) WHERE telegram_id <> '' AND deleted_at = 0");
+  // Panel v1.4.10: each reseller decides whether subscriptions that already
+  // exist on the panels under their Telegram id are pulled into their list.
+  // Turning it off only hides those rows; the clients stay untouched in x-ui.
+  ensureColumn(db, 'users', 'import_configs', 'INTEGER NOT NULL DEFAULT 1');
+  // `origin` separates customers created through this panel from subscriptions
+  // adopted out of an existing x-ui/sanaei panel. A single client is always one
+  // origin, so packages never mix the two in the grouped list.
+  ensureColumn(db, 'configs', 'origin', "TEXT NOT NULL DEFAULT 'panel'");
 }
 
 function rebuildInbounds(db) {

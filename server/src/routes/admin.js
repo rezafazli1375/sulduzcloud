@@ -135,7 +135,7 @@ router.post('/users', auth.requirePerm('users'), asyncH(async (req, res) => {
   // on any connected server. Importing never charges the wallet and cannot fail
   // the account creation.
   let imported = null;
-  if (String(user.telegram_id || '').trim()) {
+  if (String(user.telegram_id || '').trim() && Number(user.import_configs ?? 1) !== 0) {
     try {
       imported = await configsService.importTelegramClients(user, req);
     } catch (err) {
@@ -174,8 +174,12 @@ router.patch('/users/:id', auth.requirePerm('users'), asyncH(async (req, res) =>
   const user = usersService.updateUser(num(req.params.id), req.body || {}, req);
   // Setting or changing the Telegram id re-runs the adoption pass, so a
   // reseller added before the id was known still gets their subscriptions.
+  // Turning the switch back on also fetches them again immediately.
+  const idChanged = String(before?.telegram_id || '') !== String(user.telegram_id);
+  const enabledNow = Number(user.import_configs ?? 1) !== 0;
+  const wasEnabled = Number(before?.import_configs ?? 1) !== 0;
   let imported = null;
-  if (String(user.telegram_id || '').trim() && String(before?.telegram_id || '') !== String(user.telegram_id)) {
+  if (String(user.telegram_id || '').trim() && enabledNow && (idChanged || !wasEnabled)) {
     try {
       imported = await configsService.importTelegramClients(user, req);
     } catch (err) {
@@ -191,6 +195,9 @@ router.post('/users/:id/import', auth.requirePerm('users'), asyncH(async (req, r
   if (!user) throw new ApiError(404, 'not_found', 'User not found');
   if (!String(user.telegram_id || '').trim()) {
     throw new ApiError(422, 'telegram_id_required', 'ابتدا شناسه عددی تلگرام این نماینده را ثبت کنید / Set this reseller\'s Telegram ID first');
+  }
+  if (Number(user.import_configs ?? 1) === 0) {
+    throw new ApiError(409, 'import_disabled', 'دریافت کانفیگ‌های قبلی برای این نماینده خاموش است؛ اول روشنش کنید / Previous-config import is switched off for this reseller');
   }
   const result = await configsService.importTelegramClients(user, req);
   res.json({ ok: true, data: result });
@@ -273,6 +280,7 @@ router.get('/configs', auth.requirePerm('configs'), (req, res) => {
       inboundId: num(req.query.inboundId, 0),
       status: String(req.query.status || ''),
       search: String(req.query.search || ''),
+      origin: String(req.query.origin || ''),
       expiringDays: num(req.query.expiringDays, 0),
       page: num(req.query.page, 1),
       pageSize: Math.min(200, num(req.query.pageSize, 20)),
@@ -289,6 +297,7 @@ router.get('/configs/export.csv', auth.requirePerm('configs'), (req, res) => {
       inboundId: num(req.query.inboundId, 0),
       status: String(req.query.status || ''),
       search: String(req.query.search || ''),
+      origin: String(req.query.origin || ''),
     },
     { role: 'admin' }
   );
@@ -302,6 +311,7 @@ router.get('/configs/export.csv', auth.requirePerm('configs'), (req, res) => {
       { label: 'Customer', value: 'customerName' },
       { label: 'Phone', value: 'customerPhone' },
       { label: 'Status', value: 'status' },
+      { label: 'Origin', value: 'origin' },
       { label: 'Total GB', value: 'totalGb' },
       { label: 'Used GB', value: (r) => bytesToGb(r.used) },
       { label: 'Expiry', value: (r) => (r.expiryAt ? new Date(r.expiryAt).toISOString() : 'unlimited') },

@@ -5,6 +5,10 @@ const { dayKey, statusOf, CONFIG_GROUP_KEY_SQL } = require('../utils');
 
 const DAY_MS = 86400000;
 
+// Adopted subscriptions vanish from every counter while their owner has the
+// adoption switch off, so lists, KPI cards and reseller stats always agree.
+const VISIBLE_SQL = "(c.origin <> 'external' OR c.user_id IN (SELECT id FROM users WHERE import_configs = 1))";
+
 function dayRange(days) {
   const out = [];
   const now = Date.now();
@@ -19,7 +23,7 @@ function dayRange(days) {
 // inconsistent members (manual disable, mixed expiry) are reported as `mixed`.
 function statusCounts(userId = 0) {
   const db = getDb();
-  const scope = userId ? 'AND c.user_id = ?' : '';
+  const scope = `${userId ? 'AND c.user_id = ?' : ''} AND ${VISIBLE_SQL}`;
   const params = userId ? [Number(userId)] : [];
   const now = Date.now();
   const activeMember = `c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
@@ -118,7 +122,7 @@ function topConfigs(days = 7, limit = 8, userId = 0) {
   const rows = db.prepare(
     `SELECT c.id, c.email, c.label, c.customer_name, SUM(d.up_bytes + d.down_bytes) AS used
      FROM usage_daily d JOIN configs c ON c.id = d.config_id
-     WHERE d.day >= ? ${scope} GROUP BY c.id ORDER BY used DESC LIMIT ?`
+     WHERE d.day >= ? AND ${VISIBLE_SQL} ${scope} GROUP BY c.id ORDER BY used DESC LIMIT ?`
   ).all(from, ...params, Number(limit));
   return rows.map((r) => ({
     id: r.id,
@@ -136,7 +140,8 @@ function inboundBreakdown(userId = 0) {
   const rows = db.prepare(
     `SELECT i.id, i.remark, i.protocol, i.node_name, COUNT(c.id) AS configs,
        COALESCE(SUM(c.up_bytes + c.down_bytes), 0) AS used
-     FROM inbounds i LEFT JOIN configs c ON c.inbound_id = i.id AND c.deleted_at = 0 ${scope}
+     FROM inbounds i LEFT JOIN configs c ON c.inbound_id = i.id AND c.deleted_at = 0
+       AND (c.origin <> 'external' OR c.user_id IN (SELECT id FROM users WHERE import_configs = 1)) ${scope}
      GROUP BY i.id ORDER BY configs DESC`
   ).all(...params);
   return rows.map((r) => ({
@@ -158,7 +163,7 @@ function expiringSoon(days = 3, userId = 0) {
   return db.prepare(
     `SELECT COUNT(*) AS c FROM (
        SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey FROM configs c
-       WHERE c.deleted_at = 0 AND c.enabled = 1 AND c.expiry_at > ? AND c.expiry_at <= ? ${scope}
+       WHERE c.deleted_at = 0 AND ${VISIBLE_SQL} AND c.enabled = 1 AND c.expiry_at > ? AND c.expiry_at <= ? ${scope}
        GROUP BY gkey
      )`
   ).get(now, now + days * DAY_MS, ...params).c;

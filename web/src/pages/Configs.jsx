@@ -86,6 +86,7 @@ export default function Configs() {
   const [search, setSearch] = useState('');
   const debounced = useDebounced(search, 350);
   const [status, setStatus] = useState('');
+  const [origin, setOrigin] = useState('');
   const [inboundId, setInboundId] = useState('');
   const [userId, setUserId] = useState('');
   const [expiringDays, setExpiringDays] = useState(Number(params.get('expiring') || 0));
@@ -105,19 +106,20 @@ export default function Configs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => { setPage(1); }, [debounced, status, inboundId, userId, expiringDays]);
+  useEffect(() => { setPage(1); }, [debounced, status, origin, inboundId, userId, expiringDays]);
 
   const filters = useMemo(() => {
     const query = new URLSearchParams();
     if (debounced) query.set('search', debounced);
     if (status) query.set('status', status);
+    if (origin) query.set('origin', origin);
     if (inboundId) query.set('inboundId', inboundId);
     if (userId) query.set('userId', userId);
     if (expiringDays) query.set('expiringDays', String(expiringDays));
     query.set('page', String(page));
     query.set('pageSize', '20');
     return query.toString();
-  }, [debounced, status, inboundId, userId, expiringDays, page]);
+  }, [debounced, status, origin, inboundId, userId, expiringDays, page]);
 
   const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
     queryKey: ['configs', base, filters],
@@ -145,6 +147,7 @@ export default function Configs() {
     const query = new URLSearchParams();
     if (debounced) query.set('search', debounced);
     if (status) query.set('status', status);
+    if (origin) query.set('origin', origin);
     if (inboundId) query.set('inboundId', inboundId);
     if (userId) query.set('userId', userId);
     downloadFile(`${base}/configs/export.csv?${query.toString()}`, 'configs.csv');
@@ -153,13 +156,14 @@ export default function Configs() {
   const resetFilters = () => {
     setSearch('');
     setStatus('');
+    setOrigin('');
     setInboundId('');
     setUserId('');
     setExpiringDays(0);
     setPage(1);
   };
 
-  const activeFilters = Boolean(search || status || inboundId || userId || expiringDays);
+  const activeFilters = Boolean(search || status || origin || inboundId || userId || expiringDays);
 
   return (
     <>
@@ -179,6 +183,11 @@ export default function Configs() {
         <Select value={status} onChange={(e) => setStatus(e.target.value)} className="w-auto min-w-[132px]">
           <option value="">{t('common.allStatuses')}</option>
           {STATUSES.map((item) => <option key={item} value={item}>{t(`common.${item}`)}</option>)}
+        </Select>
+        <Select value={origin} onChange={(e) => setOrigin(e.target.value)} className="w-auto max-w-[200px]">
+          <option value="">{t('configs.originFilter')}</option>
+          <option value="panel">{t('configs.originPanel')}</option>
+          <option value="external">{t('configs.originExternal')}</option>
         </Select>
         <Select value={inboundId} onChange={(e) => setInboundId(e.target.value)} className="w-auto max-w-[200px]">
           <option value="">{t('configs.filterInbound')}</option>
@@ -238,7 +247,12 @@ export default function Configs() {
                               {(row.customerName || row.label || row.email || '?').charAt(0).toUpperCase()}
                             </span>
                             <div className="min-w-0">
-                              <p className="max-w-[190px] truncate text-[12.5px] font-medium text-slate-200">{row.customerName || row.label || '—'}</p>
+                              <p className="flex items-center gap-1.5">
+                                <span className="max-w-[190px] truncate text-[12.5px] font-medium text-slate-200">{row.customerName || row.label || '—'}</span>
+                                {row.origin === 'external' ? (
+                                  <Badge tone="amber" className="shrink-0">{t('configs.originExternalBadge')}</Badge>
+                                ) : null}
+                              </p>
                               {grouped ? (
                                 <p className="flex items-center gap-1 text-[10px] text-cyan-300/80">
                                   <Layers className="h-3 w-3" />
@@ -321,7 +335,10 @@ export default function Configs() {
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
-                      <p className="truncate text-[12.5px] font-semibold text-slate-100">{row.customerName || row.label || row.email}</p>
+                      <p className="flex items-center gap-1.5">
+                        <span className="truncate text-[12.5px] font-semibold text-slate-100">{row.customerName || row.label || row.email}</span>
+                        {row.origin === 'external' ? <Badge tone="amber" className="shrink-0">{t('configs.originExternalBadge')}</Badge> : null}
+                      </p>
                       {grouped ? (
                         <p className="flex items-center gap-1 text-[9.5px] text-cyan-300/80">
                           <Layers className="h-3 w-3" />

@@ -23,7 +23,8 @@ function userStats(userId) {
     `SELECT COUNT(*) AS configs,
             COALESCE(SUM(CASE WHEN enabled = 1 AND (expiry_at = 0 OR expiry_at > ?) AND (total_bytes = 0 OR up_bytes + down_bytes < total_bytes) THEN 1 ELSE 0 END), 0) AS active,
             COALESCE(SUM(up_bytes + down_bytes), 0) AS used
-     FROM configs WHERE user_id = ? AND deleted_at = 0`
+     FROM configs WHERE user_id = ? AND deleted_at = 0
+       AND (origin <> 'external' OR user_id IN (SELECT id FROM users WHERE import_configs = 1))`
   ).get(Date.now(), Number(userId));
   // Row counts above stay for API v1, which is documented as one row per inbound.
   // Packages are the customer-facing unit: every inbound of one subscription is
@@ -46,14 +47,22 @@ function userStats(userId) {
          MAX(c.total_bytes) AS quota,
          SUM(c.up_bytes + c.down_bytes) AS used
        FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0
+         AND (c.origin <> 'external' OR c.user_id IN (SELECT id FROM users WHERE import_configs = 1))
        GROUP BY gkey
      )`
   ).get(Number(userId));
+  // Adopted subscriptions are always their own package (empty group token), so
+  // this count is what the "old panel" tab shows.
+  const external = db.prepare(
+    `SELECT COUNT(*) AS c FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0 AND c.origin = 'external'
+       AND c.user_id IN (SELECT id FROM users WHERE import_configs = 1)`
+  ).get(Number(userId)).c;
   return {
     configs: Number(row.configs || 0),
     active: Number(row.active || 0),
     packages: Number(packages.total || 0),
     activePackages: Number(packages.active || 0),
+    externalPackages: Number(external || 0),
     quotaBytes: Number(packages.quota || 0),
     usedBytes: Number(packages.used || 0),
   };
@@ -120,6 +129,10 @@ function validateUserPayload(data, { partial = false } = {}) {
     }
     out.telegram_id = raw;
   }
+  if (data.import_configs !== undefined || data.importConfigs !== undefined) {
+    const value = data.import_configs ?? data.importConfigs;
+    out.import_configs = value === false || value === 0 || value === '0' ? 0 : 1;
+  }
   if (data.email !== undefined && out.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(out.email)) {
     throw new ApiError(422, 'invalid_email', 'Email address is not valid');
   }
@@ -158,10 +171,10 @@ function createUser(data, req) {
   }
   const now = Date.now();
   const info = db.prepare(
-    `INSERT INTO users (username, password_hash, role, name, email, phone, telegram_id, status, lang, permissions,
+    `INSERT INTO users (username, password_hash, role, name, email, phone, telegram_id, import_configs, status, lang, permissions,
       max_configs, max_total_gb, max_gb_per_config, max_days_per_config, allowed_inbounds,
       balance, api_key, note, token_version, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   ).run(
     clean.username,
     hashPassword(clean.password),
@@ -170,6 +183,7 @@ function createUser(data, req) {
     clean.email || '',
     clean.phone || '',
     clean.telegram_id || '',
+    clean.import_configs === undefined ? 1 : Number(clean.import_configs),
     clean.status || 'active',
     clean.lang || 'fa',
     JSON.stringify(clean.permissions || (clean.role === 'admin' ? ['*'] : [])),
@@ -213,7 +227,7 @@ function updateUser(id, data, req) {
   const assign = (column, value) => { fields.push(`${column} = ?`); values.push(value); };
   if (clean.username) assign('username', clean.username);
   if (clean.password) { assign('password_hash', hashPassword(clean.password)); assign('token_version', Number(current.token_version || 1) + 1); }
-  for (const key of ['name', 'email', 'phone', 'note', 'role', 'status', 'lang', 'telegram_id']) {
+  for (const key of ['name', 'email', 'phone', 'note', 'role', 'status', 'lang', 'telegram_id', 'import_configs']) {
     if (clean[key] !== undefined) assign(key, clean[key]);
   }
   if (clean.permissions !== undefined) assign('permissions', JSON.stringify(clean.permissions));
@@ -303,6 +317,7 @@ function checkLimits(user, { gb = 0, days = 0, count: adding = 1, gbEach = 0 } =
      FROM (
        SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey, MAX(c.total_bytes) AS quota
        FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0
+         AND c.origin <> 'external'
        GROUP BY gkey
      )`
   ).get(Number(user.id));

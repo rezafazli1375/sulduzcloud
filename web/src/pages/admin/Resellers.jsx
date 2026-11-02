@@ -48,6 +48,7 @@ import {
   Select,
   Skeleton,
   StatusBadge,
+  Switch,
   TableSkeleton,
   Textarea,
   Toolbar,
@@ -66,6 +67,7 @@ const EMPTY_FORM = {
   email: '',
   phone: '',
   telegramId: '',
+  importConfigs: true,
   role: 'reseller',
   status: 'active',
   permissions: [],
@@ -80,8 +82,11 @@ const EMPTY_FORM = {
 
 // A single sentence describing what a Telegram adoption pass did.
 function importMessage(result, t) {
+  if (result?.enabled === false) return t('resellers.import.disabled');
   const added = Number(result?.imported || 0) + Number(result?.restored || 0);
-  if (added) return t('resellers.import.done', { n: added });
+  const refreshed = Number(result?.refreshed || 0);
+  if (added) return refreshed ? t('resellers.import.doneRefreshed', { n: added, m: refreshed }) : t('resellers.import.done', { n: added });
+  if (refreshed) return t('resellers.import.refreshed', { n: refreshed });
   if (Number(result?.conflicts || 0)) return t('resellers.import.conflicts', { n: result.conflicts });
   if (Number(result?.failed || 0)) return t('resellers.import.failed', { n: result.failed });
   return t('resellers.import.none');
@@ -119,6 +124,7 @@ function UserForm({ open, onClose, editing }) {
         email: editing.email || '',
         phone: editing.phone || '',
         telegramId: editing.telegramId || '',
+        importConfigs: editing.importConfigs !== false,
         role: editing.role || 'reseller',
         status: editing.status || 'active',
         permissions: editing.permissions || [],
@@ -144,7 +150,8 @@ function UserForm({ open, onClose, editing }) {
       // that already exist under that id on the panels.
       if (result?.import) {
         const added = Number(result.import.imported || 0) + Number(result.import.restored || 0);
-        if (added) {
+        const refreshed = Number(result.import.refreshed || 0);
+        if (added || refreshed) {
           toast.success(importMessage(result.import, t));
           queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
         } else if (Number(result.import.conflicts || 0) || Number(result.import.failed || 0)) {
@@ -166,6 +173,7 @@ function UserForm({ open, onClose, editing }) {
       email: form.email.trim(),
       phone: form.phone.trim(),
       telegram_id: form.telegramId.trim(),
+      import_configs: Boolean(form.importConfigs),
       role: form.role,
       status: form.status,
       note: form.note.trim(),
@@ -262,6 +270,17 @@ function UserForm({ open, onClose, editing }) {
               </Select>
             </Field>
           </div>
+        </div>
+
+        <div className={cx(
+          'flex flex-wrap items-center justify-between gap-3 rounded-xl border px-3.5 py-3 transition',
+          form.importConfigs ? 'border-emerald-400/25 bg-emerald-500/[0.05]' : 'border-white/[0.07] bg-white/[0.02]'
+        )}>
+          <div className="min-w-0">
+            <p className="text-[12.5px] font-medium text-slate-200">{t('resellers.form.importConfigs')}</p>
+            <p className="mt-0.5 text-[10.5px] leading-5 text-slate-500">{t('resellers.form.importHint')}</p>
+          </div>
+          <Switch checked={Boolean(form.importConfigs)} onChange={(value) => setForm((prev) => ({ ...prev, importConfigs: value }))} />
         </div>
 
         {form.role === 'admin' ? (
@@ -576,8 +595,27 @@ function UserDetail({ userId, onClose, onEdit }) {
 
   const askFetch = () => {
     if (!user?.telegramId) { toast.error(t('resellers.import.noId')); return; }
+    if (user?.importConfigs === false) { toast.error(t('resellers.import.disabled')); return; }
     fetchSubscriptions.mutate();
   };
+
+  // Quick on/off switch inside the reseller drawer. Enabling runs one adoption
+  // pass immediately; disabling only hides the adopted rows (x-ui untouched).
+  const setImportConfigs = useMutation({
+    mutationFn: (value) => api.patch(`/admin/users/${userId}`, { import_configs: value }),
+    onSuccess: (result, value) => {
+      toast.success(value ? t('resellers.detail.on') : t('resellers.detail.off'));
+      if (value && result?.import) {
+        const added = Number(result.import.imported || 0) + Number(result.import.restored || 0);
+        const refreshed = Number(result.import.refreshed || 0);
+        if (added || refreshed) toast.success(importMessage(result.import, t));
+        else if (Number(result.import.conflicts || 0) || Number(result.import.failed || 0)) toast.warning(importMessage(result.import, t));
+      }
+      queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
+      invalidate();
+    },
+    onError: (err) => toast.error(translateError(err, t)),
+  });
 
   const remove = useMutation({
     mutationFn: (purge) => api.del(`/admin/users/${userId}?purge=${purge ? 1 : 0}`),
@@ -686,6 +724,20 @@ function UserDetail({ userId, onClose, onEdit }) {
                 </div>
               ) : null}
               {user.note ? <p className="mt-2 rounded-lg bg-white/[0.03] px-2.5 py-2 text-[11px] text-slate-400">{user.note}</p> : null}
+              <div className={cx(
+                'mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border px-3 py-2.5 transition',
+                user.importConfigs !== false ? 'border-emerald-400/25 bg-emerald-500/[0.05]' : 'border-white/[0.07] bg-white/[0.02]'
+              )}>
+                <div className="min-w-0">
+                  <p className="text-[12px] font-medium text-slate-200">{t('resellers.detail.importConfigs')}</p>
+                  <p className="mt-0.5 text-[10px] leading-5 text-slate-500">{t('resellers.form.importHint')}</p>
+                </div>
+                <Switch
+                  checked={user.importConfigs !== false}
+                  disabled={setImportConfigs.isPending}
+                  onChange={(value) => setImportConfigs.mutate(value)}
+                />
+              </div>
               <div className="mt-3 flex flex-wrap gap-2 border-t border-white/[0.06] pt-3">
                 <Button size="xs" variant="soft" icon={DownloadCloud} onClick={askFetch} loading={fetchSubscriptions.isPending}>{t('resellers.detail.fetch')}</Button>
                 <Button size="xs" variant="soft" icon={Wallet} onClick={() => setBalanceOpen(true)}>{t('resellers.detail.adjustBalance')}</Button>

@@ -126,6 +126,7 @@ function sanitizeUser(row) {
     email: row.email || '',
     phone: row.phone || '',
     telegramId: row.telegram_id || '',
+    importConfigs: Number(row.import_configs ?? 1) !== 0,
     status: row.status,
     lang: row.lang || 'fa',
     permissions,
@@ -190,6 +191,9 @@ function sanitizeConfig(row, inbound, reseller, at = Date.now()) {
     expiryAt: Number(row.expiry_at || 0),
     enabled: Boolean(row.enabled),
     status: statusOf(row, at),
+    // 'external' marks a subscription adopted from an existing x-ui panel; the
+    // UI separates those from customers created through this panel.
+    origin: row.origin === 'external' ? 'external' : 'panel',
     syncStatus: row.sync_status || '',
     up,
     down,

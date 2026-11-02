@@ -202,14 +202,23 @@ export function Switch({ checked, onChange, disabled, label }) {
 
 export function Checkbox({ checked, onChange, label, className, disabled }) {
   return (
-    <label className={cx('inline-flex cursor-pointer items-center gap-2 text-[13px] text-slate-300', disabled && 'opacity-50', className)}>
+    // "relative" is load-bearing: it makes the label the containing block of the
+    // hidden input below. Without it the absolutely positioned input belongs to
+    // the dialog, does not scroll with the modal body, and focusing it (label
+    // click) makes Chrome scroll the whole dialog upward.
+    <label className={cx('relative inline-flex cursor-pointer items-center gap-2 text-[13px] text-slate-300', disabled && 'opacity-50', className)}>
       <span
         className={cx(
           'flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-md border transition',
           checked ? 'border-emerald-400/50 bg-emerald-500/90 text-[#04120f]' : 'border-white/15 bg-white/[0.04]'
         )}
       >
-        {checked ? <Check className="h-3.5 w-3.5" strokeWidth={3} /> : null}
+        {/* Always mounted: toggling only animates opacity, so React never has to
+            insert/remove nodes inside the label on every click. */}
+        <Check
+          className={cx('h-3.5 w-3.5 transition-opacity duration-150', checked ? 'opacity-100' : 'opacity-0')}
+          strokeWidth={3}
+        />
       </span>
       <input type="checkbox" className="sr-only" checked={Boolean(checked)} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
       {label}
@@ -343,11 +352,11 @@ export function Modal({ open, onClose, title, subtitle, children, footer, size =
   if (!open) return null;
   return createPortal(
     <div className="fixed inset-0 z-[90] flex items-start justify-center overflow-y-auto p-3 sm:items-center sm:p-6">
-      <div className="fixed inset-0 bg-[#02040a]/75 backdrop-blur-sm" onClick={onClose} aria-hidden="true" />
+      <div className="fixed inset-0 bg-[#02040a]/80" onClick={onClose} aria-hidden="true" />
       <div
         role="dialog"
         aria-modal="true"
-        className={cx('surface relative my-auto w-full rounded-2xl animate-fadeUp', MODAL_SIZES[size] || MODAL_SIZES.md)}
+        className={cx('surface-solid relative my-auto w-full rounded-2xl animate-fadeUp', MODAL_SIZES[size] || MODAL_SIZES.md)}
       >
         <header className="flex items-start justify-between gap-4 border-b border-white/[0.06] px-5 py-4">
           <div className="min-w-0">
@@ -382,11 +391,11 @@ export function Drawer({ open, onClose, title, subtitle, children, footer, width
   if (!open) return null;
   return createPortal(
     <div className="fixed inset-0 z-[90] flex justify-end">
-      <div className="absolute inset-0 bg-[#02040a]/70 backdrop-blur-sm animate-fadeIn" onClick={onClose} aria-hidden="true" />
+      <div className="absolute inset-0 bg-[#02040a]/75 animate-fadeIn" onClick={onClose} aria-hidden="true" />
       <div
         role="dialog"
         aria-modal="true"
-        className={cx('surface relative flex h-full w-full flex-col border-s animate-fadeIn', width)}
+        className={cx('surface-solid relative flex h-full w-full flex-col border-s animate-fadeIn', width)}
         style={{ animation: 'drawerIn .28s cubic-bezier(.22,1,.36,1)' }}
       >
         <header className="flex items-start justify-between gap-4 border-b border-white/[0.06] px-5 py-4">
