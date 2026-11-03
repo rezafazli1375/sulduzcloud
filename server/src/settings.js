@@ -13,6 +13,11 @@ const SECRET_FIELDS = {
   telegram: ['botToken'],
 };
 
+// v1.4.13 removed the SMS pattern/template feature. These keys can still be
+// present in a settings row written by an older panel; they are dropped on read
+// and rewritten once on boot so nothing pattern-shaped survives the upgrade.
+const LEGACY_SMS_KEYS = ['mode', 'pattern', 'patternVar1', 'patternVar2', 'patternVar3', 'patternNames', 'patterns'];
+
 const DEFAULTS = {
   general: {
     panelName: 'Sulduz Cloud',
@@ -54,29 +59,18 @@ const DEFAULTS = {
   sms: {
     enabled: false,
     provider: 'kavenegar',
-    // 'pattern' sends a pre-approved template (delivered without operator
-    // review); 'text' sends free text, which Kavenegar/FarazSMS may hold for
-    // manual approval.
-    mode: 'pattern',
     apiKey: '',
     sender: '',
     to: '',
-    pattern: '',
-    patternVar1: '{title}',
-    patternVar2: '{body}',
-    patternVar3: '',
-    // FarazSMS matches attributes by the variable names defined in the pattern;
-    // this list (comma separated) names them in the same order as the values.
-    patternNames: 'var1,var2,var3',
-    // Optional per-notification patterns. Empty code = use the default pattern
-    // above; empty mapping = the event's built-in placeholders (see notify.js).
-    // `enabled: false` mutes SMS for that notification entirely.
-    patterns: {
-      nodeOffline: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
-      nodeOnline: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
-      panelOffline: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
-      panelOnline: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
-      test: { enabled: true, code: '', names: '', var1: '', var2: '', var3: '' },
+    // Per-notification SMS switches. Every alert is sent as the panel's own
+    // text message; `enabled: false` mutes only the SMS channel for that
+    // notification (the in-panel and email channels stay active).
+    events: {
+      nodeOffline: { enabled: true },
+      nodeOnline: { enabled: true },
+      panelOffline: { enabled: true },
+      panelOnline: { enabled: true },
+      test: { enabled: true },
     },
     customUrl: '',
     customMethod: 'POST',
@@ -158,21 +152,21 @@ function getSetting(key) {
   const raw = rawGet(key);
   const parsed = raw ? safeJsonParse(raw, {}) : {};
   const merged = { ...structuredCloneSafe(DEFAULTS[key]), ...decryptSection(key, parsed) };
-  // Nested per-notification pattern configs need a per-event merge so a new
-  // event added in a later version never wipes the owner's saved values.
-  if (key === 'sms' && DEFAULTS.sms.patterns) {
-    const stored = merged.patterns && typeof merged.patterns === 'object' ? merged.patterns : {};
-    const patterns = {};
-    for (const [event, defaults] of Object.entries(DEFAULTS.sms.patterns)) {
-      patterns[event] = { ...structuredCloneSafe(defaults), ...(stored[event] || {}) };
-    }
-    for (const [event, value] of Object.entries(stored)) {
-      if (!patterns[event] && value && typeof value === 'object') {
-        patterns[event] = { code: '', names: '', var1: '', var2: '', var3: '', ...value };
-      }
-    }
-    merged.patterns = patterns;
+  if (key !== 'sms') return merged;
+
+  // Per-event merge so an event added in a later version never wipes the
+  // owner's saved switches.
+  const stored = merged.events && typeof merged.events === 'object' ? merged.events : {};
+  const events = {};
+  for (const [event, defaults] of Object.entries(DEFAULTS.sms.events)) {
+    events[event] = { ...structuredCloneSafe(defaults), ...(stored[event] || {}) };
   }
+  for (const [event, value] of Object.entries(stored)) {
+    if (!events[event] && value && typeof value === 'object') events[event] = { enabled: value.enabled !== false };
+  }
+  merged.events = events;
+  // Pattern settings are gone: never surface legacy keys to the API or the UI.
+  for (const legacy of LEGACY_SMS_KEYS) delete merged[legacy];
   return merged;
 }
 
@@ -213,12 +207,42 @@ function redactSection(key, obj) {
   return out;
 }
 
+function migrateSmsShape() {
+  const raw = rawGet('sms');
+  if (!raw) return false;
+  const parsed = safeJsonParse(raw, {});
+  if (!LEGACY_SMS_KEYS.some((field) => field in parsed)) return false;
+
+  // Keep the per-notification on/off decisions the owner made; drop everything
+  // pattern-related (codes, template names, variable mappings).
+  const stored = parsed.patterns && typeof parsed.patterns === 'object' ? parsed.patterns : {};
+  const events = {};
+  for (const [event, defaults] of Object.entries(DEFAULTS.sms.events)) {
+    events[event] = { enabled: stored[event] && typeof stored[event] === 'object' ? stored[event].enabled !== false : defaults.enabled };
+  }
+  for (const [event, value] of Object.entries(stored)) {
+    if (value && typeof value === 'object') events[event] = { enabled: value.enabled !== false };
+  }
+
+  const next = {};
+  for (const [field, value] of Object.entries(parsed)) {
+    if (LEGACY_SMS_KEYS.includes(field)) continue;
+    next[field] = value;
+  }
+  next.events = { ...events, ...(parsed.events && typeof parsed.events === 'object' ? parsed.events : {}) };
+  // Secrets are already stored encrypted; rawSet writes the object back as is.
+  rawSet('sms', next);
+  return true;
+}
+
 function ensureDefaults() {
   const db = getDb();
   const insert = db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)');
   for (const [key, value] of Object.entries(DEFAULTS)) {
     insert.run(key, JSON.stringify(value), Date.now());
   }
+
+  if (migrateSmsShape()) console.log('[settings] SMS settings migrated to the text-only shape (patterns removed)');
 
   // Seed the x-ui token from the protected file on first run.
   const xui = getSetting('xui');
@@ -289,8 +313,10 @@ function allRedacted() {
 module.exports = {
   DEFAULTS,
   SECRET_FIELDS,
+  LEGACY_SMS_KEYS,
   extractToken,
   ensureDefaults,
+  migrateSmsShape,
   getSetting,
   setSetting,
   updateSection,

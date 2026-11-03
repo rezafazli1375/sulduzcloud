@@ -59,13 +59,9 @@ const TAB_LIST = [
   { value: 'security', icon: Lock, label: 'settings.tabs.security' },
 ];
 
-const SMS_EVENTS = [
-  { value: 'nodeOffline', vars: ['{node}', '{server}', '{address}', '{failures}'] },
-  { value: 'nodeOnline', vars: ['{node}', '{server}'] },
-  { value: 'panelOffline', vars: ['{server}', '{error}'] },
-  { value: 'panelOnline', vars: ['{server}'] },
-  { value: 'test', vars: ['{panel}'] },
-];
+// Notifications the panel can text about. Each one is only an on/off SMS
+// switch now: every alert is delivered as its own free text.
+const SMS_EVENTS = ['nodeOffline', 'nodeOnline', 'panelOffline', 'panelOnline', 'test'];
 
 function SwitchRow({ label, hint, checked, onChange }) {
   return (
@@ -139,7 +135,7 @@ export default function Settings() {
         toast.error(t('settings.sms.events.disabledTest'));
         return;
       }
-      toast.success(`${t('settings.testSent')}${result?.to ? ` · ${result.to}` : ''}${result?.mode ? ` · ${result.mode}` : ''}${result?.pattern ? ` · ${result.pattern}` : ''}${result?.source === 'event' ? ` · ${t('settings.sms.events.own')}` : ''}`);
+      toast.success(`${t('settings.testSent')}${result?.to ? ` · ${result.to}` : ''}`);
     },
     onError: (err) => toast.error(err?.message || t('errors.generic')),
   });
@@ -160,16 +156,15 @@ export default function Settings() {
     setLocal((prev) => ({ ...prev, [section]: { ...prev[section], [field]: value } }));
   };
 
-  const patchPattern = (event, field, value) => {
+  // Each notification keeps exactly one SMS setting: on or off. `events` is
+  // written as a whole object so a switch never wipes the other events.
+  const patchEvent = (event, enabled) => {
     setLocal((prev) => {
       const section = prev.sms || {};
-      const patterns = section.patterns || {};
+      const events = section.events || {};
       return {
         ...prev,
-        sms: {
-          ...section,
-          patterns: { ...patterns, [event]: { ...(patterns[event] || {}), [field]: value } },
-        },
+        sms: { ...section, events: { ...events, [event]: { ...events[event], enabled } } },
       };
     });
   };
@@ -438,14 +433,6 @@ export default function Settings() {
                   <option value="custom">{t('settings.sms.custom')}</option>
                 </Select>
               </Field>
-              {sms.provider !== 'custom' ? (
-                <Field label={t('settings.sms.mode')} hint={t('settings.sms.modeHint')}>
-                  <Select value={sms.mode || 'pattern'} onChange={(e) => patch('sms', 'mode', e.target.value)}>
-                    <option value="pattern">{t('settings.sms.modePattern')}</option>
-                    <option value="text">{t('settings.sms.modeText')}</option>
-                  </Select>
-                </Field>
-              ) : null}
               <Field label={t('settings.sms.to')}>
                 <Input dir="ltr" value={sms.to || ''} onChange={(e) => patch('sms', 'to', e.target.value)} placeholder="09xxxxxxxxx" />
               </Field>
@@ -463,134 +450,35 @@ export default function Settings() {
               </Field>
             </div>
 
-            {sms.provider !== 'custom' && (sms.mode || 'pattern') === 'pattern' ? (
-              <div className="space-y-4 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.05] p-3.5">
-                <p className="text-[10.5px] leading-5 text-emerald-100/85">{t('settings.sms.patternHint')}</p>
-                <Field
-                  label={sms.provider === 'farazsms' ? t('settings.sms.patternCode') : t('settings.sms.patternTemplate')}
-                  hint={sms.provider === 'farazsms' ? t('settings.sms.patternCodeHint') : t('settings.sms.patternTemplateHint')}
-                >
-                  <Input
-                    dir="ltr"
-                    value={sms.pattern || ''}
-                    onChange={(e) => patch('sms', 'pattern', e.target.value)}
-                    placeholder={sms.provider === 'farazsms' ? 'SJ3FgPrE0C' : 'sulduz-alert'}
-                  />
-                </Field>
-                {sms.provider === 'farazsms' ? (
-                  <Field label={t('settings.sms.patternNames')} hint={t('settings.sms.patternNamesHint')}>
-                    <Input
-                      dir="ltr"
-                      value={sms.patternNames || ''}
-                      onChange={(e) => patch('sms', 'patternNames', e.target.value)}
-                      placeholder="var1,var2"
-                    />
-                  </Field>
-                ) : null}
-                <div className="grid gap-4 sm:grid-cols-3">
-                  {[1, 2, 3].map((index) => (
-                    <Field
-                      key={index}
-                      label={t(`settings.sms.var${index}`)}
-                      hint={sms.provider === 'farazsms' ? `var${index}` : index === 1 ? 'token' : `token${index}`}
-                    >
-                      <Input
-                        dir="ltr"
-                        value={sms[`patternVar${index}`] || ''}
-                        onChange={(e) => patch('sms', `patternVar${index}`, e.target.value)}
-                        placeholder={index === 1 ? '{title}' : index === 2 ? '{body}' : ''}
-                      />
-                    </Field>
-                  ))}
-                </div>
-                <p className="text-[10px] leading-5 text-emerald-200/60">{t('settings.sms.varHint')}</p>
-              </div>
-            ) : null}
+            <p className="rounded-xl border border-amber-400/20 bg-amber-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-amber-100/90">
+              {t('settings.sms.textHint')}
+            </p>
 
-            {sms.provider !== 'custom' && (sms.mode || 'pattern') === 'pattern' ? (
-              <div className="space-y-3 rounded-xl border border-indigo-400/20 bg-indigo-500/[0.05] p-3.5">
-                <div>
-                  <p className="text-[12px] font-medium text-indigo-100">{t('settings.sms.events.title')}</p>
-                  <p className="mt-1 text-[10.5px] leading-5 text-indigo-100/70">{t('settings.sms.events.hint')}</p>
-                </div>
-                {SMS_EVENTS.map(({ value: eventKey, vars }) => {
-                  const cfg = sms.patterns?.[eventKey] || {};
-                  const own = Boolean(String(cfg.code || '').trim());
-                  const enabled = cfg.enabled !== false;
-                  return (
-                    <div key={eventKey} className="rounded-lg border border-white/[0.07] bg-slate-950/30 p-3">
-                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                        <p className="text-[12px] font-medium text-slate-200">{t(`settings.sms.events.${eventKey}`)}</p>
-                        <div className="flex items-center gap-2">
-                          <span className={cx(
-                            'chip',
-                            own
-                              ? 'border-emerald-400/20 bg-emerald-500/10 text-emerald-300'
-                              : 'border-white/10 bg-white/[0.04] text-slate-500',
-                          )}>
-                            {own ? t('settings.sms.events.own') : t('settings.sms.events.fallback')}
-                          </span>
-                          <span className={cx('text-[10.5px]', enabled ? 'text-emerald-300/80' : 'text-slate-500')}>
-                            {enabled ? t('settings.sms.events.on') : t('settings.sms.events.off')}
-                          </span>
-                          <Switch checked={enabled} onChange={(next) => patchPattern(eventKey, 'enabled', next)} />
-                        </div>
-                      </div>
-                      <div className={cx('grid gap-3 sm:grid-cols-2', enabled ? '' : 'pointer-events-none opacity-40')}>
-                        <Field
-                          label={sms.provider === 'farazsms' ? t('settings.sms.patternCode') : t('settings.sms.patternTemplate')}
-                          hint={sms.pattern ? `↳ ${sms.pattern}` : ''}
-                        >
-                          <Input
-                            dir="ltr"
-                            value={cfg.code || ''}
-                            onChange={(e) => patchPattern(eventKey, 'code', e.target.value)}
-                            placeholder={sms.pattern || ''}
-                          />
-                        </Field>
-                        {sms.provider === 'farazsms' ? (
-                          <Field label={t('settings.sms.patternNames')} hint={t('settings.sms.events.namesHint')}>
-                            <Input
-                              dir="ltr"
-                              value={cfg.names || ''}
-                              onChange={(e) => patchPattern(eventKey, 'names', e.target.value)}
-                              placeholder={sms.patternNames || 'var1,var2'}
-                            />
-                          </Field>
-                        ) : null}
-                      </div>
-                      <div className={cx('mt-3 grid gap-3 sm:grid-cols-3', enabled ? '' : 'pointer-events-none opacity-40')}>
-                        {[1, 2, 3].map((index) => (
-                          <Field
-                            key={index}
-                            label={t(`settings.sms.var${index}`)}
-                            hint={sms.provider === 'farazsms' ? `var${index}` : index === 1 ? 'token' : `token${index}`}
-                          >
-                            <Input
-                              dir="ltr"
-                              value={cfg[`var${index}`] || ''}
-                              onChange={(e) => patchPattern(eventKey, `var${index}`, e.target.value)}
-                              placeholder={index === 1 ? '{title}' : index === 2 ? '{body}' : ''}
-                            />
-                          </Field>
-                        ))}
-                      </div>
-                      <p className="mt-2 text-[10px] leading-5 text-indigo-200/60">
+            <div className="space-y-3 rounded-xl border border-indigo-400/20 bg-indigo-500/[0.05] p-3.5">
+              <div>
+                <p className="text-[12px] font-medium text-indigo-100">{t('settings.sms.events.title')}</p>
+                <p className="mt-1 text-[10.5px] leading-5 text-indigo-100/70">{t('settings.sms.events.hint')}</p>
+              </div>
+              {SMS_EVENTS.map((eventKey) => {
+                const enabled = sms.events?.[eventKey]?.enabled !== false;
+                return (
+                  <div
+                    key={eventKey}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-white/[0.07] bg-slate-950/30 px-3 py-2.5"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-[12.5px] font-medium text-slate-200">{t(`settings.sms.events.${eventKey}`)}</p>
+                      <p className={cx('mt-0.5 text-[10.5px] leading-5', enabled ? 'text-indigo-200/55' : 'text-slate-500')}>
                         {enabled
-                          ? `${t('settings.sms.events.vars')}: ${[...vars, '{title}', '{body}', '{text}', '{date}'].join(' · ')}`
-                          : t('settings.sms.events.disabledHint')}
+                          ? t('settings.sms.events.on')
+                          : `${t('settings.sms.events.off')} · ${t('settings.sms.events.disabledHint')}`}
                       </p>
                     </div>
-                  );
-                })}
-              </div>
-            ) : null}
-
-            {sms.provider !== 'custom' && (sms.mode || 'pattern') === 'text' ? (
-              <p className="rounded-xl border border-amber-400/20 bg-amber-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-amber-100/90">
-                {t('settings.sms.textHint')}
-              </p>
-            ) : null}
+                    <Switch checked={enabled} onChange={(next) => patchEvent(eventKey, next)} />
+                  </div>
+                );
+              })}
+            </div>
 
             {sms.provider === 'farazsms' ? (
               <p className="rounded-xl border border-cyan-400/20 bg-cyan-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-cyan-100/90">

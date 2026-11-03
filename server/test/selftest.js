@@ -403,52 +403,69 @@ function startMockXui(inboundRows) {
       tgSettings.botToken === '' && tgSettings.hasBotToken === true && tgSettings.chatId === '-1001234567890'
     );
 
-    const smsPatternsSave = await request('PATCH', '/api/admin/settings/sms', {
+    const smsSave = await request('PATCH', '/api/admin/settings/sms', {
       cookies,
       csrf,
       body: {
         enabled: true,
         provider: 'farazsms',
-        mode: 'pattern',
         apiKey: 'selftest-sms-key',
         sender: '50002178584000',
         to: '09120000000',
-        pattern: 'DEFAULT-CODE',
-        patterns: {
-          nodeOffline: { code: 'NODE-DOWN', names: 'node,server', var1: '{node}', var2: '{server}', var3: '' },
+        events: {
+          nodeOffline: { enabled: true },
+          nodeOnline: { enabled: true },
+          panelOffline: { enabled: true },
+          panelOnline: { enabled: false },
+          test: { enabled: true },
         },
       },
     });
-    const savedPatterns = smsPatternsSave.json?.data?.saved?.patterns || {};
+    const savedEvents = smsSave.json?.data?.saved?.events || {};
     check(
-      'per-notification SMS pattern persists and other events keep defaults',
-      smsPatternsSave.status === 200
-        && savedPatterns.nodeOffline?.code === 'NODE-DOWN'
-        && savedPatterns.nodeOffline?.names === 'node,server'
-        && savedPatterns.nodeOffline?.var2 === '{server}'
-        && savedPatterns.nodeOffline?.enabled === true
-        && savedPatterns.panelOnline?.code === ''
-        && savedPatterns.test?.code === '',
-      JSON.stringify(savedPatterns)
+      'per-notification SMS switches persist',
+      smsSave.status === 200
+        && savedEvents.nodeOffline?.enabled === true
+        && savedEvents.panelOnline?.enabled === false
+        && savedEvents.test?.enabled === true
+        && smsSave.json?.data?.saved?.hasApiKey === true,
+      JSON.stringify(savedEvents)
+    );
+
+    const legacySms = await request('PATCH', '/api/admin/settings/sms', {
+      cookies,
+      csrf,
+      body: {
+        mode: 'pattern',
+        pattern: 'SJ3FgPrE0C',
+        patternVar1: '{title}',
+        patternNames: 'var1,var2',
+        patterns: { nodeOffline: { code: 'NODE-DOWN', enabled: false } },
+      },
+    });
+    const savedSms = legacySms.json?.data?.saved || {};
+    const patternish = ['mode', 'pattern', 'patternVar1', 'patternNames', 'patterns'].filter((field) => field in savedSms);
+    check(
+      'pattern settings are refused and never stored',
+      legacySms.status === 200
+        && patternish.length === 0
+        && savedSms.events?.panelOnline?.enabled === false,
+      patternish.join(',')
     );
 
     const smsMute = await request('PATCH', '/api/admin/settings/sms', {
       cookies,
       csrf,
-      body: {
-        patterns: {
-          nodeOffline: { enabled: false, code: 'NODE-DOWN', names: 'node,server', var1: '{node}', var2: '{server}', var3: '' },
-        },
-      },
+      body: { events: { nodeOffline: { enabled: false } } },
     });
-    const mutedPatterns = smsMute.json?.data?.saved?.patterns || {};
+    const mutedEvents = smsMute.json?.data?.saved?.events || {};
     check(
-      'a notification can be muted while its pattern is kept',
+      'a notification can be muted while the others keep their state',
       smsMute.status === 200
-        && mutedPatterns.nodeOffline?.enabled === false
-        && mutedPatterns.nodeOffline?.code === 'NODE-DOWN'
-        && mutedPatterns.nodeOnline?.enabled === true,
-      JSON.stringify(mutedPatterns)
+        && mutedEvents.nodeOffline?.enabled === false
+        && mutedEvents.nodeOnline?.enabled === true
+        && mutedEvents.test?.enabled === true,
+      JSON.stringify(mutedEvents)
     );
 
     const backupListAfter = await request('GET', '/api/admin/backups', { cookies });
@@ -1114,6 +1131,71 @@ function startMockXui(inboundRows) {
         && expiringOverview.json.data.expiring3d === 1,
       `total=${expiringOverview.json?.data?.configs?.total} expiring=${expiringOverview.json?.data?.expiring3d}`
     );
+
+    // Deleting a reseller hides the account but keeps its row (usernames are
+    // UNIQUE), so saving the same name again has to bring that account back
+    // instead of answering "username already in use".
+    const REVIVE = 'revive-me';
+    const reviveCreate = await request('POST', '/api/admin/users', {
+      cookies, csrf,
+      body: { username: REVIVE, password: 'RevivePass1', name: 'نماینده بازیابی', role: 'reseller' },
+    });
+    const reviveId = reviveCreate.json?.data?.user?.id;
+    await request('POST', `/api/admin/users/${reviveId}/balance`, { cookies, csrf, body: { amount: 100000, description: 'شارژ بازیابی' } });
+    const reviveLogin = await request('POST', '/api/auth/login', { body: { username: REVIVE, password: 'RevivePass1' } });
+    const reviveCookies = cookiesFrom(reviveLogin.headers);
+    const reviveCsrf = reviveLogin.json?.data?.csrf;
+    const reviveBuy = await request('POST', '/api/reseller/configs', {
+      cookies: reviveCookies, csrf: reviveCsrf,
+      body: { inboundIds: [901], gb: 10, days: 30, customerName: 'مشتری بازیابی' },
+    });
+    const reviveDelete = await request('DELETE', `/api/admin/users/${reviveId}`, { cookies, csrf, body: {} });
+    const reviveHidden = await request('GET', `/api/admin/users?search=${REVIVE}`, { cookies });
+    check(
+      'a deleted reseller leaves the list',
+      reviveBuy.status === 201 && reviveDelete.status === 200 && reviveHidden.json?.data?.total === 0,
+      `buy=${reviveBuy.status} del=${reviveDelete.status} listed=${reviveHidden.json?.data?.total}`
+    );
+
+    const reviveAgain = await request('POST', '/api/admin/users', {
+      cookies, csrf,
+      body: { username: REVIVE, password: 'RevivePass2', name: 'نماینده بازیابی', role: 'reseller' },
+    });
+    check(
+      're-creating a deleted reseller revives the same account',
+      reviveAgain.status === 201 && reviveAgain.json?.data?.revived === true && reviveAgain.json?.data?.user?.id === reviveId,
+      `status=${reviveAgain.status} revived=${reviveAgain.json?.data?.revived} id=${reviveAgain.json?.data?.user?.id} expected=${reviveId}`
+    );
+
+    const reviveLogin2 = await request('POST', '/api/auth/login', { body: { username: REVIVE, password: 'RevivePass2' } });
+    const reviveOverview = await request('GET', '/api/reseller/overview', { cookies: cookiesFrom(reviveLogin2.headers) });
+    check(
+      'the revived account signs in with the new password and keeps its customer',
+      reviveLogin2.status === 200 && reviveOverview.json?.data?.configs?.total === 1,
+      `login=${reviveLogin2.status} configs=${reviveOverview.json?.data?.configs?.total}`
+    );
+    const staleRevive = await request('GET', '/api/auth/me', { cookies: reviveCookies });
+    check('the session from before the deletion is logged out', staleRevive.status === 401, `status=${staleRevive.status}`);
+
+    const reviveLive = await request('POST', '/api/admin/users', {
+      cookies, csrf, body: { username: REVIVE, password: 'RevivePass3', role: 'reseller' },
+    });
+    check(
+      'a live reseller still blocks the same name',
+      reviveLive.status === 409 && reviveLive.json?.error?.code === 'username_taken',
+      `status=${reviveLive.status} code=${reviveLive.json?.error?.code}`
+    );
+
+    await request('DELETE', `/api/admin/users/${reviveId}`, { cookies, csrf, body: {} });
+    const renameToDeleted = await request('PATCH', `/api/admin/users/${shopId}`, { cookies, csrf, body: { username: REVIVE } });
+    check(
+      'renaming onto a deleted username says the name belongs to a deleted reseller',
+      renameToDeleted.status === 409 && renameToDeleted.json?.error?.code === 'username_taken_deleted',
+      `status=${renameToDeleted.status} code=${renameToDeleted.json?.error?.code}`
+    );
+    await request('POST', '/api/admin/users', {
+      cookies, csrf, body: { username: REVIVE, password: 'RevivePass4', name: 'نماینده بازیابی', role: 'reseller' },
+    });
 
     // Direct fixtures exist ONLY in the disposable self-test database. They
     // cover legacy rows, token collisions, deletion and mixed member states.

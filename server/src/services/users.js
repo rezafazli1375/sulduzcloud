@@ -17,6 +17,13 @@ function getUserByUsername(username) {
   return db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE AND deleted_at = 0').get(String(username || ''));
 }
 
+// Who owns a name, live or deleted. The create endpoint uses it to tell the UI
+// that an old account came back instead of a brand new one being made.
+function usernameHolder(username) {
+  const db = getDb();
+  return db.prepare('SELECT id, deleted_at FROM users WHERE username = ? COLLATE NOCASE').get(String(username || '').trim());
+}
+
 function userStats(userId) {
   const db = getDb();
   const row = db.prepare(
@@ -160,15 +167,66 @@ function validateUserPayload(data, { partial = false } = {}) {
   return out;
 }
 
+function reviveUser(id, clean, req) {
+  const db = getDb();
+  const previous = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(id));
+  if (!previous) throw new ApiError(409, 'username_taken', 'This username is already in use');
+  const now = Date.now();
+  const keep = (field, fallback) => (clean[field] !== undefined ? clean[field] : fallback);
+  db.prepare(
+    `UPDATE users SET
+       username = ?, password_hash = ?, role = ?, name = ?, email = ?, phone = ?, telegram_id = ?, import_configs = ?,
+       status = ?, lang = ?, permissions = ?, max_configs = ?, max_total_gb = ?, max_gb_per_config = ?,
+       max_days_per_config = ?, allowed_inbounds = ?, balance = ?, note = ?,
+       deleted_at = 0, token_version = token_version + 1, updated_at = ?
+     WHERE id = ?`
+  ).run(
+    clean.username,
+    hashPassword(clean.password),
+    keep('role', previous.role),
+    keep('name', previous.name),
+    keep('email', previous.email),
+    keep('phone', previous.phone),
+    keep('telegram_id', previous.telegram_id),
+    clean.import_configs === undefined ? Number(previous.import_configs ?? 1) : Number(clean.import_configs),
+    keep('status', 'active') || 'active',
+    keep('lang', previous.lang),
+    clean.permissions !== undefined
+      ? JSON.stringify(clean.permissions)
+      : (previous.permissions || JSON.stringify(clean.role === 'admin' ? ['*'] : [])),
+    keep('max_configs', previous.max_configs),
+    keep('max_total_gb', previous.max_total_gb),
+    keep('max_gb_per_config', previous.max_gb_per_config),
+    keep('max_days_per_config', previous.max_days_per_config),
+    keep('allowed_inbounds', previous.allowed_inbounds || '[]'),
+    keep('balance', previous.balance),
+    keep('note', previous.note),
+    now,
+    Number(id)
+  );
+  // deleteUser() stamps the user row and the configs it hid with one timestamp,
+  // so matching it restores exactly that batch and never brings back a config
+  // the owner removed on its own.
+  const restored = db.prepare('UPDATE configs SET deleted_at = 0 WHERE user_id = ? AND deleted_at = ?')
+    .run(Number(id), previous.deleted_at).changes;
+  audit(req, 'user.revive', 'user', Number(id), { username: clean.username, role: keep('role', previous.role), restoredConfigs: restored });
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(Number(id));
+}
+
 function createUser(data, req) {
   const db = getDb();
   const clean = validateUserPayload(data, { partial: false });
-  const existing = db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').get(clean.username);
-  if (existing) throw new ApiError(409, 'username_taken', 'This username is already in use');
+  const existing = db.prepare('SELECT id, deleted_at, status FROM users WHERE username = ? COLLATE NOCASE').get(clean.username);
+  if (existing && existing.deleted_at === 0) throw new ApiError(409, 'username_taken', 'This username is already in use');
   if (clean.telegram_id) {
     const taken = db.prepare('SELECT id FROM users WHERE telegram_id = ? AND deleted_at = 0').get(clean.telegram_id);
     if (taken) throw new ApiError(409, 'telegram_id_taken', 'این شناسه تلگرام قبلاً برای نماینده دیگری ثبت شده است / This Telegram ID already belongs to another user');
   }
+  // A deleted reseller keeps its row — and usernames are UNIQUE in the table —
+  // so saving the same name again revives that account instead of failing. The
+  // owner gets the same id, wallet history and tickets back with the new
+  // password, and only the configs that the deletion itself hid return with it.
+  if (existing) return reviveUser(existing.id, clean, req);
   const now = Date.now();
   const info = db.prepare(
     `INSERT INTO users (username, password_hash, role, name, email, phone, telegram_id, import_configs, status, lang, permissions,
@@ -209,8 +267,11 @@ function updateUser(id, data, req) {
   if (!current) throw new ApiError(404, 'not_found', 'User not found');
   const clean = validateUserPayload(data, { partial: true });
   if (clean.username && clean.username.toLowerCase() !== current.username.toLowerCase()) {
-    const clash = db.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE AND id != ?').get(clean.username, Number(id));
-    if (clash) throw new ApiError(409, 'username_taken', 'This username is already in use');
+    const clash = db.prepare('SELECT id, deleted_at FROM users WHERE username = ? COLLATE NOCASE AND id != ?').get(clean.username, Number(id));
+    if (clash && clash.deleted_at === 0) throw new ApiError(409, 'username_taken', 'This username is already in use');
+    if (clash) {
+      throw new ApiError(409, 'username_taken_deleted', 'این نام کاربری متعلق به یک نمایندگی حذف‌شده است / This username belongs to a deleted reseller');
+    }
   }
   if (clean.telegram_id && clean.telegram_id !== String(current.telegram_id || '')) {
     const clash = db.prepare('SELECT id FROM users WHERE telegram_id = ? AND deleted_at = 0 AND id != ?').get(clean.telegram_id, Number(id));
@@ -355,6 +416,7 @@ module.exports = {
   USERNAME_RE,
   getUser,
   getUserByUsername,
+  usernameHolder,
   userStats,
   listUsers,
   createUser,

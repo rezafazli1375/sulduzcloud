@@ -104,6 +104,7 @@ function LimitBadge({ icon: Icon, value, suffix }) {
 function UserForm({ open, onClose, editing }) {
   const { t, lang } = useI18n();
   const toast = useToast();
+  const confirm = useConfirm();
   const queryClient = useQueryClient();
   const [form, setForm] = useState(EMPTY_FORM);
   const [showPassword, setShowPassword] = useState(false);
@@ -145,7 +146,10 @@ function UserForm({ open, onClose, editing }) {
   const save = useMutation({
     mutationFn: (payload) => (editing ? api.patch(`/admin/users/${editing.id}`, payload) : api.post('/admin/users', payload)),
     onSuccess: (result) => {
-      toast.success(editing ? t('common.updated') : t('common.created'));
+      // Reusing the name of a deleted reseller brings that account back, so the
+      // panel says so instead of pretending it is a brand new one.
+      if (result?.revived) toast.success(t('resellers.form.revived'));
+      else toast.success(editing ? t('common.updated') : t('common.created'));
       // Creating/saving a reseller with a Telegram id adopts the subscriptions
       // that already exist under that id on the panels.
       if (result?.import) {
@@ -164,6 +168,28 @@ function UserForm({ open, onClose, editing }) {
     },
     onError: (err) => toast.error(translateError(err, t)),
   });
+
+  // Deletion is a soft delete: the account is disabled and hidden and its
+  // configs disappear from the panel, but x-ui itself is never touched.
+  const remove = useMutation({
+    mutationFn: () => api.del(`/admin/users/${editing.id}`),
+    onSuccess: () => {
+      toast.success(t('common.deleted'));
+      queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
+      queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
+      onClose?.();
+    },
+    onError: (err) => toast.error(translateError(err, t)),
+  });
+
+  const askDelete = async () => {
+    const ok = await confirm({
+      title: t('resellers.detail.deleteConfirm'),
+      body: `@${editing?.username || ''} · ${t('resellers.detail.deleteNote')}`,
+      danger: true,
+    });
+    if (ok) remove.mutate();
+  };
 
   const submit = (event) => {
     event.preventDefault();
@@ -205,10 +231,22 @@ function UserForm({ open, onClose, editing }) {
       title={editing ? t('resellers.form.editTitle') : t('resellers.form.createTitle')}
       size="lg"
       footer={
-        <>
-          <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
-          <Button loading={save.isPending} onClick={submit} icon={ShieldCheck}>{t('common.save')}</Button>
-        </>
+        editing ? (
+          <div className="flex w-full flex-wrap items-center justify-between gap-2">
+            <Button variant="danger" size="sm" icon={Trash2} loading={remove.isPending} onClick={askDelete}>
+              {t('resellers.detail.deleteUser')}
+            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
+              <Button loading={save.isPending} onClick={submit} icon={ShieldCheck}>{t('common.save')}</Button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
+            <Button loading={save.isPending} onClick={submit} icon={ShieldCheck}>{t('common.save')}</Button>
+          </>
+        )
       }
     >
       <form onSubmit={submit} className="space-y-5">
@@ -634,7 +672,7 @@ function UserDetail({ userId, onClose, onEdit }) {
   const askDelete = async () => {
     const ok = await confirm({
       title: t('resellers.detail.deleteConfirm'),
-      body: t('common.irreversible'),
+      body: `@${user?.username || ''} · ${t('resellers.detail.deleteNote')}`,
       danger: true,
     });
     if (ok) remove.mutate(false);
@@ -879,6 +917,27 @@ export default function Resellers() {
     }
   };
 
+  // Same soft delete the edit dialog and the detail drawer use: the account is
+  // disabled and hidden, its configs leave the list, and x-ui stays untouched.
+  // The only owner can never be deleted — the API refuses it and the reason is
+  // shown as a toast.
+  const removeRow = async (row) => {
+    const ok = await confirm({
+      title: t('resellers.detail.deleteConfirm'),
+      body: `@${row.username} · ${t('resellers.detail.deleteNote')}`,
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.del(`/admin/users/${row.id}`);
+      toast.success(t('common.deleted'));
+      queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
+      queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
+    } catch (err) {
+      toast.error(translateError(err, t));
+    }
+  };
+
   return (
     <>
       <PageHeader
@@ -966,6 +1025,13 @@ export default function Resellers() {
                           ) : null}
                           <IconButton icon={Pencil} label={t('common.edit')} onClick={() => { setEditing(row); setFormOpen(true); }} />
                           <IconButton icon={row.status === 'active' ? UserX : BadgeCheck} label={t('common.status')} onClick={() => toggleStatus(row)} />
+                          <IconButton
+                            icon={Trash2}
+                            variant="ghost"
+                            label={t('resellers.detail.deleteUser')}
+                            className="text-rose-300/80 hover:bg-rose-500/15 hover:text-rose-200"
+                            onClick={() => removeRow(row)}
+                          />
                         </div>
                       </td>
                     </tr>
@@ -992,8 +1058,8 @@ export default function Resellers() {
                   <span className="text-slate-500">{t('common.balance')}</span>
                   <span className="font-semibold text-emerald-300">{formatNumber(row.balance, lang)}</span>
                 </div>
-                {row.role === 'reseller' ? (
-                  <div className="mt-2.5 border-t border-white/[0.06] pt-2">
+                <div className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-white/[0.06] pt-2">
+                  {row.role === 'reseller' ? (
                     <Button
                       size="xs"
                       variant="soft"
@@ -1002,8 +1068,17 @@ export default function Resellers() {
                     >
                       {t('resellers.detail.discounts')}
                     </Button>
-                  </div>
-                ) : null}
+                  ) : null}
+                  <Button
+                    size="xs"
+                    variant="soft"
+                    icon={Trash2}
+                    className="text-rose-300/85 hover:text-rose-200"
+                    onClick={(event) => { event.stopPropagation(); removeRow(row); }}
+                  >
+                    {t('resellers.detail.deleteUser')}
+                  </Button>
+                </div>
               </div>
             ))}
           </div>

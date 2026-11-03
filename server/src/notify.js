@@ -88,23 +88,7 @@ async function sendMail(to, subject, text, html) {
 }
 
 const SMS_TEXT_MAX = 900;
-// Kavenegar caps each verify template token at 100 characters; staying inside
-// the same bound keeps one mapping safe for both providers.
-const SMS_VAR_MAX = 100;
-const SMS_VAR_PLACEHOLDER = /\{([a-zA-Z][a-zA-Z0-9_]*)\}/g;
 
-// Notifications that can carry SMS. Besides {title}/{body}/{text}/{date}, each
-// event exposes its own details as variables so a dedicated pattern can say
-// exactly what happened (e.g. «نود {node} روی {server} قطع شد»).
-const SMS_EVENTS = {
-  test: ['panel'],
-  nodeOffline: ['node', 'server', 'address', 'failures'],
-  nodeOnline: ['node', 'server'],
-  panelOffline: ['server', 'error'],
-  panelOnline: ['server'],
-};
-
-// Accept 09…, 0098… and 98… but always use the local 09… form.
 function normalizeSmsNumber(value) {
   const digits = String(value || '').replace(/\D/g, '');
   if (/^0098\d{10}$/.test(digits)) return `0${digits.slice(4)}`;
@@ -119,160 +103,6 @@ function smsTargets(sms, to) {
     .split(/[,;\n]+/)
     .map(normalizeSmsNumber)
     .filter(Boolean);
-}
-
-function smsToday() {
-  const timezone = getSetting('general').timezone || 'Asia/Tehran';
-  try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
-    }).format(new Date());
-  } catch (_) {
-    return new Date().toISOString().slice(0, 10);
-  }
-}
-
-// Operator-controlled providers (Kavenegar/FarazSMS) only deliver pre-approved
-// patterns without manual review, so the message is projected onto template
-// variables. Every message exposes:
-//   {title} first line · {body} remaining lines · {text} whole message · {date}
-// plus the event's own keys (see SMS_EVENTS).
-function smsValues({ title = '', body = '', text = '', data = {} } = {}) {
-  const lines = String(text || [title, body].filter(Boolean).join('\n')).replace(/\r/g, '').split('\n');
-  const values = {
-    title: String(title || lines[0] || '').trim(),
-    body: String(body || lines.slice(1).join('\n')).trim(),
-    text: lines.join('\n').trim(),
-    date: smsToday(),
-  };
-  for (const [key, value] of Object.entries(data || {})) {
-    if (value === null || value === undefined) continue;
-    values[String(key).toLowerCase()] = String(value).replace(/\s+/g, ' ').trim();
-  }
-  return values;
-}
-
-function renderSmsVars(mapping, values) {
-  const rendered = (Array.isArray(mapping) ? mapping : []).slice(0, 3).map((template) => (
-    String(template ?? '')
-      .replace(SMS_VAR_PLACEHOLDER, (_, key) => values[key.toLowerCase()] || '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, SMS_VAR_MAX)
-  ));
-  while (rendered.length && !rendered[rendered.length - 1]) rendered.pop();
-  return rendered;
-}
-
-// Each notification can use its own approved pattern. An empty per-event code
-// falls back to the shared default pattern (pattern/patternVar1..3); a per-event
-// pattern without its own mapping keeps the built-in title/body split.
-function smsEventConfig(sms, event, values) {
-  const saved = (sms.patterns && sms.patterns[event]) || {};
-  const code = String(saved.code || '').trim();
-  if (!code) {
-    return {
-      event,
-      source: 'default',
-      pattern: String(sms.pattern || '').trim(),
-      names: sms.patternNames,
-      vars: renderSmsVars([sms.patternVar1, sms.patternVar2, sms.patternVar3], values),
-    };
-  }
-  const mapping = [saved.var1, saved.var2, saved.var3];
-  const templates = mapping.some((value) => String(value ?? '').trim())
-    ? mapping
-    : ['{title}', '{body}', ''];
-  return {
-    event,
-    source: 'event',
-    pattern: code,
-    names: String(saved.names || '').trim() || sms.patternNames,
-    vars: renderSmsVars(templates, values),
-  };
-}
-
-async function sendSmsPattern(sms, recipients, config) {
-  const pattern = String(config.pattern || '').trim();
-  if (!pattern) {
-    throw new ApiError(400, 'sms_pattern_missing',
-      'الگوی پیامک (پترن) تنظیم نشده است؛ نام یا کد پترن تأییدشده را در تنظیمات پیامک وارد کنید.');
-  }
-  const vars = Array.isArray(config.vars) ? config.vars : [];
-  if (!vars.length) throw new ApiError(400, 'sms_empty', 'SMS message is empty');
-  const names = String(config.names || '')
-    .split(/[,;\s]+/)
-    .map((name) => name.trim())
-    .filter(Boolean);
-  const meta = {
-    event: config.event || '',
-    source: config.source || 'default',
-    pattern,
-    recipients,
-    vars,
-    names,
-  };
-
-  if (sms.provider === 'kavenegar') {
-    // Kavenegar verify/lookup: the template name is registered in the panel and
-    // its tokens (token, token2, token3) fill the approved text. One request per
-    // number keeps the quota/error of each delivery separate.
-    if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'Kavenegar API key is missing');
-    for (const recipient of recipients) {
-      const url = new URL(`https://api.kavenegar.com/v1/${encodeURIComponent(sms.apiKey)}/verify/lookup.json`);
-      url.searchParams.set('receptor', recipient);
-      url.searchParams.set('template', pattern);
-      url.searchParams.set('type', 'sms');
-      ['token', 'token2', 'token3'].forEach((name, index) => {
-        if (vars[index]) url.searchParams.set(name, vars[index]);
-      });
-      const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(15000) });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok || Number(json.return?.status) !== 200) {
-        throw new ApiError(502, 'sms_failed', `Kavenegar error: ${json.return?.message || `HTTP ${res.status}`}`);
-      }
-    }
-    return { ok: true, provider: 'kavenegar', mode: 'pattern', ...meta };
-  }
-
-  if (sms.provider === 'farazsms') {
-    // FarazSMS pattern endpoint (docs.iranpayamak.com): one request per number.
-    // Attribute keys must match the variable names defined in the pattern, so
-    // `names` (per-event or global) labels them in rendered order.
-    if (!sms.apiKey) throw new ApiError(400, 'sms_incomplete', 'FarazSMS API key is missing');
-    const line = String(sms.sender || '').trim();
-    if (!line) throw new ApiError(400, 'sms_incomplete', 'FarazSMS line number (sender) is missing');
-    const attributes = {};
-    vars.forEach((value, index) => {
-      attributes[names[index] || `var${index + 1}`] = value;
-    });
-    for (const recipient of recipients) {
-      const res = await fetch('https://api.iranpayamak.com/ws/v1/sms/pattern', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'Api-Key': String(sms.apiKey),
-        },
-        body: JSON.stringify({
-          code: pattern,
-          attributes,
-          recipient,
-          line_number: line,
-          number_format: 'english',
-        }),
-        signal: AbortSignal.timeout(15000),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok || String(json.status || '').toLowerCase() === 'error') {
-        const reason = (Array.isArray(json.messages) && json.messages[0]) || json.message || `HTTP ${res.status}`;
-        throw new ApiError(502, 'sms_failed', `FarazSMS error: ${reason}`);
-      }
-    }
-    return { ok: true, provider: 'farazsms', mode: 'pattern', ...meta };
-  }
-
-  throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
 }
 
 async function sendSmsText(sms, recipients, message) {
@@ -322,6 +152,9 @@ async function sendSmsText(sms, recipients, message) {
   throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
 }
 
+// Every notification is delivered as the panel's own free text. The owner can
+// mute any single notification; that only skips the SMS channel, the in-panel
+// and email channels stay active.
 async function sendSms(text, to, options = {}) {
   const sms = getSetting('sms');
   if (!sms.enabled) throw new ApiError(400, 'sms_disabled', 'SMS notifications are disabled');
@@ -329,10 +162,8 @@ async function sendSms(text, to, options = {}) {
   if (!recipients.length) throw new ApiError(400, 'sms_no_recipient', 'No SMS recipient configured');
   const message = String(text || '').slice(0, SMS_TEXT_MAX);
 
-  // The owner can mute any notification without losing its saved pattern; the
-  // in-panel and email channels stay active, only the SMS is skipped.
   const event = String(options.event || '');
-  if (event && sms.patterns && sms.patterns[event] && sms.patterns[event].enabled === false) {
+  if (event && sms.events?.[event]?.enabled === false) {
     return { ok: true, skipped: 'event_disabled', event, recipients: [] };
   }
 
@@ -341,9 +172,12 @@ async function sendSms(text, to, options = {}) {
     let headers = {};
     try { headers = sms.customHeaders ? JSON.parse(sms.customHeaders) : {}; } catch (_) { headers = {}; }
     const bodyTemplate = sms.customBody || '{"to":"{to}","text":"{text}"}';
+    // Alert texts are multi-line, so the substituted values have to stay valid
+    // JSON string content: quotes, backslashes and control characters escape.
+    const jsonSafe = (value) => JSON.stringify(String(value)).slice(1, -1);
     const rendered = bodyTemplate
-      .replaceAll('{to}', recipients.join(','))
-      .replaceAll('{text}', message.replace(/"/g, '\\"'));
+      .replaceAll('{to}', jsonSafe(recipients.join(',')))
+      .replaceAll('{text}', jsonSafe(message));
     const method = String(sms.customMethod || 'POST').toUpperCase();
     const init = { method, headers: { 'Content-Type': 'application/json', ...headers }, signal: AbortSignal.timeout(15000) };
     if (method !== 'GET') init.body = rendered;
@@ -356,26 +190,7 @@ async function sendSms(text, to, options = {}) {
     throw new ApiError(400, 'sms_provider', `Unknown SMS provider: ${sms.provider}`);
   }
 
-  // Pattern (pre-approved template) is the default: operator-controlled bulk
-  // text needs manual approval, approved patterns are delivered immediately.
-  if (String(sms.mode || 'pattern') === 'text') return sendSmsText(sms, recipients, message);
-
-  const values = smsValues({
-    title: options.title,
-    body: options.body,
-    text: message,
-    data: options.data,
-  });
-  const config = options.event
-    ? smsEventConfig(sms, options.event, values)
-    : {
-      event: '',
-      source: 'default',
-      pattern: String(sms.pattern || '').trim(),
-      names: sms.patternNames,
-      vars: renderSmsVars([sms.patternVar1, sms.patternVar2, sms.patternVar3], values),
-    };
-  return sendSmsPattern(sms, recipients, config);
+  return sendSmsText(sms, recipients, message);
 }
 
 async function testEmail() {
@@ -388,16 +203,12 @@ async function testEmail() {
 async function testSms() {
   const sms = getSetting('sms');
   const panelName = String(getSetting('general').panelName || 'Sulduz Cloud').trim();
-  // Two lines so {title} receives the panel name and {body} the test text.
-  const result = await sendSms(`${panelName}\nپیام آزمایشی`, sms.to, {
-    event: 'test',
-    title: panelName,
-    body: 'پیام آزمایشی',
-    data: { panel: panelName },
-  });
+  const result = await sendSms(`${panelName}\nپیام آزمایشی`, sms.to, { event: 'test' });
   return { ...result, to: sms.to };
 }
 
+// `data` is the event's own metadata; it is not part of the SMS any more (the
+// message is plain text) but callers keep sending it for the notification meta.
 async function alertAdmins({ event = '', data = {}, title, body }) {
   notifyAdmins({ type: 'alert', title, body, link: '/admin/servers' });
   const monitor = getSetting('monitor');
@@ -407,9 +218,7 @@ async function alertAdmins({ event = '', data = {}, title, body }) {
   }
   if (monitor.alertSms) {
     try {
-      const result = await sendSms(`${title}\n${body}`, undefined, {
-        event, data, title, body,
-      });
+      const result = await sendSms(`${title}\n${body}`, undefined, { event });
       results.sms = !result.skipped;
       if (result.skipped) results.skipped = result.skipped;
     } catch (err) { results.errors.push(`sms: ${err.message}`); }

@@ -130,6 +130,10 @@ router.get('/users/export.csv', auth.requirePerm('users'), (req, res) => {
 });
 
 router.post('/users', auth.requirePerm('users'), asyncH(async (req, res) => {
+  // A name that belongs to a deleted reseller revives that account (see
+  // users.createUser), so the UI can say "restored" instead of "created".
+  const holder = usersService.usernameHolder((req.body || {}).username);
+  const revived = Boolean(holder && holder.deleted_at > 0);
   const user = usersService.createUser(req.body || {}, req);
   // A Telegram id lets the panel adopt subscriptions the reseller already owns
   // on any connected server. Importing never charges the wallet and cannot fail
@@ -143,7 +147,7 @@ router.post('/users', auth.requirePerm('users'), asyncH(async (req, res) => {
       imported = { imported: 0, restored: 0, failed: 1, errors: [err.message] };
     }
   }
-  res.status(201).json({ ok: true, data: { user: sanitizeUser(user), stats: usersService.userStats(user.id), import: imported } });
+  res.status(201).json({ ok: true, data: { user: sanitizeUser(user), stats: usersService.userStats(user.id), import: imported, revived } });
 }));
 
 router.get('/users/:id', auth.requirePerm('users'), (req, res) => {
@@ -638,6 +642,17 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     if (patch[key] !== undefined) clean[key] = patch[key];
   }
   // Type guards for critical values.
+  if (section === 'sms' && clean.events !== undefined) {
+    // Only the known notifications, and only their on/off flag: the SMS channel
+    // has no other per-event setting since the pattern feature was removed.
+    const known = Object.keys(settings.DEFAULTS.sms.events);
+    const events = {};
+    for (const [event, value] of Object.entries(clean.events || {})) {
+      if (!known.includes(event)) continue;
+      events[event] = { enabled: value && typeof value === 'object' ? value.enabled !== false : Boolean(value) };
+    }
+    clean.events = events;
+  }
   if (section === 'monitor') {
     if (clean.intervalSec !== undefined) clean.intervalSec = Math.min(3600, Math.max(60, num(clean.intervalSec, 120)));
     if (clean.failureThreshold !== undefined) clean.failureThreshold = Math.min(10, Math.max(1, num(clean.failureThreshold, 2)));
