@@ -12,6 +12,7 @@ import {
   Eye,
   EyeOff,
   KeyRound,
+  Link2,
   Pencil,
   Percent,
   Pin,
@@ -111,6 +112,7 @@ function UserForm({ open, onClose, editing }) {
   const [form, setForm] = useState(EMPTY_FORM);
   const [showPassword, setShowPassword] = useState(false);
   const [savingFixed, setSavingFixed] = useState(false);
+  const [merging, setMerging] = useState(false);
 
   const inboundsQuery = useQuery({
     queryKey: ['inbounds', 'form'],
@@ -185,6 +187,44 @@ function UserForm({ open, onClose, editing }) {
       else toast.error(t('resellers.form.fixedInboundFailed', { reason: (result?.errors || [])[0] || '' }));
       queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
       queryClient.invalidateQueries({ queryKey: ['admin', 'user', userId] });
+    } catch (err) {
+      toast.error(translateError(err, t));
+    }
+  };
+
+  // Panel v1.4.18: a customer package that is spread over more than one x-ui
+  // client cannot be listed by the node's own subscription server, so such a
+  // package is handed this panel's aggregated link instead of the node address
+  // the owner configured. Merging moves the extra channels onto the client the
+  // customer already uses, which puts his link back on the node. Count first
+  // (dryRun is read-only) because the real pass deletes the duplicate client
+  // this panel created on the x-ui panel.
+  const mergePackages = async (userId) => {
+    let preview = null;
+    try {
+      preview = await api.post(`/admin/users/${userId}/consolidate`, { dryRun: true });
+    } catch (err) {
+      toast.error(translateError(err, t));
+      return;
+    }
+    const split = Number(preview?.split || 0);
+    if (!split) {
+      toast.success(t('resellers.form.mergeNothing', { n: Number(preview?.packages || 0) }));
+      return;
+    }
+    const go = await confirm({
+      title: t('resellers.form.mergeTitle'),
+      body: t('resellers.form.mergeBody', { n: split }),
+    });
+    if (!go) return;
+    try {
+      const result = await api.post(`/admin/users/${userId}/consolidate`, { dryRun: false });
+      const merged = Number(result?.merged || 0);
+      const skipped = Number(result?.skipped || 0);
+      if (merged) toast.success(t('resellers.form.mergeDone', { n: merged, m: skipped }));
+      else toast.error(t('resellers.form.mergeFailed', { reason: (result?.errors || [])[0] || '' }));
+      queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
+      queryClient.invalidateQueries({ queryKey: ['configs'] });
     } catch (err) {
       toast.error(translateError(err, t));
     }
@@ -420,6 +460,35 @@ function UserForm({ open, onClose, editing }) {
               ) : null}
             </div>
             <p className="mt-1.5 text-[10.5px] leading-5 text-slate-500">{t('resellers.form.fixedInboundHint')}</p>
+          </div>
+        ) : null}
+
+        {/* Panel v1.4.18: the subscription link of a customer lives on the node
+            (sub_base) as long as his package is ONE x-ui client. The heal of
+            v1.4.16–17 added a second client to the adopted packages, which
+            pushed those links behind this panel; this is the repair pass, and it
+            only removes a client this panel created itself. */}
+        {editing ? (
+          <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] px-3.5 py-3">
+            <div className="flex items-center gap-2">
+              <Link2 className="h-3.5 w-3.5 text-emerald-300" />
+              <p className="text-[12.5px] font-medium text-slate-200">{t('resellers.form.mergeCard')}</p>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+              <p className="min-w-0 flex-1 text-[10.5px] leading-5 text-slate-500">{t('resellers.form.mergeHint')}</p>
+              <Button
+                variant="ghost"
+                size="sm"
+                loading={merging}
+                icon={RefreshCw}
+                onClick={() => {
+                  setMerging(true);
+                  Promise.resolve(mergePackages(editing.id)).finally(() => setMerging(false));
+                }}
+              >
+                {t('resellers.form.mergeButton')}
+              </Button>
+            </div>
           </div>
         ) : null}
 

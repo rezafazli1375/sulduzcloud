@@ -123,6 +123,13 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const links = detail.data?.links || [];
   const subUrl = detail.data?.subUrl || '';
   const linksError = detail.data?.error || '';
+  // Where the subscription link comes from: the node's own subscription server
+  // (one x-ui client holding every inbound of the customer) or, only when a
+  // package really spans several x-ui clients, this panel's aggregated link.
+  const subs = detail.data?.subscriptions || null;
+  const nodeLinks = Array.isArray(subs?.node) ? subs.node.filter((item) => item?.url) : [];
+  const clientCount = Number(subs?.clientCount || nodeLinks.length || 1);
+  const isPanelLink = subs?.source === 'panel';
 
   const addableQuery = useQuery({
     queryKey: ['config-inbounds', isAdmin, config?.userId],
@@ -239,22 +246,39 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const removeInbound = useMutation({
     mutationFn: (targetId) => api.del(`${base}/${targetId}`),
     onSuccess: (data, targetId) => {
-      toast.success(data?.detachedOnly ? t('configs.group.detached') : t('configs.group.removed'));
+      // Three outcomes worth telling apart: an adopted row (nothing was written
+      // to the other panel), a channel taken off the customer's own client (he
+      // stays connected), and his last channel (that client is gone).
+      const message = data?.detachedOnly
+        ? t('configs.group.detached')
+        : (data?.inboundDetached
+          ? t('configs.group.channelDetached', { n: Number(data?.keptInbounds || 0) })
+          : t('configs.group.removed'));
+      toast.success(message);
       if (Number(targetId) === Number(configId)) onClose?.();
       refresh();
     },
     onError,
   });
 
+  // Since v1.4.18 a package is ONE x-ui client holding every channel of that
+  // customer, so taking one row off a package whose client has other members does
+  // NOT delete the client and does NOT cut him off — it detaches that channel.
+  // Only a row that stands alone on its client really deletes a x-ui client, and
+  // the wording must say which of the two the operator is about to do.
+  const sharesClient = (item) => group.some((other) => Number(other.id) !== Number(item?.id)
+    && String(other.email || '').toLowerCase() === String(item?.email || '').toLowerCase());
+
   const askRemoveInbound = async (item) => {
-    // Adopted subscriptions are not this panel's clients: removing one only
-    // detaches the row, so the confirm must not promise a x-ui delete.
     const external = item?.origin === 'external';
+    const detach = external || sharesClient(item);
     const ok = await confirm({
-      title: external ? t('configs.group.detachConfirm') : t('configs.group.removeConfirm'),
-      body: `${item ? `${item.inbound?.remark || `#${item.inboundId}`} · ${item.email}` : ''}${external ? `\n${t('configs.group.detachNote')}` : ''}`,
+      title: detach ? t('configs.group.detachConfirm') : t('configs.group.removeConfirm'),
+      body: `${item ? `${item.inbound?.remark || `#${item.inboundId}`} · ${item.email}` : ''}`
+        + (external ? `\n${t('configs.group.detachNote')}`
+          : (detach ? `\n${t('configs.group.channelDetachNote')}` : '')),
       danger: true,
-      confirmText: external ? t('configs.group.detach') : t('configs.group.remove'),
+      confirmText: detach ? t('configs.group.detach') : t('configs.group.remove'),
     });
     if (ok) removeInbound.mutate(item.id);
   };
@@ -407,6 +431,26 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                     </div>
                   </div>
                   <p className="break-all rounded-lg bg-[#050811]/60 px-2 py-1.5 font-mono text-[10.5px] leading-5 text-emerald-100/80" dir="ltr">{subUrl}</p>
+                  <p className="mt-1 text-[10px] text-slate-400">
+                    {isPanelLink ? t('configs.detail.subSourcePanel') : t('configs.detail.subSourceNode')}
+                  </p>
+                  {isPanelLink && nodeLinks.length > 1 ? (
+                    <div className="mt-1.5 space-y-1.5">
+                      <p className="text-[10px] text-slate-400">{t('configs.detail.subNodeLinks')}</p>
+                      {nodeLinks.map((item) => (
+                        <div key={item.url} className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2 py-1.5">
+                          <span className="min-w-0 truncate text-[10px] text-slate-400" dir="ltr">
+                            {item.email} · {t('configs.detail.subInbounds', { n: item.inboundCount || 1 })}
+                          </span>
+                          <div className="flex shrink-0 items-center gap-0.5">
+                            <IconButton icon={QrCode} variant="ghost" label={t('common.qr')} onClick={() => setQr({ title: item.email, value: item.url })} />
+                            <CopyButton value={item.url} iconOnly />
+                          </div>
+                          <p className="w-full break-all font-mono text-[10px] text-slate-500" dir="ltr">{item.url}</p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
 
@@ -510,7 +554,8 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                         <IconButton
                           icon={Trash2}
                           variant="ghost"
-                          label={item.origin === 'external' ? t('configs.group.detach') : t('configs.group.remove')}
+                          label={item.origin === 'external' || sharesClient(item)
+                            ? t('configs.group.detach') : t('configs.group.remove')}
                           onClick={() => askRemoveInbound(item)}
                         />
                       )}

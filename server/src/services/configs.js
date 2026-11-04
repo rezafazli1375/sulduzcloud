@@ -64,24 +64,41 @@ function publicBaseUrl() {
   return String(config.publicUrl || '').trim().replace(/\/+$/, '');
 }
 
-// How many live configs share this customer's subscription token. A package is
-// one group; a single config is a group of one.
-function groupSize(row) {
-  if (!row || !row.sub_id) return 0;
-  return Number(getDb().prepare(
-    'SELECT COUNT(*) AS c FROM configs WHERE sub_id = ? AND user_id = ? AND deleted_at = 0'
-  ).get(row.sub_id, row.user_id).c || 0);
+// One x-ui client = one subscription id on the node's own subscription server.
+// The client is identified by the panel that holds it and its email, which is
+// exactly how distinctClients() groups the rows of a package.
+function clientKeyOf(row) {
+  return `${Number(row?.server_id || 0)}|${String(row?.email || '').toLowerCase()}`;
 }
 
-function subUrlFor(config, server) {
-  // x-ui 3.2.5+ refuses to create a second client with an already used subId,
-  // so a multi-inbound package cannot be aggregated by the x-ui subscription
-  // server. The panel serves one aggregated subscription per customer instead
-  // and every x-ui client keeps its own private subId.
-  if (config.sub_id && groupSize(config) > 1) {
-    const base = publicBaseUrl();
-    return base ? `${base}/api/sub/${encodeURIComponent(config.sub_id)}` : '';
-  }
+// The live x-ui clients behind a customer package, each with its rows. A
+// subscription adopted from another panel is ONE client kept as one row per
+// inbound, so his rows collapse into a single group; a package that really
+// holds several clients keeps one group per client.
+function packageClientGroups(row) {
+  return distinctClients(packageRows(row));
+}
+
+function isOneClientPackage(row) {
+  return packageClientGroups(row).length <= 1;
+}
+
+/**
+ * The subscription URL the customer should be handed.
+ *
+ * A package is ONE x-ui client attached to several inbounds whenever the client
+ * was adopted from a panel or ordered through this panel since v1.4.18. That
+ * client's own subscription link lives on the node — the base configured per
+ * server (sub_base, e.g. https://sbs.example.com:8443/sub) — and x-ui already
+ * lists every inbound the client is attached to there, so the panel has nothing
+ * to aggregate and must not insert itself between the customer and the node.
+ *
+ * Only when a package genuinely spans MORE THAN ONE x-ui client can no single
+ * node link cover it: x-ui 3.2.5+ rejects a subId already in use, so each client
+ * carries its own private subId and this panel serves one combined subscription
+ * for the group token instead.
+ */
+function nodeSubUrlFor(config, server) {
   const xuiCfg = settings.getSetting('xui');
   let base = String((server && server.subBase) || '').replace(/\/+$/, '');
   // The legacy settings.xui.subBase only belongs to the primary panel.
@@ -91,10 +108,53 @@ function subUrlFor(config, server) {
       base = String(xuiCfg.subBase || '').replace(/\/+$/, '');
     }
   }
+  // A single config uses the same value for both, so preferring the per-client
+  // subId keeps the classic link and the adopted one working the same way.
   const subId = String(config.xui_sub_id || config.sub_id || '');
   if (!base || !subId) return '';
   if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
   return `${base}/${encodeURIComponent(subId)}`;
+}
+
+function panelSubUrlFor(config) {
+  if (!config || !config.sub_id) return '';
+  const base = publicBaseUrl();
+  return base ? `${base}/api/sub/${encodeURIComponent(config.sub_id)}` : '';
+}
+
+function subUrlFor(config, server) {
+  const nodeUrl = nodeSubUrlFor(config, server);
+  if (isOneClientPackage(config)) return nodeUrl || panelSubUrlFor(config);
+  return panelSubUrlFor(config) || nodeUrl;
+}
+
+/**
+ * Every subscription link a package can be reached by, for the detail drawer:
+ * the node link of each x-ui client it holds, plus the panel's aggregated link
+ * when there is more than one client. `primary` is what the panel hands out.
+ */
+function subscriptionsOf(row, server) {
+  const srv = server || serverOfConfig(row);
+  const groups = packageClientGroups(row);
+  const node = groups.map((members) => {
+    const head = members.find((item) => item.xui_sub_id) || members[0] || {};
+    return {
+      email: String(head.email || ''),
+      subId: String(head.xui_sub_id || head.sub_id || ''),
+      url: nodeSubUrlFor(head, srv),
+      origin: String(head.origin || 'panel'),
+      inboundCount: members.length,
+    };
+  }).filter((item) => item.url);
+  const aggregated = panelSubUrlFor(row);
+  const multiple = groups.length > 1;
+  return {
+    clientCount: groups.length,
+    node,
+    aggregated: multiple ? aggregated : '',
+    primary: (!multiple && node[0]?.url) ? node[0].url : (aggregated || node[0]?.url || ''),
+    source: (!multiple && node[0]?.url) ? 'node' : (aggregated ? 'panel' : node[0]?.url ? 'node' : ''),
+  };
 }
 
 function priceFor(inbound, gb, days, userId) {
@@ -472,33 +532,42 @@ async function createConfigs(input, req) {
   const created = [];
   const createdIds = [];
   const createdEmails = [];
-  // One group token per order: every inbound of this customer is listed by the
-  // same subscription URL instead of handing out one link per inbound. The
-  // token is served by this panel (see routes/public.js) because x-ui 3.2.5+
-  // rejects a second client carrying an already used subId — every x-ui client
-  // therefore gets its own private xui_sub_id below.
+  // One group token per order, and since v1.4.18 the order is also ONE x-ui
+  // client attached to every inbound that was ordered. A client carries its own
+  // subscription id on the node's subscription server, so <sub_base>/<subId>
+  // already lists all of the customer's inbounds — the link he is handed stays
+  // on the node address configured per server, exactly like the subscriptions
+  // this panel adopts. The token and the x-ui subId are the same value, so a
+  // rotation of either keeps both links pointing at the same place.
   const subId = randomToken(16);
+  const email = emailFor(user);
+  const uuid = randomUUID();
+  const comment = [input.label, input.customerName, input.customerPhone].filter(Boolean).join(' | ').slice(0, 120);
 
   try {
-    for (const { inboundId, inbound, server } of priced) {
-      const email = emailFor(user);
-      const uuid = randomUUID();
-      // A single-inbound order keeps the classic behaviour: the token is also
-      // the x-ui subId, so the customer link stays on the x-ui sub server.
-      const xuiSubId = inboundIds.length === 1 ? subId : randomToken(16);
-      const comment = [input.label, input.customerName, input.customerPhone].filter(Boolean).join(' | ').slice(0, 120);
-      const client = {
+    const server = priced[0].server;
+    // All inbounds of one order are on one panel (checked above), so one client
+    // can be attached to all of them in a single x-ui call.
+    const xuiIds = [...new Set(priced.map((item) => Number(item.inbound.xui_id)).filter((n) => Number.isFinite(n) && n > 0))];
+    const createdClient = await xui.addClient(
+      {
         email,
-        subId: xuiSubId,
+        subId,
         uuid,
         flow: '',
         totalBytes,
         expiryAt,
         enabled: true,
         comment,
-      };
-      const createdClient = await xui.addClient(client, [Number(inbound.xui_id)], server);
-      createdEmails.push({ email, server });
+      },
+      xuiIds,
+      server
+    );
+    createdEmails.push({ email, server });
+    const liveSubId = String(createdClient?.subId || subId);
+    const liveUuid = String(createdClient?.uuid || uuid);
+
+    for (const { inboundId } of priced) {
       const info = db.prepare(
         `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label, customer_name,
           customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status, created_at, updated_at)
@@ -509,8 +578,8 @@ async function createConfigs(input, req) {
         Number(server.id),
         email,
         subId,
-        xuiSubId,
-        String(createdClient?.uuid || uuid),
+        liveSubId,
+        liveUuid,
         String(input.label || '').slice(0, 80),
         String(input.customerName || '').slice(0, 80),
         String(input.customerPhone || '').slice(0, 32),
@@ -795,9 +864,11 @@ async function linksFor(row) {
   } catch (err) {
     if (!error) error = err.message;
   }
+  const subscriptions = subscriptionsOf(row, server);
   return {
     links,
-    subUrl: subUrlFor(row, server),
+    subUrl: subscriptions.primary,
+    subscriptions,
     error,
     // The customer-facing subscription id is the group token; the per-client
     // x-ui subId stays private to the panel.
@@ -1114,11 +1185,28 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
     throw new ApiError(409, 'fixed_inbound_locked', 'این اینباند ثابت نماینده است؛ تا بسته عضو دیگری دارد از بسته برداشته نمی‌شود / The reseller’s fixed inbound cannot be removed while the package has other inbounds');
   }
   const isExternal = String(row.origin || 'panel') === 'external';
+  // The rows of one customer can all stand for the SAME x-ui client: an adopted
+  // subscription is one client kept as one row per inbound, and since v1.4.18 a
+  // multi-inbound order is created that way too. Removing one channel from such a
+  // package takes that inbound off the client — deleting the client would drop
+  // every other inbound the customer is connected through.
+  const siblings = members.filter((item) => Number(item.id) !== Number(row.id) && clientKeyOf(item) === clientKeyOf(row));
+  const keepIds = [...new Set(siblings
+    .map((item) => Number(getInboundRow(item.inbound_id)?.xui_id || 0))
+    .filter((n) => Number.isFinite(n) && n > 0))];
+  const sharedClient = siblings.length > 0 && keepIds.length > 0;
   if (isExternal) {
     // Adopted subscriptions live on another operator's panel and their owners
     // are connected right now. Removing the row here forgets the subscription
     // locally and never sends a delete to that panel.
     console.warn(`[configs] detaching adopted config ${row.email} without touching x-ui`);
+  } else if (sharedClient) {
+    try {
+      await xui.setInbounds(row.email, keepIds, serverOfConfig(row));
+    } catch (err) {
+      if (!silent) throw err;
+      console.error(`[configs] x-ui detach failed for ${row.email}:`, err.message);
+    }
   } else {
     try {
       await xui.deleteClient(row.email, false, serverOfConfig(row));
@@ -1134,8 +1222,12 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
   } else {
     db.prepare('UPDATE configs SET deleted_at = ?, enabled = 0, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), row.id);
   }
-  audit(req, 'config.delete', 'config', row.id, { email: row.email, hard, detachedOnly: isExternal });
-  return { ok: true, detachedOnly: isExternal };
+  audit(req, 'config.delete', 'config', row.id, {
+    email: row.email, hard, detachedOnly: isExternal, inboundDetached: sharedClient, keptInbounds: keepIds.length,
+  });
+  return {
+    ok: true, detachedOnly: isExternal, inboundDetached: sharedClient, keptInbounds: keepIds.length,
+  };
 }
 
 /**
@@ -1269,25 +1361,26 @@ async function updateIdentity(id, patch = {}, req, viewer) {
   if (!next.uuid && !subChanged) return hydrate(row);
 
   const db = getDb();
-  const siblings = groupRows(row).filter((sibling) => Number(sibling.id) !== Number(row.id));
+  const members = packageRows(row);
+  const groups = distinctClients(members);
+  // One client behind the whole package ⇒ the customer link IS that client's
+  // node link, so a rotation has to change the real x-ui subId (and every row of
+  // the client) or the link he already has would silently stay the old one.
+  const oneClient = groups.length <= 1;
+  const sameClient = oneClient ? members : members.filter((item) => clientKeyOf(item) === clientKeyOf(row));
+  const touchClientRows = (sets, values) => {
+    const sql = `UPDATE configs SET ${sets}, updated_at = ? WHERE id = ?`;
+    for (const item of sameClient) db.prepare(sql).run(...values, Date.now(), Number(item.id));
+  };
 
   if (next.uuid) {
     await xui.setIdentity(row.email, { uuid: next.uuid }, serverOfConfig(row));
-    db.prepare('UPDATE configs SET uuid = ?, updated_at = ? WHERE id = ?').run(next.uuid, Date.now(), row.id);
+    touchClientRows('uuid = ?', [next.uuid]);
     row.uuid = next.uuid;
   }
 
   if (subChanged) {
-    if (siblings.length) {
-      // A package keeps ONE customer-facing subscription URL (served by this
-      // panel), so a rotation only rewrites the group token in the database.
-      db.prepare(
-        'UPDATE configs SET sub_id = ?, updated_at = ? WHERE sub_id = ? AND user_id = ? AND deleted_at = 0'
-      ).run(next.subId, Date.now(), row.sub_id, row.user_id);
-      row.sub_id = next.subId;
-    } else {
-      // A single config still uses the x-ui subscription server directly, so
-      // rotate the real client subId to keep <subBase>/<value> valid.
+    if (oneClient) {
       try {
         await xui.setIdentity(row.email, { subId: next.subId }, serverOfConfig(row));
       } catch (err) {
@@ -1296,10 +1389,19 @@ async function updateIdentity(id, patch = {}, req, viewer) {
           ? err
           : new ApiError(502, 'xui_error', `تغییر شناسه اشتراک ناموفق بود: ${err.message}`);
       }
-      db.prepare('UPDATE configs SET sub_id = ?, xui_sub_id = ?, updated_at = ? WHERE id = ?')
-        .run(next.subId, next.subId, Date.now(), row.id);
+      // Token and client subId stay one value: the node link is built from the
+      // client subId and the panel's aggregated link from the token, and both
+      // must move together so an old link never keeps working half-way.
+      touchClientRows('sub_id = ?, xui_sub_id = ?', [next.subId, next.subId]);
       row.sub_id = next.subId;
       row.xui_sub_id = next.subId;
+    } else {
+      // Several x-ui clients in one package: the only link that can join them is
+      // the one this panel serves for the group token, so rotate the token.
+      db.prepare(
+        'UPDATE configs SET sub_id = ?, updated_at = ? WHERE sub_id = ? AND user_id = ? AND deleted_at = 0'
+      ).run(next.subId, Date.now(), row.sub_id, row.user_id);
+      row.sub_id = next.subId;
     }
   }
   audit(req, 'config.identity', 'config', row.id, { uuid: Boolean(next.uuid), subId: subChanged });
@@ -1345,28 +1447,43 @@ async function attachInbound(row, inbound, req, { free = false } = {}) {
     throw new ApiError(402, 'insufficient_balance', 'موجودی کیف پول کافی نیست / Insufficient wallet balance');
   }
 
-  const email = emailFor(user);
-  const uuid = randomUUID();
-  // Each x-ui client needs its own subId (3.2.5+ rejects duplicates); the group
-  // token in configs.sub_id is what the panel's aggregated sub link exposes.
-  const xuiSubId = randomToken(16);
-  const comment = [row.label, row.customer_name, row.customer_phone].filter(Boolean).join(' | ').slice(0, 120);
-  const createdClient = await xui.addClient(
-    { email, subId: xuiSubId, uuid, flow: '', totalBytes, expiryAt, enabled: Boolean(row.enabled), comment },
-    [Number(inbound.xui_id)],
-    server
-  );
+  // v1.4.18: the new channel joins the customer's EXISTING x-ui client instead of
+  // creating a second one. One client keeps one subscription link on the node's
+  // own subscription server (<sub_base>/<subId>) that already lists every inbound
+  // he has; minting another client would split one customer across two links and
+  // force this panel to aggregate them again — the very thing that moved his
+  // subscription off the node address.
+  const hostRows = members.filter((item) => clientKeyOf(item) === clientKeyOf(row));
+  const host = hostRows.find((item) => item.xui_sub_id) || hostRows[0] || row;
+  const email = String(host.email || '') || emailFor(user);
+  const uuid = String(host.uuid || '') || randomUUID();
+  // A package adopted from another panel carries no group token of ours. Minting
+  // one here keeps the bookkeeping (and the panel's aggregated link) usable as a
+  // fallback, while the customer link itself stays the client's node link below.
+  const groupToken = host.sub_id || randomToken(16);
+  const xuiId = Number(inbound.xui_id);
+  let attachedClient;
+  try {
+    // updateClient() keeps the client's current attachments and adds this one,
+    // and an empty patch writes the live counters back unchanged: the customer's
+    // quota, expiry and UUID on the node are exactly what they were.
+    attachedClient = await xui.updateClient(email, {}, [xuiId], server);
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'xui_client_missing') {
+      throw new ApiError(404, 'xui_client_missing', `اشتراک این مشتری روی پنل نود پیدا نشد / This customer’s subscription is no longer on the node panel: ${email}`);
+    }
+    throw err instanceof ApiError ? err : new ApiError(502, 'xui_error', `افزودن اینباند ناموفق بود: ${err.message}`);
+  }
+  const xuiSubId = String(attachedClient?.subId || host.xui_sub_id || groupToken);
 
-  // A package without a group token — every subscription adopted from another
-  // panel — has no aggregated subscription link at all. Minting one here is what
-  // actually delivers the new inbound to the customer; before, the sibling was
-  // inserted with an empty token and nothing referenced it.
-  const groupToken = row.sub_id || randomToken(16);
   let insertedId = 0;
   try {
     const info = db.transaction(() => {
-      if (!row.sub_id) {
-        db.prepare('UPDATE configs SET sub_id = ?, updated_at = ? WHERE id = ?').run(groupToken, Date.now(), row.id);
+      // Every row of the customer shares the token and the client identity, so
+      // the package has one link, one pool and one UUID.
+      if (host.sub_id !== groupToken || !host.sub_id) {
+        db.prepare('UPDATE configs SET sub_id = ?, updated_at = ? WHERE email = ? AND server_id = ? AND deleted_at = 0')
+          .run(groupToken, Date.now(), host.email, Number(server.id));
         row.sub_id = groupToken;
       }
       return db.prepare(
@@ -1380,7 +1497,7 @@ async function attachInbound(row, inbound, req, { free = false } = {}) {
         email,
         groupToken,
         xuiSubId,
-        String(createdClient?.uuid || uuid),
+        String(attachedClient?.uuid || uuid),
         String(row.label || '').slice(0, 80),
         String(row.customer_name || '').slice(0, 80),
         String(row.customer_phone || '').slice(0, 32),
@@ -1397,10 +1514,13 @@ async function attachInbound(row, inbound, req, { free = false } = {}) {
       chargeReseller(user, amount, `افزودن اینباند ${inbound.remark} به ${row.customer_name || email}`, 'purchase', req);
     }
   } catch (err) {
+    // Undo only what this call added: the channel comes off the client again.
+    // A client this panel did not create is never deleted.
     try {
-      await xui.deleteClient(email, false, server);
+      const keep = (attachedClient?.inboundIds || []).map(Number).filter((id) => id !== xuiId);
+      if (keep.length) await xui.setInbounds(email, keep, server);
     } catch (cleanupErr) {
-      console.error(`[configs] addInbound: cleanup failed for ${email}:`, cleanupErr.message);
+      console.error(`[configs] addInbound: rollback failed for ${email}:`, cleanupErr.message);
     }
     if (insertedId) db.prepare('DELETE FROM configs WHERE id = ?').run(insertedId);
     throw err;
@@ -1436,8 +1556,11 @@ async function addInbound(id, inboundId, req, viewer) {
  * Add the reseller's fixed inbound to every one of their packages that lacks
  * it — the automatic heal the owner asked for when he introduced the fixed
  * inbound, so legacy (adopted) subscriptions get the same guaranteed base as
- * new ones. `dryRun` only counts. Nothing is charged, no existing client is
- * touched, and a package that already carries the base is left alone.
+ * new ones. `dryRun` only counts. Nothing is charged and a package that already
+ * carries the base is left alone. Since v1.4.18 the base is attached to the
+ * customer's OWN x-ui client (attachInbound), so healing keeps a package one
+ * client and its subscription link on the node address instead of minting a
+ * second client and pushing the link behind this panel.
  */
 async function applyFixedInbound(userId, { dryRun = false } = {}, req) {
   const db = getDb();
@@ -1499,6 +1622,141 @@ async function applyFixedInbound(userId, { dryRun = false } = {}, req) {
   return summary;
 }
 
+/**
+ * Merge one package that is spread over MORE THAN ONE x-ui client back onto the
+ * customer's own client.
+ *
+ * A split is what v1.4.16…1.4.17 left behind when an inbound was added to an
+ * adopted package: it minted a second client under the same group token, so the
+ * package stopped being one client and its subscription link moved from the
+ * node's address to this panel's aggregated one. Attaching the extra channels to
+ * the client the customer already uses, and moving the rows onto that client,
+ * gives him one link again — on the node — and the duplicate client this panel
+ * created is removed. A client adopted from another operator is never deleted:
+ * a package that would need that is skipped.
+ *
+ * `dryRun` only reports. Nothing here changes quota, expiry or the UUID.
+ */
+async function consolidatePackage(row, { dryRun = false } = {}, req) {
+  const db = getDb();
+  const members = packageRows(row);
+  const groups = distinctClients(members);
+  if (groups.length < 2) {
+    return {
+      changed: false, reason: 'already-one-client', email: (groups[0] || [])[0]?.email || row.email,
+      clients: groups.length, rows: members.length, moved: 0,
+    };
+  }
+  // The client to keep: an adopted subscription owns the customer's live link and
+  // his counters, so it wins; otherwise the client with the most rows, and on a
+  // tie the oldest row.
+  const rank = (items) => [String(items[0]?.origin || '') === 'external' ? 1 : 0, items.length, -Number(items[0]?.id || 0)];
+  const sorted = [...groups].sort((a, b) => {
+    const left = rank(a);
+    const right = rank(b);
+    for (let i = 0; i < left.length; i += 1) {
+      if (left[i] !== right[i]) return right[i] - left[i];
+    }
+    return 0;
+  });
+  const hostRows = sorted[0];
+  const host = hostRows.find((item) => item.xui_sub_id) || hostRows[0];
+  const extra = sorted.slice(1);
+  const server = serverOfConfig(host);
+  const doomedExternal = extra.find((items) => String(items[0]?.origin || '') === 'external');
+  const info = {
+    changed: true,
+    email: String(host.email || ''),
+    subId: String(host.xui_sub_id || host.sub_id || ''),
+    serverId: Number(server.id || 0),
+    keeps: hostRows.length,
+    moved: extra.flat().length,
+    movedEmails: extra.map((items) => String(items[0]?.email || '')),
+    movesInbounds: extra.flat().map((item) => Number(item.inbound_id)),
+    dryRun: Boolean(dryRun),
+    skipped: Boolean(doomedExternal),
+  };
+  if (doomedExternal) {
+    // Two adopted customers share this group token — merging would delete a
+    // subscription this panel does not own. Leave it to the operator.
+    info.reason = 'several-adopted-clients';
+    info.changed = false;
+    return info;
+  }
+  if (dryRun) return info;
+
+  const xuiIds = [...new Set(extra.flat()
+    .map((item) => Number(getInboundRow(item.inbound_id)?.xui_id || 0))
+    .filter((n) => Number.isFinite(n) && n > 0))];
+  if (xuiIds.length) {
+    // Attach first: the customer's own client covers every channel before the
+    // duplicate one disappears, so there is no moment without a link.
+    await xui.updateClient(host.email, {}, xuiIds, server);
+  }
+  const groupToken = host.sub_id || randomToken(16);
+  if (!host.sub_id) {
+    // A package adopted without a token of ours: mint one and give it to the
+    // client's own rows first, so the merged package is one group again.
+    db.prepare('UPDATE configs SET sub_id = ?, updated_at = ? WHERE email = ? AND server_id = ? AND deleted_at = 0')
+      .run(groupToken, Date.now(), String(host.email || ''), Number(server.id));
+    host.sub_id = groupToken;
+  }
+  for (const items of extra) {
+    for (const item of items) {
+      db.prepare('UPDATE configs SET email = ?, uuid = ?, sub_id = ?, xui_sub_id = ?, updated_at = ? WHERE id = ?')
+        .run(String(host.email || ''), String(host.uuid || ''), groupToken, String(host.xui_sub_id || groupToken), Date.now(), Number(item.id));
+    }
+    try {
+      await xui.deleteClient(String(items[0]?.email || ''), false, server);
+    } catch (err) {
+      console.error(`[configs] consolidate: duplicate client ${items[0]?.email} not removed:`, err.message);
+      info.errors = [...(info.errors || []), `${items[0]?.email}: ${err.message}`];
+    }
+  }
+  audit(req, 'config.consolidate', 'config', Number(row.id), info);
+  return info;
+}
+
+/**
+ * Consolidate every split package of one reseller (or of the whole panel when no
+ * user is given). `dryRun` only counts, so the owner can see what would change
+ * before anything is written to a panel.
+ */
+async function consolidatePackages({ userId = 0, dryRun = false } = {}, req) {
+  const db = getDb();
+  const rows = userId
+    ? db.prepare('SELECT * FROM configs WHERE user_id = ? AND deleted_at = 0 ORDER BY id').all(Number(userId))
+    : db.prepare('SELECT * FROM configs WHERE deleted_at = 0 ORDER BY id').all();
+  const seen = new Set();
+  const summary = { packages: 0, single: 0, split: 0, merged: 0, skipped: 0, dryRun: Boolean(dryRun), details: [], errors: [] };
+  for (const row of rows) {
+    const key = packageKeyOf(row);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    summary.packages += 1;
+    if (isOneClientPackage(row)) {
+      summary.single += 1;
+      continue;
+    }
+    summary.split += 1;
+    try {
+      const info = await consolidatePackage(row, { dryRun }, req);
+      if (info.skipped) summary.skipped += 1;
+      else if (info.changed) summary.merged += 1;
+      // One entry per split package, also for a dry run: the UI has to be able to
+      // say WHY a package was left alone (several adopted clients) before the
+      // operator confirms anything.
+      summary.details.push(info);
+      (info.errors || []).forEach((message) => summary.errors.push(message));
+    } catch (err) {
+      summary.skipped += 1;
+      summary.errors.push(`${row.email}: ${err.message}`);
+    }
+  }
+  if (!dryRun && summary.merged) audit(req, 'config.consolidate_all', 'user', Number(userId || 0), summary);
+  return summary;
+}
+
 async function syncConfigs({ pruneUsageDays } = {}) {
   const db = getDb();
   const started = Date.now();
@@ -1530,12 +1788,18 @@ async function syncConfigs({ pruneUsageDays } = {}) {
   );
   let synced = 0;
   let missing = 0;
-  // Package aggregates are collected during the same pass so the shared pool can
-  // be enforced right after the counters are written.
+  // Traffic history is per x-ui CLIENT. Every row of one client carries the same
+  // counters, so accruing the delta once per row would write the same bytes as
+  // many times as the customer has inbounds and the dashboard traffic chart would
+  // read several times the truth.
+  const accrued = new Set();
   const groups = new Map();
   const tx = db.transaction(() => {
     for (const row of rows) {
       const sid = Number(row.server_id || 0) || (serverList[0] ? Number(serverList[0].id) : 0);
+      const clientKey = `${sid}:${String(row.email || '').toLowerCase()}`;
+      const firstOfClient = !accrued.has(clientKey);
+      if (firstOfClient) accrued.add(clientKey);
       const client = map.get(`${sid}:${String(row.email).toLowerCase()}`);
       if (!client) {
         missing += 1;
@@ -1549,7 +1813,7 @@ async function syncConfigs({ pruneUsageDays } = {}) {
       let deltaDown = down - Number(row.last_down || 0);
       if (deltaUp < 0) deltaUp = 0;
       if (deltaDown < 0) deltaDown = 0;
-      if ((deltaUp > 0 || deltaDown > 0) && dayKey() === today) {
+      if ((deltaUp > 0 || deltaDown > 0) && dayKey() === today && firstOfClient) {
         upsertUsage.run(row.id, row.user_id, today, deltaUp, deltaDown);
       }
       updateConfig.run(up, down, up, down, client.lastOnlineAt || 0,
@@ -1566,9 +1830,9 @@ async function syncConfigs({ pruneUsageDays } = {}) {
       // usage and the shared-pool rule below would switch off a customer who has
       // used a third of his quota. Take the max per client, then sum clients —
       // the mirror of CONFIG_GROUP_USED_SQL.
-      const clientKey = String(row.email || '').toLowerCase() || `id:${row.id}`;
-      const seenTotal = group.perClient.get(clientKey) || 0;
-      if (up + down > seenTotal) group.perClient.set(clientKey, up + down);
+      const poolKey = `${sid}|${String(row.email || '').toLowerCase()}`;
+      const seenTotal = group.perClient.get(poolKey) || 0;
+      if (up + down > seenTotal) group.perClient.set(poolKey, up + down);
       group.members.push({
         id: row.id,
         email: row.email,
@@ -1706,6 +1970,11 @@ module.exports = {
   getConfigRow,
   linksFor,
   subUrlFor,
+  subscriptionsOf,
+  packageClientGroups,
+  isOneClientPackage,
+  consolidatePackage,
+  consolidatePackages,
   extendConfig,
   setQuota,
   toggleConfig,

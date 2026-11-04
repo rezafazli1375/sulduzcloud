@@ -212,6 +212,28 @@ async function updateClient(email, patch, inboundIds, server) {
   return getClient(current.email, server);
 }
 
+/**
+ * Set the exact list of inbounds a client is attached to.
+ *
+ * x-ui's update endpoint takes the attachment list from the ?inboundIds= query
+ * and treats it as the complete set (that is why updateClient() above merges the
+ * current attachments in first, so a quota edit cannot silently drop channels).
+ * Replacing the list is therefore the way to take ONE channel off a customer who
+ * keeps the rest — used when an inbound is removed from a package whose rows all
+ * stand for the same x-ui client.
+ */
+async function setInbounds(email, inboundIds, server) {
+  const current = await getClient(email, server);
+  if (!current) throw new ApiError(404, 'xui_client_missing', 'Client does not exist on the x-ui panel');
+  const ids = [...new Set((inboundIds || []).map(Number))].filter((id) => Number.isFinite(id) && id > 0);
+  if (!ids.length) {
+    throw new ApiError(422, 'inbounds_required', 'A client cannot be left without any inbound');
+  }
+  const body = buildClientPayload(current);
+  await request('POST', `/clients/update/${enc(email)}?inboundIds=${ids.join(',')}`, body, { server });
+  return getClient(email, server);
+}
+
 async function deleteClient(email, keepTraffic = false, server) {
   await request('POST', `/clients/del/${enc(email)}${keepTraffic ? '?keepTraffic=1' : ''}`, undefined, { server });
   return true;
@@ -313,6 +335,7 @@ module.exports = {
   getClient,
   addClient,
   updateClient,
+  setInbounds,
   deleteClient,
   resetTraffic,
   setEnabled,

@@ -229,6 +229,19 @@ router.post('/users/:id/fixed-inbound/apply', auth.requirePerm('users'), asyncH(
   res.json({ ok: true, data: { ...result, dryRun } });
 }));
 
+// Panel v1.4.18: merge the packages of this reseller that are spread over more
+// than one x-ui client back onto the customer's own client. Only such a package
+// needs this panel's aggregated link; a package that is one client is listed by
+// the node's own subscription server, which is where the owner wants his
+// customers' links to live. `dryRun` only counts: the write attaches the extra
+// channels to the client the customer already uses and removes the duplicate
+// client THIS panel created — an adopted client is never deleted.
+router.post('/users/:id/consolidate', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const dryRun = req.body?.dryRun === true || String(req.body?.dryRun) === 'true';
+  const result = await configsService.consolidatePackages({ userId: num(req.params.id), dryRun }, req);
+  res.json({ ok: true, data: { ...result, dryRun } });
+}));
+
 router.post('/users/:id/status', auth.requirePerm('users'), (req, res) => {
   const user = usersService.setStatus(num(req.params.id), String(req.body?.status || ''), req);
   res.json({ ok: true, data: { user: sanitizeUser(user) } });
@@ -433,7 +446,15 @@ router.post('/configs/:id/reset', auth.requirePerm('configs'), asyncH(async (req
 
 router.delete('/configs/:id', auth.requirePerm('configs'), asyncH(async (req, res) => {
   const result = await configsService.removeConfig(num(req.params.id), {}, req, { role: 'admin' });
-  res.json({ ok: true, data: { deleted: true, detachedOnly: Boolean(result.detachedOnly) } });
+  res.json({
+    ok: true,
+    data: {
+      deleted: true,
+      detachedOnly: Boolean(result.detachedOnly),
+      inboundDetached: Boolean(result.inboundDetached),
+      keptInbounds: Number(result.keptInbounds || 0),
+    },
+  });
 }));
 
 // ---------------------------------------------------------------- inbounds

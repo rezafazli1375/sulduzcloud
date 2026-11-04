@@ -215,7 +215,18 @@ router.post('/configs/:id/reset', asyncH(async (req, res) => {
 
 router.delete('/configs/:id', asyncH(async (req, res) => {
   const result = await configsService.removeConfig(num(req.params.id), {}, req, req.user);
-  res.json({ ok: true, data: { deleted: true, detachedOnly: Boolean(result.detachedOnly) } });
+  // detachedOnly  — an adopted row: nothing was written to the other panel.
+  // inboundDetached — the channel came off the customer's own x-ui client and he
+  // stays connected through his other inbounds; the UI has to say so.
+  res.json({
+    ok: true,
+    data: {
+      deleted: true,
+      detachedOnly: Boolean(result.detachedOnly),
+      inboundDetached: Boolean(result.inboundDetached),
+      keptInbounds: Number(result.keptInbounds || 0),
+    },
+  });
 }));
 
 router.get('/stats', (req, res) => {

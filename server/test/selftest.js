@@ -728,6 +728,18 @@ function startMockXui(inboundRows) {
       adoptedInfo.includes('upload=11') && adoptedInfo.includes('download=22')
         && adoptedInfo.includes(`total=${5 * TG_GB}`),
       `header=${adoptedInfo}`);
+    // v1.4.18: this customer IS one x-ui client, and a client's subscription
+    // lives on the node's own subscription server (<sub_base>/<subId>), which
+    // already lists every inbound he is attached to. The panel must not insert
+    // its own address between the customer and the node.
+    const adoptedLinkCall = await request('GET', `/api/admin/configs/${adoptedRows?.[0]?.id}/links`, { cookies });
+    const adoptedSubs = adoptedLinkCall.json?.data?.subscriptions || {};
+    check('an adopted one-client package is handed the node subscription address',
+      adoptedLinkCall.status === 200
+        && String(adoptedLinkCall.json?.data?.subUrl || '') === 'https://sub.example.com/sub/tg-sub-1'
+        && Number(adoptedSubs.clientCount) === 1 && adoptedSubs.source === 'node'
+        && Number(adoptedSubs.node?.[0]?.inboundCount) === 2,
+      `subUrl=${adoptedLinkCall.json?.data?.subUrl} clients=${adoptedSubs.clientCount} inbounds=${adoptedSubs.node?.[0]?.inboundCount}`);
     const tgDetail = await request('GET', `/api/admin/users/${tgUserId}`, { cookies });
     const tgEmails = (tgDetail.json?.data?.configs?.rows || []).map((row) => row.email);
     check(
@@ -959,16 +971,22 @@ function startMockXui(inboundRows) {
       Boolean(groupToken) && multiConfigs.every((config) => config.subId === groupToken),
       `tokens=${multiConfigs.map((config) => config.subId).join(',')}`
     );
-    const mockSubIds = multiConfigs.map((config) => mockXui.clients.get(config.email)?.subId || '');
-    check(
-      'every x-ui client carries its own subId',
-      mockSubIds.length === 3 && mockSubIds.every(Boolean) && new Set(mockSubIds).size === 3,
-      `subIds=${mockSubIds.join(',')}`
-    );
+    // v1.4.18: the whole order is ONE x-ui client attached to every inbound it
+    // bought — the same shape a subscription adopted from another panel has. One
+    // client means the customer's link stays on the node's own subscription
+    // server, which already lists all of his inbounds, instead of moving behind
+    // this panel.
+    const orderClient = mockXui.clients.get(multiConfigs[0].email);
+    check('a multi-inbound order is one x-ui client attached to every inbound',
+      multiConfigs.every((config) => config.email === multiConfigs[0].email)
+      && multiConfigs.every((config) => config.uuid === multiConfigs[0].uuid)
+      && [...new Set(multiConfigs.map((config) => config.subId))].length === 1
+      && (orderClient?.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,902,903',
+      `attached=${(orderClient?.inboundIds || []).join(',')} emails=${new Set(multiConfigs.map((config) => config.email)).size}`);
     const subFeed = await request('GET', `/api/sub/${groupToken}`);
     const decoded = Buffer.from(String(subFeed?.raw || ''), 'base64').toString('utf8').split('\n').filter(Boolean);
     check(
-      'the panel serves one aggregated subscription for the package',
+      'the panel still serves one subscription for the package',
       subFeed.status === 200
         && decoded.length === 3
         && decoded.every((link) => link.startsWith('vless://')),
@@ -976,10 +994,15 @@ function startMockXui(inboundRows) {
     );
     const multiLinks = await request('GET', `/api/reseller/configs/${multiConfigs[0]?.id}/links`, { cookies: shopCookies });
     check(
-      'the package subscription URL points at the panel',
-      multiLinks.status === 200 && String(multiLinks.json?.data?.subUrl || '') === `http://127.0.0.1/api/sub/${groupToken}`,
+      'a one-client package is handed the node subscription address',
+      multiLinks.status === 200 && String(multiLinks.json?.data?.subUrl || '') === `https://sub.example.com/sub/${groupToken}`,
       `subUrl=${multiLinks.json?.data?.subUrl}`
     );
+    const subsPayload = multiLinks.json?.data?.subscriptions || {};
+    check('the subscription box reports one client on the node',
+      Number(subsPayload.clientCount) === 1 && subsPayload.source === 'node'
+      && (subsPayload.node || []).length === 1 && Number(subsPayload.node[0]?.inboundCount || 0) === 3,
+      `clients=${subsPayload.clientCount} source=${subsPayload.source} node=${(subsPayload.node || []).length}`);
     // Listing packages must paginate customers, not individual x-ui clients.
     const customerSearch = encodeURIComponent('مشتری چند اینباند');
     const groupedList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
@@ -994,9 +1017,10 @@ function startMockXui(inboundRows) {
       packageRow.totalBytes === 10 * 1024 ** 3
       && packageRow.used === 0
       && packageRow.inbounds?.every((item) => item.totalBytes === 10 * 1024 ** 3));
-    // The entered GB is one pool for the whole package: usage is summed over
-    // every inbound, the subscription advertises that single number, and the
-    // package is cut off only when the combined usage fills the pool.
+    // The entered GB is one pool for the whole package. Since v1.4.18 the package
+    // is ONE x-ui client, so his own counters are the package usage — and because
+    // every row repeats those counters, taking them per row would multiply the
+    // customer's traffic by his inbound count.
     const gbUnit = 1024 ** 3;
     const bumpClient = (config, up, down) => {
       const client = mockXui.clients.get(config.email);
@@ -1004,26 +1028,25 @@ function startMockXui(inboundRows) {
       client.down = down;
     };
     bumpClient(multiConfigs[0], 2 * gbUnit, 2 * gbUnit);
-    bumpClient(multiConfigs[1], 1.5 * gbUnit, 1.5 * gbUnit);
     const poolSync = await request('POST', '/api/admin/sync', { cookies, csrf });
     const pooledList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
     const pooledRow = pooledList.json?.data?.rows?.[0] || {};
-    check('shared pool sums usage across every inbound of the package',
+    check('one client’s counters are counted once for the whole package',
       poolSync.status === 200
-      && pooledRow.used === 7 * gbUnit
+      && pooledRow.used === 4 * gbUnit
       && pooledRow.totalBytes === 10 * gbUnit
-      && pooledRow.remaining === 3 * gbUnit
+      && pooledRow.remaining === 6 * gbUnit
       && pooledRow.status === 'active',
       `used=${pooledRow.used} remaining=${pooledRow.remaining} status=${pooledRow.status}`);
     const pooledSub = await request('GET', `/api/sub/${groupToken}`);
     const subInfo = String(pooledSub.headers['subscription-userinfo'] || '');
     check('the subscription advertises the shared pool to client apps',
       pooledSub.status === 200
-      && subInfo.includes(`upload=${3.5 * gbUnit}`)
-      && subInfo.includes(`download=${3.5 * gbUnit}`)
+      && subInfo.includes(`upload=${2 * gbUnit}`)
+      && subInfo.includes(`download=${2 * gbUnit}`)
       && subInfo.includes(`total=${10 * gbUnit}`),
       `header=${subInfo}`);
-    bumpClient(multiConfigs[2], 3 * gbUnit, 0);
+    bumpClient(multiConfigs[2], 6 * gbUnit, 4 * gbUnit);
     const drainedSync = await request('POST', '/api/admin/sync', { cookies, csrf });
     const drainedList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
     const drainedRow = drainedList.json?.data?.rows?.[0] || {};
@@ -1033,7 +1056,7 @@ function startMockXui(inboundRows) {
       && drainedRow.status === 'depleted',
       `used=${drainedRow.used} status=${drainedRow.status}`);
     check('every inbound of the package is disabled once the pool runs out',
-      multiConfigs.every((config) => mockXui.clients.get(config.email)?.enable === false));
+      mockXui.clients.get(multiConfigs[0].email)?.enable === false);
     const resetPool = await request('POST', `/api/reseller/configs/${multiConfigs[0].id}/reset`, {
       cookies: shopCookies, csrf: shopCsrf,
     });
@@ -1044,8 +1067,8 @@ function startMockXui(inboundRows) {
       resetPool.status === 200
       && resetRow.used === 0
       && resetRow.status === 'active'
-      && multiConfigs.every((config) => mockXui.clients.get(config.email)?.enable !== false),
-      `status=${resetRow.status} enabled=${multiConfigs.map((config) => mockXui.clients.get(config.email)?.enable).join(',')}`);
+      && mockXui.clients.get(multiConfigs[0].email)?.enable !== false,
+      `status=${resetRow.status} enabled=${mockXui.clients.get(multiConfigs[0].email)?.enable}`);
     const quotaOnce = await request('POST', `/api/admin/configs/${multiConfigs[1].id}/quota`, {
       cookies, csrf, body: { gb: 20 },
     });
@@ -1090,6 +1113,79 @@ function startMockXui(inboundRows) {
       rotated.status === 200 && newFeed.status === 200 && oldFeed.status === 404,
       `rotate=${rotated.status} old=${oldFeed.status} new=${newFeed.status}`
     );
+    // Rotating a one-client package rewrites the REAL x-ui subId as well, so the
+    // node address the customer already holds keeps working on the node.
+    check('rotating a one-client package also moves the client’s subId on the node',
+      mockXui.clients.get(String(multiConfigs[0].email))?.subId === 'packagerotated1',
+      `subId=${mockXui.clients.get(String(multiConfigs[0].email))?.subId}`);
+
+    // ------------------------------------------------- v1.4.18: one client per package
+    // The owner's complaint: the subscription link was served by this panel
+    // instead of the node. A package is now ONE x-ui client holding every
+    // inbound he bought, so an added channel joins that client (no second
+    // client, no aggregated link) and taking one channel off keeps the rest.
+    const joinOrderEmail = String(multiConfigs[0].email);
+    const clientsBeforeJoin = mockXui.clients.size;
+    const beforeJoinClient = mockXui.clients.get(joinOrderEmail);
+    const joinFeed = await request('POST', `/api/reseller/configs/${multiConfigs[0].id}/inbounds`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { inboundId: 904 },
+    });
+    const joinedConfig = joinFeed.json?.data?.config || {};
+    const joinedClient = mockXui.clients.get(joinOrderEmail);
+    check('a fourth inbound joins the customer’s own x-ui client instead of a new one',
+      joinFeed.status === 201 && mockXui.clients.size === clientsBeforeJoin
+        && String(joinedConfig.email) === joinOrderEmail
+        && (joinedClient?.inboundIds || []).map(Number).sort().join(',') === '901,902,903,904',
+      `status=${joinFeed.status} clients=${mockXui.clients.size} attached=${(joinedClient?.inboundIds || []).join(',')} email=${joinedConfig.email}`);
+    const joinedQuota = mockXui.clients.get(joinOrderEmail);
+    check('joining a channel leaves the pool, the expiry and the counters alone',
+      Number(joinedQuota?.totalGB) === Number(beforeJoinClient?.totalGB)
+        && Number(joinedQuota?.expiryTime) === Number(beforeJoinClient?.expiryTime)
+        && String(joinedQuota?.id || '') === String(beforeJoinClient?.id || '')
+        && Number(joinedQuota?.up) === Number(beforeJoinClient?.up)
+        && Number(joinedQuota?.down) === Number(beforeJoinClient?.down)
+        && joinedQuota?.enable !== false,
+      `total=${joinedQuota?.totalGB} up=${joinedQuota?.up} down=${joinedQuota?.down} uuid=${joinedQuota?.id}`);
+    const joinLinks = await request('GET', `/api/reseller/configs/${multiConfigs[0].id}/links`, { cookies: shopCookies });
+    const joinSubs = joinLinks.json?.data?.subscriptions || {};
+    check('the four-channel package is still one client, so its link is the node address',
+      joinLinks.status === 200 && Number(joinSubs.clientCount) === 1 && joinSubs.source === 'node'
+        && Number(joinSubs.node?.[0]?.inboundCount) === 4
+        && String(joinLinks.json?.data?.subUrl || '') === 'https://sub.example.com/sub/packagerotated1',
+      `subUrl=${joinLinks.json?.data?.subUrl} clients=${joinSubs.clientCount} inbounds=${joinSubs.node?.[0]?.inboundCount}`);
+    const dropJoined = await request('DELETE', `/api/reseller/configs/${joinedConfig.id}`, {
+      cookies: shopCookies, csrf: shopCsrf,
+    });
+    const afterDropClient = mockXui.clients.get(joinOrderEmail);
+    check('taking one channel off detaches that inbound and keeps the customer connected',
+      dropJoined.status === 200 && dropJoined.json?.data?.inboundDetached === true
+        && dropJoined.json?.data?.detachedOnly === false && mockXui.clients.has(joinOrderEmail)
+        && (afterDropClient?.inboundIds || []).map(Number).sort().join(',') === '901,902,903',
+      `status=${dropJoined.status} detached=${dropJoined.json?.data?.inboundDetached} attached=${(afterDropClient?.inboundIds || []).join(',')}`);
+
+    // A throwaway package of its own proves the other half: the last channel of a
+    // customer is his client, so removing it has to remove the client (that is
+    // what cuts the connection off, which is exactly what the owner wants).
+    const dropOrder = await request('POST', '/api/reseller/configs', {
+      cookies: shopCookies, csrf: shopCsrf,
+      body: { inboundIds: [901, 902], gb: 2, days: 5, customerName: 'مشتری حذف تدریجی' },
+    });
+    const dropRows = dropOrder.json?.data?.configs || [];
+    const dropEmail = String(dropRows[0]?.email || '');
+    const dropFirst = await request('DELETE', `/api/reseller/configs/${dropRows[1]?.id}`, {
+      cookies: shopCookies, csrf: shopCsrf,
+    });
+    check('removing one of two channels keeps the client with the remaining inbound',
+      dropOrder.status === 201 && dropFirst.status === 200 && mockXui.clients.has(dropEmail)
+        && (mockXui.clients.get(dropEmail)?.inboundIds || []).map(Number).join(',') === '901',
+      `status=${dropFirst.status} attached=${(mockXui.clients.get(dropEmail)?.inboundIds || []).join(',')}`);
+    const dropSecond = await request('DELETE', `/api/reseller/configs/${dropRows[0]?.id}`, {
+      cookies: shopCookies, csrf: shopCsrf,
+    });
+    check('removing the last channel of the package removes his x-ui client',
+      dropSecond.status === 200 && dropSecond.json?.data?.inboundDetached === false
+        && mockXui.clients.has(dropEmail) === false,
+      `status=${dropSecond.status} still=${mockXui.clients.has(dropEmail)}`);
 
 
     // ------------------------------------------------------------------- misc
@@ -1344,14 +1440,28 @@ function startMockXui(inboundRows) {
 
     const fixedDb = new Database(path.join(DATA_DIR, 'panel.db'));
     const fixedRowIds = [];
+    const fixedMockEmails = [];
     try {
+      // An adopted subscription is ONE live x-ui client attached to the inbounds
+      // the customer bought, kept locally as one row per inbound. Since v1.4.18
+      // the panel talks to that client (it adds a channel to it instead of
+      // minting a second one), so the fake panel has to hold it too — otherwise
+      // the fixture would be a row with no client behind it, which never happens
+      // on a real node.
       const addLegacy = (inboundId, label) => {
+        const email = `legacy-${crypto.randomBytes(8).toString('hex')}`;
         const info = fixedDb.prepare(`INSERT INTO configs
-          (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, label, customer_name,
-           total_bytes, expiry_at, enabled, status, origin, created_at, updated_at)
-          VALUES (?, ?, ?, ?, '', '', ?, 'مشتری قدیمی', ?, ?, 1, 'active', 'external', ?, ?)`)
-          .run(fixedShopId, primaryId, inboundId, `legacy-${crypto.randomBytes(8).toString('hex')}`,
-            label, 3 * 1024 ** 3, Date.now() + 30 * 86400000, Date.now(), Date.now());
+          (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, uuid, label, customer_name,
+           total_bytes, expiry_at, enabled, status, origin, up_bytes, down_bytes, created_at, updated_at)
+          VALUES (?, ?, ?, ?, '', ?, ?, ?, 'مشتری قدیمی', ?, ?, 1, 'active', 'external', 7, 8, ?, ?)`)
+          .run(fixedShopId, primaryId, inboundId, email, `${label}-sub`, crypto.randomUUID(), label,
+            3 * 1024 ** 3, Date.now() + 30 * 86400000, Date.now(), Date.now());
+        mockXui.clients.set(email, {
+          email, id: `${label}-uuid`, subId: `${label}-sub`, security: 'auto',
+          totalGB: 3 * 1024 ** 3, expiryTime: Date.now() + 30 * 86400000, enable: true,
+          up: 7, down: 8, inboundIds: [inboundId],
+        });
+        fixedMockEmails.push(email);
         const id = Number(info.lastInsertRowid);
         fixedRowIds.push(id);
         return id;
@@ -1480,6 +1590,25 @@ function startMockXui(inboundRows) {
         && Number(fixedMember.expiryAt) > Date.now(),
         `bytes=${fixedMember.totalBytes}`);
 
+      // v1.4.18: the heal added the channel to the customer's OWN client, so the
+      // package is still one client and his subscription link stays on the node —
+      // this is the exact case that used to push legacy configs behind the panel.
+      const legacyAEmail = String(fixedDb.prepare('SELECT email FROM configs WHERE id = ?').get(legacyA).email);
+      const healedClient = mockXui.clients.get(legacyAEmail);
+      const healedLinks = await request('GET', `/api/admin/configs/${legacyA}`, { cookies });
+      const healedSubs = healedLinks.json?.data?.subscriptions || {};
+      const healedAttached = (healedClient?.inboundIds || []).map(Number).sort((a, b) => a - b);
+      // 904 stays attached on the fake panel: the row that held it was adopted,
+      // and detaching an adopted row never writes to the seller's panel.
+      check('healing attaches the fixed inbound to the live client of the adopted customer',
+        healedClient && healedAttached.includes(901) && healedAttached.includes(902),
+        `email=${legacyAEmail} attached=${healedAttached.join(',')}`);
+      check('the healed adopted package is still one client, so its link stays on the node',
+        healedLinks.status === 200 && Number(healedSubs.clientCount) === 1 && healedSubs.source === 'node'
+        && Number(healedSubs.node?.[0]?.inboundCount) === 2
+        && String(healedLinks.json?.data?.subUrl || '') === 'https://sub.example.com/sub/legacy-a-sub',
+        `subUrl=${healedLinks.json?.data?.subUrl} clients=${healedSubs.clientCount} inbounds=${healedSubs.node?.[0]?.inboundCount}`);
+
       const dropFixed = await request('DELETE', `/api/admin/configs/${fixedMember.id}`, { cookies, csrf });
       check('the fixed inbound cannot be taken off a multi-inbound package',
         dropFixed.status === 409 && dropFixed.json?.error?.code === 'fixed_inbound_locked',
@@ -1540,7 +1669,140 @@ function startMockXui(inboundRows) {
     } finally {
       for (const id of fixedRowIds) fixedDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
       fixedDb.prepare('DELETE FROM configs WHERE user_id = ?').run(fixedShopId);
+      for (const email of fixedMockEmails) mockXui.clients.delete(email);
       fixedDb.close();
+    }
+
+    // ------------------------------------------------ v1.4.18: merged packages
+    // What v1.4.16–1.4.17 left on the live panel: adding a channel to an existing
+    // package minted a SECOND x-ui client under the same group token, so that
+    // package stopped being one client and its subscription link slid from the
+    // node's address to this panel's aggregated one. Consolidation puts every
+    // channel back on the client the customer already uses and deletes only the
+    // duplicate client this panel created — never an adopted one.
+    const MERGE_GB = 1024 ** 3;
+    const splitToken = `split${crypto.randomBytes(8).toString('hex')}`;
+    const hostEmail = `merge-host-${crypto.randomBytes(6).toString('hex')}`;
+    const dupEmail = `merge-dup-${crypto.randomBytes(6).toString('hex')}`;
+    const extToken = `ext${crypto.randomBytes(8).toString('hex')}`;
+    const extEmailA = `merge-ext-a-${crypto.randomBytes(6).toString('hex')}`;
+    const extEmailB = `merge-ext-b-${crypto.randomBytes(6).toString('hex')}`;
+    const splitDb = new Database(path.join(DATA_DIR, 'panel.db'));
+    const splitRowIds = [];
+    const addSplitRow = ({ email, inboundId, token, xuiSubId, origin }) => {
+      const info = splitDb.prepare(`INSERT INTO configs
+        (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, uuid, label, customer_name,
+         total_bytes, expiry_at, enabled, status, origin, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'بسته دونیم', 'مشتری یکپارچه', ?, ?, 1, 'active', ?, ?, ?)`)
+        .run(fixedShopId, primaryId, inboundId, email, token, xuiSubId, crypto.randomUUID(),
+          10 * MERGE_GB, Date.now() + 30 * 86400000, origin, Date.now(), Date.now());
+      const id = Number(info.lastInsertRowid);
+      splitRowIds.push(id);
+      return id;
+    };
+    const addSplitClient = (email, subId, inboundIds) => {
+      mockXui.clients.set(email, {
+        email, id: crypto.randomUUID(), subId, security: 'auto',
+        totalGB: 10 * MERGE_GB, expiryTime: Date.now() + 30 * 86400000, enable: true,
+        up: 0, down: 0, inboundIds,
+      });
+    };
+    try {
+      const hostRow = addSplitRow({ email: hostEmail, inboundId: 901, token: splitToken, xuiSubId: splitToken, origin: 'panel' });
+      const dupRow = addSplitRow({ email: dupEmail, inboundId: 903, token: splitToken, xuiSubId: `private-${dupEmail}`, origin: 'panel' });
+      addSplitClient(hostEmail, splitToken, [901]);
+      addSplitClient(dupEmail, `private-${dupEmail}`, [903]);
+
+      const splitLinks = await request('GET', `/api/admin/configs/${hostRow}/links`, { cookies });
+      const splitSubs = splitLinks.json?.data?.subscriptions || {};
+      check('a package held by two x-ui clients is served by the panel’s aggregated link',
+        splitLinks.status === 200 && Number(splitSubs.clientCount) === 2 && splitSubs.source === 'panel'
+        && String(splitLinks.json?.data?.subUrl || '') === `http://127.0.0.1/api/sub/${splitToken}`,
+        `subUrl=${splitLinks.json?.data?.subUrl} clients=${splitSubs.clientCount} source=${splitSubs.source}`);
+      check('every client of a split package keeps its own node link in the drawer',
+        Number(splitSubs.node?.length) === 2
+        && (splitSubs.node || []).every((item) => String(item.url || '').startsWith('https://sub.example.com/sub/')),
+        `node=${JSON.stringify((splitSubs.node || []).map((item) => item.url))}`);
+
+      const clientsBeforeMerge = mockXui.clients.size;
+      const mergeDry = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
+        cookies, csrf, body: { dryRun: true },
+      });
+      const dryInfo = (mergeDry.json?.data?.details || []).find((item) => item.email === hostEmail) || {};
+      check('the dry run reports the split without writing anything to x-ui',
+        mergeDry.status === 200 && Number(mergeDry.json?.data?.packages) === 1
+        && Number(mergeDry.json?.data?.split) === 1 && Number(mergeDry.json?.data?.merged) === 1
+        && Number(dryInfo.moved) === 1 && dryInfo.dryRun === true
+        && mockXui.clients.size === clientsBeforeMerge
+        && String(splitDb.prepare('SELECT email FROM configs WHERE id = ?').get(dupRow).email) === dupEmail,
+        `status=${mergeDry.status} packages=${mergeDry.json?.data?.packages} split=${mergeDry.json?.data?.split} clients=${mockXui.clients.size} host=${dryInfo.email} moved=${dryInfo.moved}`);
+
+      const hostClientBefore = mockXui.clients.get(hostEmail) || {};
+      const mergeRun = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      const dupRowAfter = splitDb.prepare('SELECT * FROM configs WHERE id = ?').get(dupRow);
+      const mergedClient = mockXui.clients.get(hostEmail) || {};
+      check('consolidating moves the extra channel onto the customer’s own client',
+        mergeRun.status === 200 && Number(mergeRun.json?.data?.merged) === 1
+        && Number(mergeRun.json?.data?.split) === 1
+        && mockXui.clients.has(dupEmail) === false && mockXui.clients.has(hostEmail) === true
+        && (mergedClient.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,903'
+        && String(dupRowAfter?.email || '') === hostEmail && String(dupRowAfter?.sub_id || '') === splitToken
+        && String(dupRowAfter?.xui_sub_id || '') === splitToken,
+        `status=${mergeRun.status} merged=${mergeRun.json?.data?.merged} dup=${mockXui.clients.has(dupEmail)} attached=${(mergedClient.inboundIds || []).join(',')} row=${dupRowAfter?.email}/${dupRowAfter?.sub_id}`);
+      check('the merge leaves the surviving client’s pool, expiry and identity alone',
+        Number(mergedClient.totalGB) === Number(hostClientBefore.totalGB)
+        && Number(mergedClient.expiryTime) === Number(hostClientBefore.expiryTime)
+        && String(mergedClient.subId) === splitToken
+        && (mergeRun.json?.data?.errors || []).length === 0,
+        `total=${mergedClient.totalGB} expiry=${mergedClient.expiryTime} subId=${mergedClient.subId} errors=${JSON.stringify(mergeRun.json?.data?.errors || [])}`);
+      const mergedLinks = await request('GET', `/api/admin/configs/${hostRow}/links`, { cookies });
+      const mergedSubs = mergedLinks.json?.data?.subscriptions || {};
+      check('after the merge the customer’s link is the node address again',
+        Number(mergedSubs.clientCount) === 1 && mergedSubs.source === 'node'
+        && Number(mergedSubs.node?.[0]?.inboundCount) === 2 && mergedSubs.aggregated === ''
+        && String(mergedLinks.json?.data?.subUrl || '') === `https://sub.example.com/sub/${splitToken}`,
+        `subUrl=${mergedLinks.json?.data?.subUrl} clients=${mergedSubs.clientCount} inbounds=${mergedSubs.node?.[0]?.inboundCount}`);
+
+      // Two adopted clients under one token are two different customers' live
+      // subscriptions: merging would delete one of them, so the pass only reports.
+      const extRowA = addSplitRow({ email: extEmailA, inboundId: 901, token: extToken, xuiSubId: `${extEmailA}-sub`, origin: 'external' });
+      addSplitRow({ email: extEmailB, inboundId: 902, token: extToken, xuiSubId: `${extEmailB}-sub`, origin: 'external' });
+      addSplitClient(extEmailA, `${extEmailA}-sub`, [901]);
+      addSplitClient(extEmailB, `${extEmailB}-sub`, [902]);
+      const extDry = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
+        cookies, csrf, body: { dryRun: true },
+      });
+      const extInfo = (extDry.json?.data?.details || []).find((item) => item.email === extEmailA) || {};
+      check('a package whose second client belongs to another operator is reported, not touched',
+        Number(extDry.json?.data?.packages) === 2 && Number(extDry.json?.data?.single) === 1
+        && Number(extDry.json?.data?.split) === 1 && Number(extDry.json?.data?.merged) === 0
+        && Number(extDry.json?.data?.skipped) === 1 && extInfo.reason === 'several-adopted-clients'
+        && extInfo.skipped === true && mockXui.clients.has(extEmailA) && mockXui.clients.has(extEmailB),
+        `packages=${extDry.json?.data?.packages} merged=${extDry.json?.data?.merged} skipped=${extDry.json?.data?.skipped} reason=${extInfo.reason}`);
+      const extRun = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      check('running the pass keeps every adopted client and its rows exactly where they are',
+        Number(extRun.json?.data?.merged) === 0 && Number(extRun.json?.data?.skipped) === 1
+        && mockXui.clients.has(extEmailA) === true && mockXui.clients.has(extEmailB) === true
+        && String(splitDb.prepare('SELECT email FROM configs WHERE id = ?').get(extRowA).email) === extEmailA,
+        `merged=${extRun.json?.data?.merged} skipped=${extRun.json?.data?.skipped} clients=${mockXui.clients.has(extEmailA)}/${mockXui.clients.has(extEmailB)}`);
+
+      // Nothing left to do: a second pass over the same reseller is a no-op.
+      const mergeAgain = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      check('a second pass changes nothing — the split packages are already one client each',
+        mergeAgain.status === 200 && Number(mergeAgain.json?.data?.split) === 1
+        && Number(mergeAgain.json?.data?.merged) === 0 && Number(mergeAgain.json?.data?.skipped) === 1
+        && Number(mergeAgain.json?.data?.single) === 1,
+        `split=${mergeAgain.json?.data?.split} merged=${mergeAgain.json?.data?.merged} skipped=${mergeAgain.json?.data?.skipped}`);
+    } finally {
+      for (const id of splitRowIds) splitDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      for (const email of [hostEmail, dupEmail, extEmailA, extEmailB]) mockXui.clients.delete(email);
+      splitDb.close();
     }
 
     const v1Bad = await request('GET', '/api/v1/me', { headers: { 'x-api-key': 'sc_invalid' } });
