@@ -164,6 +164,34 @@ function validateUserPayload(data, { partial = false } = {}) {
     const arr = Array.isArray(data.allowed_inbounds) ? data.allowed_inbounds : safeJsonParse(data.allowed_inbounds, []);
     out.allowed_inbounds = JSON.stringify(arr.map(Number).filter((n) => Number.isFinite(n)));
   }
+  // Panel v1.4.16: one inbound is the FIXED base of this reseller's packages.
+  // 0 = "no fixed inbound" (keeps the old free-for-all behaviour); otherwise it
+  // must be an inbound the panel actually knows about and that is still enabled,
+  // because a locked inbound that cannot accept clients would break every
+  // package it belongs to.
+  const fixedRaw = data.fixed_inbound ?? data.fixedInbound;
+  if (fixedRaw !== undefined) {
+    const fixedId = Number(fixedRaw || 0);
+    if (!Number.isInteger(fixedId) || fixedId < 0) {
+      throw new ApiError(422, 'invalid_fixed_inbound', 'اینباند ثابت نامعتبر است / Invalid fixed inbound');
+    }
+    if (fixedId > 0) {
+      const inbound = getDb().prepare('SELECT id, enabled, remark FROM inbounds WHERE id = ?').get(fixedId);
+      if (!inbound) throw new ApiError(422, 'invalid_fixed_inbound', 'این اینباند در پنل وجود ندارد / Fixed inbound not found');
+      if (!inbound.enabled) {
+        throw new ApiError(422, 'fixed_inbound_disabled', `اینباند «${inbound.remark}» غیرفعال است / The fixed inbound is disabled`);
+      }
+    }
+    out.fixed_inbound = fixedId;
+  }
+  // The fixed inbound is always usable: silently add it to a non-empty allow
+  // list so the create form can pre-select it without the admin ticking twice.
+  if (out.fixed_inbound > 0 && out.allowed_inbounds !== undefined) {
+    const ids = safeJsonParse(out.allowed_inbounds, []);
+    if (ids.length && !ids.includes(out.fixed_inbound)) {
+      out.allowed_inbounds = JSON.stringify([...ids, out.fixed_inbound]);
+    }
+  }
   return out;
 }
 
@@ -177,7 +205,7 @@ function reviveUser(id, clean, req) {
     `UPDATE users SET
        username = ?, password_hash = ?, role = ?, name = ?, email = ?, phone = ?, telegram_id = ?, import_configs = ?,
        status = ?, lang = ?, permissions = ?, max_configs = ?, max_total_gb = ?, max_gb_per_config = ?,
-       max_days_per_config = ?, allowed_inbounds = ?, balance = ?, note = ?,
+       max_days_per_config = ?, allowed_inbounds = ?, fixed_inbound = ?, balance = ?, note = ?,
        deleted_at = 0, token_version = token_version + 1, updated_at = ?
      WHERE id = ?`
   ).run(
@@ -199,6 +227,7 @@ function reviveUser(id, clean, req) {
     keep('max_gb_per_config', previous.max_gb_per_config),
     keep('max_days_per_config', previous.max_days_per_config),
     keep('allowed_inbounds', previous.allowed_inbounds || '[]'),
+    keep('fixed_inbound', Number(previous.fixed_inbound || 0)),
     keep('balance', previous.balance),
     keep('note', previous.note),
     now,
@@ -230,9 +259,9 @@ function createUser(data, req) {
   const now = Date.now();
   const info = db.prepare(
     `INSERT INTO users (username, password_hash, role, name, email, phone, telegram_id, import_configs, status, lang, permissions,
-      max_configs, max_total_gb, max_gb_per_config, max_days_per_config, allowed_inbounds,
+      max_configs, max_total_gb, max_gb_per_config, max_days_per_config, allowed_inbounds, fixed_inbound,
       balance, api_key, note, token_version, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   ).run(
     clean.username,
     hashPassword(clean.password),
@@ -250,6 +279,7 @@ function createUser(data, req) {
     Number(clean.max_gb_per_config || 0),
     Number(clean.max_days_per_config || 0),
     clean.allowed_inbounds || '[]',
+    Number(clean.fixed_inbound || 0),
     Number(clean.balance || 0),
     null,
     clean.note || '',
@@ -295,7 +325,27 @@ function updateUser(id, data, req) {
   for (const key of ['max_configs', 'max_total_gb', 'max_gb_per_config', 'max_days_per_config', 'balance']) {
     if (clean[key] !== undefined) assign(key, clean[key]);
   }
-  if (clean.allowed_inbounds !== undefined) assign('allowed_inbounds', clean.allowed_inbounds);
+  // The fixed inbound is the guaranteed base of this reseller's packages, so it
+  // must never end up outside an explicit allow list — whichever half of the
+  // pair the admin edited. An empty list means "everything visible" anyway.
+  const effectiveFixed = clean.fixed_inbound !== undefined
+    ? Number(clean.fixed_inbound || 0)
+    : Number(current.fixed_inbound || 0);
+  if (clean.allowed_inbounds !== undefined) {
+    const ids = safeJsonParse(clean.allowed_inbounds, []);
+    assign('allowed_inbounds', effectiveFixed > 0 && ids.length && !ids.includes(effectiveFixed)
+      ? JSON.stringify([...ids, effectiveFixed])
+      : clean.allowed_inbounds);
+  }
+  if (clean.fixed_inbound !== undefined) {
+    assign('fixed_inbound', clean.fixed_inbound);
+    if (effectiveFixed > 0 && clean.allowed_inbounds === undefined) {
+      const currentIds = safeJsonParse(current.allowed_inbounds, []);
+      if (currentIds.length && !currentIds.includes(effectiveFixed)) {
+        assign('allowed_inbounds', JSON.stringify([...currentIds, effectiveFixed]));
+      }
+    }
+  }
   if (!fields.length) return current;
   assign('updated_at', Date.now());
   if (clean.status && clean.status !== 'active') assign('token_version', Number(current.token_version || 1) + 1);
@@ -319,7 +369,7 @@ function deleteUser(id, { purgeConfigs = false } = {}, req) {
     const configs = db.prepare('SELECT * FROM configs WHERE user_id = ? AND deleted_at = 0').all(Number(id));
     for (const cfg of configs) {
       try {
-        configsService.removeConfig(cfg.id, { hard: true, silent: true }, req);
+        configsService.removeConfig(cfg.id, { hard: true, silent: true, force: true }, req);
         removed += 1;
       } catch (err) {
         console.error(`[users] failed to remove config ${cfg.email}:`, err.message);
@@ -412,6 +462,13 @@ function allowedInboundIds(user) {
   return ids.map(Number).filter((n) => Number.isFinite(n));
 }
 
+// 0 = this reseller has no fixed inbound. Otherwise the id is the base every
+// package of theirs must carry: create forms pre-select it, the edit drawer
+// locks it, and the heal pass adds it to legacy subscriptions that lack it.
+function fixedInboundId(user) {
+  return Number(user?.fixed_inbound || 0) || 0;
+}
+
 module.exports = {
   USERNAME_RE,
   getUser,
@@ -427,5 +484,6 @@ module.exports = {
   adjustBalance,
   checkLimits,
   allowedInboundIds,
+  fixedInboundId,
   normalizePermissions,
 };

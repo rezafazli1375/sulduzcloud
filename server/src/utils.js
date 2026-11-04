@@ -138,6 +138,7 @@ function sanitizeUser(row) {
       maxDaysPerConfig: Number(row.max_days_per_config || 0),
     },
     allowedInbounds: parseNumberArray(row.allowed_inbounds),
+    fixedInbound: Number(row.fixed_inbound || 0),
     balance: Number(row.balance || 0),
     note: row.note || '',
     apiKey: row.role === 'reseller' ? row.api_key || '' : undefined,
@@ -184,7 +185,16 @@ function sanitizeConfig(row, inbound, reseller, at = Date.now()) {
         }
       : null,
     reseller: reseller
-      ? { id: reseller.id, username: reseller.username, name: reseller.name || '' }
+      ? {
+        id: reseller.id,
+        username: reseller.username,
+        name: reseller.name || '',
+        // The drawer needs both to decide what is addable and what is locked:
+        // the fixed inbound is the base of every package and never removable,
+        // and an empty allowed list means "every visible inbound".
+        fixedInbound: Number(reseller.fixed_inbound || 0),
+        allowedInbounds: parseNumberArray(reseller.allowed_inbounds),
+      }
       : null,
     totalGb: bytesToGb(totalBytes),
     totalBytes,

@@ -42,14 +42,25 @@ router.get('/overview', (req, res) => {
 
 router.get('/inbounds', (req, res) => {
   const allowed = usersService.allowedInboundIds(req.user);
+  const fixedId = usersService.fixedInboundId(req.user);
   const discountMap = pricing.discountMap(req.user.id);
-  const rows = inboundsService.listInbounds({ includeHidden: false, allowed })
-    .map((row) => ({ ...row, discountPercent: discountMap.get(row.id) || 0 }));
+  let rows = inboundsService.listInbounds({ includeHidden: false, allowed })
+    .map((row) => ({ ...row, discountPercent: discountMap.get(row.id) || 0, fixed: Number(row.id) === fixedId }));
+  // The fixed inbound is this reseller's guaranteed base, so the create form
+  // must always be able to show and lock it — even if it is hidden from the
+  // general list or was left out of an explicit allow list.
+  if (fixedId > 0 && !rows.some((row) => Number(row.id) === fixedId)) {
+    const fixed = inboundsService.listInbounds({ includeHidden: true }).find((row) => Number(row.id) === fixedId);
+    if (fixed) {
+      rows = [{ ...fixed, discountPercent: discountMap.get(fixed.id) || 0, fixed: true }, ...rows];
+    }
+  }
   res.json({
     ok: true,
     data: {
       rows,
       allowedInbounds: allowed,
+      fixedInbound: fixedId,
       limits: usersService.userStats(req.user.id),
       billing: pricing.billingInfo(),
     },
@@ -63,6 +74,10 @@ router.post('/configs/quote', (req, res) => {
     .map(Number)
     .filter((n) => Number.isFinite(n))
     .filter((id) => !allowed || allowed.includes(id));
+  // Mirror createConfigs: the fixed inbound always joins the package, so the
+  // quoted price must already include it instead of surprising the reseller.
+  const fixedId = usersService.fixedInboundId(req.user);
+  if (ids.length && fixedId > 0 && !ids.includes(fixedId)) ids.unshift(fixedId);
   const result = pricing.quote({
     userId: req.user.id,
     inboundIds: ids,
@@ -199,8 +214,8 @@ router.post('/configs/:id/reset', asyncH(async (req, res) => {
 }));
 
 router.delete('/configs/:id', asyncH(async (req, res) => {
-  await configsService.removeConfig(num(req.params.id), {}, req, req.user);
-  res.json({ ok: true, data: { deleted: true } });
+  const result = await configsService.removeConfig(num(req.params.id), {}, req, req.user);
+  res.json({ ok: true, data: { deleted: true, detachedOnly: Boolean(result.detachedOnly) } });
 }));
 
 router.get('/stats', (req, res) => {

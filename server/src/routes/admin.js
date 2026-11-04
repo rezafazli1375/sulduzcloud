@@ -191,7 +191,19 @@ router.patch('/users/:id', auth.requirePerm('users'), asyncH(async (req, res) =>
       imported = { imported: 0, restored: 0, failed: 1, errors: [err.message] };
     }
   }
-  res.json({ ok: true, data: { user: sanitizeUser(user), stats: usersService.userStats(user.id), import: imported } });
+  // A fresh fixed inbound usually means the reseller's OLD packages do not
+  // carry it yet. Count them (read-only) so the UI can offer the heal with the
+  // exact number instead of writing to another panel unexpectedly.
+  let fixedInboundPreview = null;
+  const fixedId = Number(user.fixed_inbound || 0);
+  if (fixedId > 0 && Number(before?.fixed_inbound || 0) !== fixedId) {
+    try {
+      fixedInboundPreview = await configsService.applyFixedInbound(Number(user.id), { dryRun: true }, req);
+    } catch (err) {
+      console.error('[admin] fixed inbound preview failed:', err.message);
+    }
+  }
+  res.json({ ok: true, data: { user: sanitizeUser(user), stats: usersService.userStats(user.id), import: imported, fixedInboundPreview } });
 }));
 
 router.post('/users/:id/import', auth.requirePerm('users'), asyncH(async (req, res) => {
@@ -205,6 +217,16 @@ router.post('/users/:id/import', auth.requirePerm('users'), asyncH(async (req, r
   }
   const result = await configsService.importTelegramClients(user, req);
   res.json({ ok: true, data: result });
+}));
+
+// Panel v1.4.16: give every existing package of this reseller their fixed
+// inbound. `dryRun` only counts, so the UI can show what will change before the
+// panel writes a single client — adopted subscriptions live on another panel and
+// their owners are connected, so nothing here happens silently.
+router.post('/users/:id/fixed-inbound/apply', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const dryRun = req.body?.dryRun === true || String(req.body?.dryRun) === 'true';
+  const result = await configsService.applyFixedInbound(num(req.params.id), { dryRun }, req);
+  res.json({ ok: true, data: { ...result, dryRun } });
 }));
 
 router.post('/users/:id/status', auth.requirePerm('users'), (req, res) => {
@@ -410,8 +432,8 @@ router.post('/configs/:id/reset', auth.requirePerm('configs'), asyncH(async (req
 }));
 
 router.delete('/configs/:id', auth.requirePerm('configs'), asyncH(async (req, res) => {
-  await configsService.removeConfig(num(req.params.id), {}, req, { role: 'admin' });
-  res.json({ ok: true, data: { deleted: true } });
+  const result = await configsService.removeConfig(num(req.params.id), {}, req, { role: 'admin' });
+  res.json({ ok: true, data: { deleted: true, detachedOnly: Boolean(result.detachedOnly) } });
 }));
 
 // ---------------------------------------------------------------- inbounds
@@ -420,6 +442,11 @@ router.get('/inbounds', auth.requirePerm('inbounds'), (req, res) => {
   const statuses = latestStatuses();
   const discountUserId = num(req.query.userId, 0);
   const discountMap = discountUserId ? pricing.discountMap(discountUserId) : null;
+  // Opening a reseller's editor or config form passes their id: the fixed
+  // inbound of that reseller is flagged so the UI can lock and badge it.
+  const fixedInbound = discountUserId
+    ? usersService.fixedInboundId(usersService.getUser(discountUserId) || {})
+    : 0;
   const rows = inboundsService.listInbounds({ includeHidden: true }).map((row) => {
     // Local inbounds live on the x-ui panel itself (node_id = 0); their health
     // is tracked under that server's `panel` row, not a `node` row.
@@ -431,9 +458,10 @@ router.get('/inbounds', auth.requirePerm('inbounds'), (req, res) => {
       discountPercent: discountMap ? discountMap.get(row.id) || 0 : 0,
       nodeStatus: status ? status.status : 'unknown',
       nodeLatencyMs: status ? status.latency_ms : null,
+      fixed: fixedInbound > 0 && Number(row.id) === fixedInbound,
     };
   });
-  res.json({ ok: true, data: { rows, servers: serversService.listServers().map(serversService.publicShape) } });
+  res.json({ ok: true, data: { rows, fixedInbound, servers: serversService.listServers().map(serversService.publicShape) } });
 });
 
 router.post('/inbounds/sync', auth.requirePerm('inbounds'), asyncH(async (req, res) => {

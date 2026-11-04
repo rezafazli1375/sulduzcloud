@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Boxes, Check, Clock, CreditCard, Globe2, Info, Network, Server, UserRound, Wallet } from 'lucide-react';
+import { AlertTriangle, Boxes, Check, Clock, CreditCard, Globe2, Info, Network, Pin, Server, UserRound, Wallet } from 'lucide-react';
 import { useAuth } from '../../lib/auth.jsx';
 import { useI18n, translateError } from '../../lib/i18n.jsx';
 import { api } from '../../lib/api.js';
@@ -9,7 +9,7 @@ import { nodeLabel } from '../../lib/nodes.js';
 import { Badge, Button, Checkbox, Field, Input, Modal, Select, Skeleton, Textarea, cx } from '../ui.jsx';
 import { useToast } from '../feedback.jsx';
 
-function InboundPicker({ rows, value, onToggle, lang, t, gb = 0, days = 0, currency = '' }) {
+function InboundPicker({ rows, value, onToggle, lang, t, gb = 0, days = 0, currency = '', fixedId = 0 }) {
   const grouped = useMemo(() => {
     const map = new Map();
     for (const row of rows) {
@@ -40,6 +40,10 @@ function InboundPicker({ rows, value, onToggle, lang, t, gb = 0, days = 0, curre
           <div className="grid gap-1.5 sm:grid-cols-2">
             {list.map((row) => {
               const selected = value.includes(row.id);
+              // The fixed inbound is this reseller's guaranteed base: it comes
+              // pre-selected and clicking it does nothing, so a package can
+              // never be created — or later trimmed — without it.
+              const isFixed = Boolean(row.fixed) || (fixedId > 0 && Number(row.id) === Number(fixedId));
               const rowBase = Number(row.priceFixed || 0)
                 + Number(row.pricePerGb || 0) * Number(gb || 0)
                 + Number(row.pricePerDay || 0) * Number(days || 0);
@@ -48,25 +52,29 @@ function InboundPicker({ rows, value, onToggle, lang, t, gb = 0, days = 0, curre
                 <button
                   key={row.id}
                   type="button"
-                  onClick={() => onToggle(row.id)}
+                  onClick={() => { if (!isFixed) onToggle(row.id); }}
+                  title={isFixed ? t('configs.form.fixedInboundLocked') : undefined}
                   className={cx(
                     'group flex items-center gap-2.5 rounded-xl border px-2.5 py-2 text-start transition-all duration-200',
-                    selected
-                      ? 'border-emerald-400/40 bg-emerald-500/[0.09] shadow-[inset_0_0_0_1px_rgba(16,185,129,.15)]'
-                      : 'border-white/[0.06] bg-white/[0.02] hover:border-white/15 hover:bg-white/[0.04]'
+                    isFixed
+                      ? 'border-sky-400/40 bg-sky-500/[0.09]'
+                      : selected
+                        ? 'border-emerald-400/40 bg-emerald-500/[0.09] shadow-[inset_0_0_0_1px_rgba(16,185,129,.15)]'
+                        : 'border-white/[0.06] bg-white/[0.02] hover:border-white/15 hover:bg-white/[0.04]'
                   )}
                 >
                   <span
                     className={cx(
                       'flex h-4 w-4 shrink-0 items-center justify-center rounded-md border transition',
-                      selected ? 'border-emerald-400/60 bg-emerald-500 text-[#04120f]' : 'border-white/15 bg-white/[0.03]'
+                      isFixed ? 'border-sky-400/60 bg-sky-500 text-[#04101a]' : selected ? 'border-emerald-400/60 bg-emerald-500 text-[#04120f]' : 'border-white/15 bg-white/[0.03]'
                     )}
                   >
-                    {selected ? <Check className="h-3 w-3" strokeWidth={3.5} /> : null}
+                    {isFixed ? <Pin className="h-3 w-3" strokeWidth={2.5} /> : selected ? <Check className="h-3 w-3" strokeWidth={3.5} /> : null}
                   </span>
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center gap-1.5">
                       <span className="truncate text-[11.5px] font-medium text-slate-200">{row.remark || `#${row.id}`}</span>
+                      {isFixed ? <Badge tone="blue" className="px-1.5 py-0 text-[9px]">{t('configs.form.fixedInboundBadge')}</Badge> : null}
                       {row.visible === false ? <Badge tone="slate" className="px-1.5 py-0 text-[9px]">{t('common.hidden')}</Badge> : null}
                       {Number(row.discountPercent) > 0 ? (
                         <Badge tone="emerald" className="px-1.5 py-0 text-[9px]">{formatNumber(row.discountPercent, lang)}%</Badge>
@@ -152,6 +160,28 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
   });
 
   const inbounds = (inboundsQuery.data?.rows || []).filter((row) => row.enabled && (isAdmin || row.visible));
+  // The inbounds endpoint already knows the reseller whose form this is (admin
+  // passes ?userId=, a reseller is themselves) and flags their fixed inbound.
+  const fixedId = Number(inboundsQuery.data?.fixedInbound || 0)
+    || Number((inboundsQuery.data?.rows || []).find((row) => row.fixed)?.id || 0);
+  const autoFixedRef = useRef(0);
+
+  useEffect(() => {
+    if (!open) return;
+    const previous = autoFixedRef.current;
+    autoFixedRef.current = fixedId;
+    setForm((prev) => {
+      let ids = prev.inboundIds;
+      // Switching reseller: drop the base the previous reseller was pinned to,
+      // but never a row the admin ticked by hand.
+      if (previous && previous !== fixedId && ids.some((value) => Number(value) === previous)) {
+        ids = ids.filter((value) => Number(value) !== previous);
+      }
+      if (fixedId > 0 && !ids.some((value) => Number(value) === fixedId)) ids = [fixedId, ...ids];
+      if (ids === prev.inboundIds) return prev;
+      return { ...prev, inboundIds: ids };
+    });
+  }, [open, fixedId]);
   const resellers = usersQuery.data?.rows || [];
   const selectedUser = resellers.find((row) => String(row.id) === String(form.userId));
   const limits = selectedUser?.limits || inboundsQuery.data?.limits || {};
@@ -195,6 +225,7 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
   });
 
   const toggleInbound = (id) => {
+    if (fixedId > 0 && Number(id) === fixedId) return; // the fixed base always stays selected
     setForm((prev) => ({
       ...prev,
       inboundIds: prev.inboundIds.includes(id) ? prev.inboundIds.filter((value) => value !== id) : [...prev.inboundIds, id],
@@ -363,9 +394,18 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
               gb={isUnlimited ? 0 : Number(form.gb || 0)}
               days={Number(form.days || 0)}
               currency={currency}
+              fixedId={fixedId}
             />
           )}
           <p className="mt-1.5 text-[10.5px] text-slate-500">{t('configs.form.inboundHint')}</p>
+          {fixedId > 0 ? (
+            <p className="mt-1 flex items-center gap-1.5 text-[10px] leading-5 text-sky-200/80">
+              <Pin className="h-3 w-3 shrink-0" />
+              {t('configs.form.fixedInboundHint', {
+                inbound: inbounds.find((row) => Number(row.id) === fixedId)?.remark || `#${fixedId}`,
+              })}
+            </p>
+          ) : null}
           {crossServer ? (
             <p className="mt-1 text-[10px] leading-5 text-rose-300">{t('configs.form.crossServerWarn')}</p>
           ) : null}

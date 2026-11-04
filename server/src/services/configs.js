@@ -367,10 +367,29 @@ async function createConfigs(input, req) {
   if (!user) throw new ApiError(404, 'user_not_found', 'Reseller not found');
   if (user.status !== 'active') throw new ApiError(403, 'user_disabled', 'This reseller account is disabled');
 
-  const inboundIds = (Array.isArray(input.inboundIds) ? input.inboundIds : [input.inboundId])
+  const inboundIds = [...new Set((Array.isArray(input.inboundIds) ? input.inboundIds : [input.inboundId])
     .map(Number)
-    .filter((n) => Number.isFinite(n));
+    .filter((n) => Number.isFinite(n)))];
   if (!inboundIds.length) throw new ApiError(422, 'inbound_required', 'Select at least one inbound');
+  // Panel v1.4.16: the reseller's fixed inbound is the base of every package, so
+  // it joins the order even when the form did not tick it. Choosing only the
+  // fixed inbound keeps the classic single-inbound behaviour; a package that
+  // always carries its base can never be left without a channel to connect on.
+  const fixedId = usersService.fixedInboundId(user);
+  if (fixedId > 0 && !inboundIds.includes(fixedId)) {
+    const fixedInbound = getInboundRow(fixedId);
+    if (!fixedInbound) {
+      throw new ApiError(422, 'invalid_fixed_inbound', 'این اینباند ثابت در پنل پیدا نشد / The fixed inbound is no longer in the panel');
+    }
+    if (!fixedInbound.enabled) {
+      throw new ApiError(422, 'fixed_inbound_disabled', `اینباند «${fixedInbound.remark}» غیرفعال است / The fixed inbound is disabled`);
+    }
+    const firstInbound = getInboundRow(inboundIds[0]);
+    if (firstInbound && Number(firstInbound.server_id) !== Number(fixedInbound.server_id)) {
+      throw new ApiError(422, 'fixed_inbound_server_mismatch', 'اینباند ثابت این نماینده روی پنل دیگری است / This reseller’s fixed inbound is on another server');
+    }
+    inboundIds.unshift(fixedId);
+  }
 
   const gb = Math.max(0, Number(input.gb || 0));
   const days = Math.max(0, Math.round(Number(input.days || 0)));
@@ -385,10 +404,10 @@ async function createConfigs(input, req) {
     const inbound = getInboundRow(inboundId);
     if (!inbound) throw new ApiError(404, 'inbound_not_found', `Inbound ${inboundId} not found`);
     if (!inbound.enabled) throw new ApiError(422, 'inbound_disabled', `Inbound ${inbound.remark} is disabled`);
-    if (allowed && !allowed.includes(inboundId)) {
+    if (allowed && !allowed.includes(inboundId) && inboundId !== fixedId) {
       throw new ApiError(403, 'inbound_forbidden', 'This reseller cannot use the selected inbound');
     }
-    if (!inbound.visible && req?.user?.role !== 'admin') {
+    if (!inbound.visible && req?.user?.role !== 'admin' && inboundId !== fixedId) {
       throw new ApiError(403, 'inbound_hidden', 'This inbound is not available');
     }
     const price = pricing.priceFor(inbound, gb, days, user.id);
@@ -691,8 +710,8 @@ function configDetail(id, viewer) {
 // one expiry and one status, with the opened config's identity kept on top.
 function packageView(row) {
   const db = getDb();
-  const members = groupRows(row);
-  const list = (members.length ? members : [row]).map((item) => hydrate(item)).filter(Boolean);
+  const members = packageRows(row);
+  const list = members.map((item) => hydrate(item)).filter(Boolean);
   if (!list.length) return hydrate(row);
   return mergeGroup(list, list.find((item) => Number(item.id) === Number(row.id)) || list[0]);
 }
@@ -1021,13 +1040,31 @@ async function updateMeta(id, patch, req, viewer) {
   return hydrate(getConfigRow(row.id));
 }
 
-async function removeConfig(id, { hard = false, silent = false } = {}, req, viewer) {
+async function removeConfig(id, { hard = false, silent = false, force = false } = {}, req, viewer) {
   const { row } = configDetail(id, viewer);
-  try {
-    await xui.deleteClient(row.email, false, serverOfConfig(row));
-  } catch (err) {
-    if (!silent) throw err;
-    console.error(`[configs] x-ui delete failed for ${row.email}:`, err.message);
+  const user = getResellerRow(row.user_id);
+  const fixedId = usersService.fixedInboundId(user);
+  const members = packageRows(row);
+  // The fixed inbound is the base of the package: while the customer has other
+  // inbounds, dropping the base would silently take away the channel the
+  // reseller guaranteed. A package that is only the base can still be deleted,
+  // and `force` (used when a whole reseller is purged) overrides the lock.
+  if (!force && fixedId > 0 && Number(row.inbound_id) === fixedId && members.length > 1) {
+    throw new ApiError(409, 'fixed_inbound_locked', 'این اینباند ثابت نماینده است؛ تا بسته عضو دیگری دارد از بسته برداشته نمی‌شود / The reseller’s fixed inbound cannot be removed while the package has other inbounds');
+  }
+  const isExternal = String(row.origin || 'panel') === 'external';
+  if (isExternal) {
+    // Adopted subscriptions live on another operator's panel and their owners
+    // are connected right now. Removing the row here forgets the subscription
+    // locally and never sends a delete to that panel.
+    console.warn(`[configs] detaching adopted config ${row.email} without touching x-ui`);
+  } else {
+    try {
+      await xui.deleteClient(row.email, false, serverOfConfig(row));
+    } catch (err) {
+      if (!silent) throw err;
+      console.error(`[configs] x-ui delete failed for ${row.email}:`, err.message);
+    }
   }
   const db = getDb();
   if (hard) {
@@ -1036,8 +1073,8 @@ async function removeConfig(id, { hard = false, silent = false } = {}, req, view
   } else {
     db.prepare('UPDATE configs SET deleted_at = ?, enabled = 0, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), row.id);
   }
-  audit(req, 'config.delete', 'config', row.id, { email: row.email, hard });
-  return { ok: true };
+  audit(req, 'config.delete', 'config', row.id, { email: row.email, hard, detachedOnly: isExternal });
+  return { ok: true, detachedOnly: isExternal };
 }
 
 /**
@@ -1051,8 +1088,22 @@ function groupRows(row) {
     .all(row.sub_id, row.user_id, Number(row.server_id || 0) || 1);
 }
 
+/**
+ * The live members of this config's package. Subscriptions adopted out of an
+ * existing panel carry no group token, so groupRows() is empty for them and the
+ * edit drawer used to show "no inbound" at all — and an added inbound was
+ * written with the same empty token, so it never joined the customer. A config
+ * without a token IS a package of one, so it lists itself.
+ */
+function packageRows(row) {
+  if (!row) return [];
+  const members = groupRows(row);
+  return members.length ? members : [row];
+}
+
 function groupFor(row) {
-  return groupRows(row).map((r) => {
+  const fixedId = usersService.fixedInboundId(getResellerRow(row?.user_id));
+  const list = packageRows(row).map((r) => {
     const config = hydrate(r);
     return {
       id: config.id,
@@ -1065,8 +1116,15 @@ function groupFor(row) {
       enabled: config.enabled,
       status: config.status,
       used: config.used,
+      origin: config.origin,
+      // The drawer keeps this row's remove button disabled while the package has
+      // other members: the fixed inbound is the base of the subscription, so
+      // dropping it would leave the customer without the channel the reseller
+      // promised. A package of one can still be deleted as a whole.
+      fixed: fixedId > 0 && Number(config.inboundId) === fixedId,
     };
   });
+  return list.map((item) => ({ ...item, removable: !item.fixed || list.length === 1 }));
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1130,16 +1188,15 @@ async function updateIdentity(id, patch = {}, req, viewer) {
   return hydrate(getConfigRow(row.id));
 }
 
-async function addInbound(id, inboundId, req, viewer) {
+/**
+ * Attach one more inbound to an existing customer package. `row` may be any
+ * live member. `options.free` skips pricing, limits and the wallet: the fixed
+ * inbound heal adds a channel the customer already pays for as part of the
+ * package's shared pool, so charging again would be wrong.
+ */
+async function attachInbound(row, inbound, req, { free = false } = {}) {
   const db = getDb();
-  const { row } = configDetail(id, viewer);
-  const target = Number(inboundId);
-  const inbound = getInboundRow(target);
-  if (!inbound) throw new ApiError(404, 'inbound_not_found', 'Inbound not found');
-  if (!inbound.enabled) throw new ApiError(422, 'inbound_disabled', `Inbound ${inbound.remark} is disabled`);
-  if (!inbound.visible && viewer?.role !== 'admin') {
-    throw new ApiError(403, 'inbound_hidden', 'This inbound is not available');
-  }
+  const target = Number(inbound.id);
   const user = getResellerRow(row.user_id);
   if (!user) throw new ApiError(404, 'user_not_found', 'Reseller not found');
   const server = serverOfInbound(inbound);
@@ -1147,28 +1204,24 @@ async function addInbound(id, inboundId, req, viewer) {
   // A customer's inbounds share one subscription id, which lives on a single
   // x-ui panel; cross-server groups would need two different sub links.
   if (Number(server.id) !== Number(targetServer.id)) {
-    throw new ApiError(422, 'server_mismatch', 'This inbound belongs to a different x-ui panel than the config');
+    throw new ApiError(422, 'server_mismatch', 'این اینباند روی پنل دیگری است / This inbound belongs to a different x-ui panel than the config');
   }
   const allowed = usersService.allowedInboundIds(user);
   if (allowed && !allowed.includes(target)) {
     throw new ApiError(403, 'inbound_forbidden', 'This reseller cannot use the selected inbound');
   }
-  const exists = db
-    .prepare('SELECT 1 FROM configs WHERE sub_id = ? AND inbound_id = ? AND deleted_at = 0')
-    .get(row.sub_id, target);
-  if (exists) throw new ApiError(409, 'inbound_exists', 'This customer already has this inbound');
 
   // The new inbound joins the package's shared pool: it inherits the pool size
   // and expiry window (max across members, healing any drift) and adds NO quota.
-  const siblings = groupRows(row);
-  const members = siblings.length ? siblings : [row];
+  const members = packageRows(row);
   const totalBytes = members.reduce((max, item) => Math.max(max, Number(item.total_bytes || 0)), 0);
   const expiryAt = members.reduce((max, item) => Math.max(max, Number(item.expiry_at || 0)), 0);
   const totalGb = bytesToGb(totalBytes);
   const remainingDays = expiryAt > 0 ? Math.max(1, Math.ceil((expiryAt - Date.now()) / DAY_MS)) : 0;
-  const amount = pricing.priceFor(inbound, totalGb, remainingDays, user.id);
-  // This joins the customer's existing package instead of creating a new one.
-  usersService.checkLimits(user, { count: 0, gb: 0, gbEach: totalGb, days: remainingDays });
+  const amount = free ? 0 : pricing.priceFor(inbound, totalGb, remainingDays, user.id);
+  // This joins the customer's existing package instead of creating a new one,
+  // and a heal pass adds no quota either, so limits only gate a paid add.
+  if (!free) usersService.checkLimits(user, { count: 0, gb: 0, gbEach: totalGb, days: remainingDays });
 
   if (billingEnabled() && amount > 0 && Number(user.balance || 0) < amount) {
     throw new ApiError(402, 'insufficient_balance', 'موجودی کیف پول کافی نیست / Insufficient wallet balance');
@@ -1185,30 +1238,42 @@ async function addInbound(id, inboundId, req, viewer) {
     [Number(inbound.xui_id)],
     server
   );
+
+  // A package without a group token — every subscription adopted from another
+  // panel — has no aggregated subscription link at all. Minting one here is what
+  // actually delivers the new inbound to the customer; before, the sibling was
+  // inserted with an empty token and nothing referenced it.
+  const groupToken = row.sub_id || randomToken(16);
   let insertedId = 0;
   try {
-    const info = db.prepare(
-      `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label, customer_name,
-        customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, 'active', '', ?, ?)`
-    ).run(
-      row.user_id,
-      target,
-      Number(server.id),
-      email,
-      row.sub_id,
-      xuiSubId,
-      String(createdClient?.uuid || uuid),
-      String(row.label || '').slice(0, 80),
-      String(row.customer_name || '').slice(0, 80),
-      String(row.customer_phone || '').slice(0, 32),
-      String(row.note || '').slice(0, 500),
-      totalBytes,
-      expiryAt,
-      row.enabled ? 1 : 0,
-      Date.now(),
-      Date.now()
-    );
+    const info = db.transaction(() => {
+      if (!row.sub_id) {
+        db.prepare('UPDATE configs SET sub_id = ?, updated_at = ? WHERE id = ?').run(groupToken, Date.now(), row.id);
+        row.sub_id = groupToken;
+      }
+      return db.prepare(
+        `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label, customer_name,
+          customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, 'active', '', ?, ?)`
+      ).run(
+        row.user_id,
+        target,
+        Number(server.id),
+        email,
+        groupToken,
+        xuiSubId,
+        String(createdClient?.uuid || uuid),
+        String(row.label || '').slice(0, 80),
+        String(row.customer_name || '').slice(0, 80),
+        String(row.customer_phone || '').slice(0, 32),
+        String(row.note || '').slice(0, 500),
+        totalBytes,
+        expiryAt,
+        row.enabled ? 1 : 0,
+        Date.now(),
+        Date.now()
+      );
+    })();
     insertedId = Number(info.lastInsertRowid);
     if (billingEnabled() && amount > 0) {
       chargeReseller(user, amount, `افزودن اینباند ${inbound.remark} به ${row.customer_name || email}`, 'purchase', req);
@@ -1223,8 +1288,94 @@ async function addInbound(id, inboundId, req, viewer) {
     throw err;
   }
 
-  audit(req, 'config.inbound_add', 'config', insertedId, { source: row.id, inboundId: target, amount });
+  audit(req, 'config.inbound_add', 'config', insertedId, {
+    source: row.id, inboundId: target, inbound: inbound.remark, amount, healed: free,
+  });
+  return insertedId;
+}
+
+async function addInbound(id, inboundId, req, viewer) {
+  const { row } = configDetail(id, viewer);
+  const target = Number(inboundId);
+  const inbound = getInboundRow(target);
+  if (!inbound) throw new ApiError(404, 'inbound_not_found', 'Inbound not found');
+  if (!inbound.enabled) throw new ApiError(422, 'inbound_disabled', `Inbound ${inbound.remark} is disabled`);
+  if (!inbound.visible && viewer?.role !== 'admin') {
+    throw new ApiError(403, 'inbound_hidden', 'This inbound is not available');
+  }
+  // Duplicate detection is scoped to THIS customer's package. The old query
+  // matched on (sub_id, inbound_id) and every adopted row shares the empty
+  // token, so adding any inbound to an old config answered "already has it".
+  const members = packageRows(row);
+  if (members.some((item) => Number(item.inbound_id) === target)) {
+    throw new ApiError(409, 'inbound_exists', 'این مشتری همین اینباند را در بسته دارد / This customer already has this inbound');
+  }
+  const insertedId = await attachInbound(row, inbound, req);
   return hydrate(getConfigRow(insertedId));
+}
+
+/**
+ * Add the reseller's fixed inbound to every one of their packages that lacks
+ * it — the automatic heal the owner asked for when he introduced the fixed
+ * inbound, so legacy (adopted) subscriptions get the same guaranteed base as
+ * new ones. `dryRun` only counts. Nothing is charged, no existing client is
+ * touched, and a package that already carries the base is left alone.
+ */
+async function applyFixedInbound(userId, { dryRun = false } = {}, req) {
+  const db = getDb();
+  const user = getResellerRow(userId);
+  if (!user) throw new ApiError(404, 'user_not_found', 'Reseller not found');
+  const fixedId = usersService.fixedInboundId(user);
+  if (!fixedId) {
+    throw new ApiError(422, 'fixed_inbound_required', 'ابتدا اینباند ثابت این نماینده را انتخاب کنید / Set this reseller’s fixed inbound first');
+  }
+  const inbound = getInboundRow(fixedId);
+  if (!inbound) throw new ApiError(422, 'invalid_fixed_inbound', 'این اینباند ثابت در پنل پیدا نشد / The fixed inbound is no longer in the panel');
+  if (!inbound.enabled) {
+    throw new ApiError(422, 'fixed_inbound_disabled', `اینباند «${inbound.remark}» غیرفعال است / The fixed inbound is disabled`);
+  }
+
+  // Packages are (server, group token) pairs; a tokenless row is a package of
+  // one, so scan live rows and let packageRows() do the grouping. The lowest
+  // id anchors each package so one attach happens per customer, not per row.
+  const rows = db
+    .prepare('SELECT * FROM configs WHERE user_id = ? AND deleted_at = 0 ORDER BY id')
+    .all(Number(user.id));
+  const seen = new Set();
+  const summary = {
+    fixedInbound: fixedId, inbound: inbound.remark, serverId: Number(inbound.server_id || 0),
+    packages: 0, already: 0, needFix: 0, healed: 0, skipped: 0, errors: [],
+  };
+  for (const row of rows) {
+    const members = packageRows(row);
+    const key = row.sub_id ? `G:${row.server_id}:${row.sub_id}` : `C:${row.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    summary.packages += 1;
+    if (members.some((item) => Number(item.inbound_id) === fixedId)) {
+      summary.already += 1;
+      continue;
+    }
+    // One subscription link spans one x-ui panel: a legacy package whose base
+    // lives on another panel cannot take this inbound without splitting it.
+    const server = serverOfInbound(inbound);
+    if (Number(server.id) !== Number(serverOfConfig(members[0]).id)) {
+      summary.skipped += 1;
+      summary.errors.push(`${members[0].email}: این بسته روی پنل دیگری است / package is on another panel`);
+      continue;
+    }
+    summary.needFix += 1;
+    if (dryRun) continue;
+    try {
+      await attachInbound(members[0], inbound, req, { free: true });
+      summary.healed += 1;
+    } catch (err) {
+      summary.skipped += 1;
+      summary.errors.push(`${members[0].email}: ${err.message}`);
+    }
+  }
+  if (!dryRun && summary.healed) audit(req, 'user.fixed_inbound_apply', 'user', Number(user.id), summary);
+  return summary;
 }
 
 async function syncConfigs({ pruneUsageDays } = {}) {
@@ -1415,6 +1566,7 @@ module.exports = {
   packageView,
   hydrate,
   groupRows,
+  packageRows,
   getConfigRow,
   linksFor,
   subUrlFor,
@@ -1427,6 +1579,7 @@ module.exports = {
   groupFor,
   updateIdentity,
   addInbound,
+  applyFixedInbound,
   syncConfigs,
   expiredNotifications,
   exportRows,

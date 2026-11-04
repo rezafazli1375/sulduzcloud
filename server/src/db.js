@@ -273,6 +273,11 @@ function migrate(db) {
   // adopted out of an existing x-ui/sanaei panel. A single client is always one
   // origin, so packages never mix the two in the grouped list.
   ensureColumn(db, 'configs', 'origin', "TEXT NOT NULL DEFAULT 'panel'");
+  // Panel v1.4.16: every reseller can name one FIXED inbound. It is the base of
+  // a package — pre-selected when a config is created and never removable — so a
+  // package can never end up with zero inbounds and a customer can never be left
+  // without a subscription by removing the wrong inbound.
+  ensureColumn(db, 'users', 'fixed_inbound', 'INTEGER NOT NULL DEFAULT 0');
 }
 
 function rebuildInbounds(db) {

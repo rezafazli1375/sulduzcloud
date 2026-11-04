@@ -12,6 +12,7 @@ import {
   Link2,
   Loader2,
   Layers,
+  Pin,
   Plus,
   Power,
   QrCode,
@@ -237,8 +238,8 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
 
   const removeInbound = useMutation({
     mutationFn: (targetId) => api.del(`${base}/${targetId}`),
-    onSuccess: (_data, targetId) => {
-      toast.success(t('configs.group.removed'));
+    onSuccess: (data, targetId) => {
+      toast.success(data?.detachedOnly ? t('configs.group.detached') : t('configs.group.removed'));
       if (Number(targetId) === Number(configId)) onClose?.();
       refresh();
     },
@@ -246,11 +247,14 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   });
 
   const askRemoveInbound = async (item) => {
+    // Adopted subscriptions are not this panel's clients: removing one only
+    // detaches the row, so the confirm must not promise a x-ui delete.
+    const external = item?.origin === 'external';
     const ok = await confirm({
-      title: t('configs.group.removeConfirm'),
-      body: item ? `${item.inbound?.remark || `#${item.inboundId}`} · ${item.email}` : '',
+      title: external ? t('configs.group.detachConfirm') : t('configs.group.removeConfirm'),
+      body: `${item ? `${item.inbound?.remark || `#${item.inboundId}`} · ${item.email}` : ''}${external ? `\n${t('configs.group.detachNote')}` : ''}`,
       danger: true,
-      confirmText: t('configs.group.remove'),
+      confirmText: external ? t('configs.group.detach') : t('configs.group.remove'),
     });
     if (ok) removeInbound.mutate(item.id);
   };
@@ -275,9 +279,22 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
 
   const allLinks = [subUrl, ...links].filter(Boolean);
   const left = config ? daysLeft(config.expiryAt, lang) : null;
-  const addable = (addableQuery.data?.rows || []).filter(
-    (row) => row.enabled && (isAdmin || row.visible) && !group.some((item) => Number(item.inboundId) === Number(row.id))
-  );
+  // A package spans ONE x-ui panel and one subscription link, and a reseller can
+  // only sell the inbounds they are allowed — so the "add inbound" list drops
+  // everything else instead of offering rows the server would refuse. Before
+  // this, an adopted config with no listed group even offered its own inbound
+  // again.
+  const packageServerId = Number(config?.serverId || config?.inbound?.serverId || 0);
+  const allowedList = Array.isArray(config?.reseller?.allowedInbounds) ? config.reseller.allowedInbounds.map(Number) : [];
+  const addable = (addableQuery.data?.rows || []).filter((row) => {
+    if (!row.enabled) return false;
+    if (!isAdmin && row.visible === false) return false;
+    if (group.some((item) => Number(item.inboundId) === Number(row.id))) return false;
+    if (packageServerId && Number(row.serverId || 0) !== packageServerId) return false;
+    if (allowedList.length && !allowedList.includes(Number(row.id))) return false;
+    return true;
+  });
+  const fixedInboundId = Number(config?.reseller?.fixedInbound || 0);
 
   return (
     <>
@@ -460,6 +477,12 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                     <div className="min-w-0">
                       <p className="truncate text-[12px] text-slate-200">
                         {item.inbound?.remark || `#${item.inboundId}`}
+                        {item.fixed ? (
+                          <Badge tone="blue" className="ms-1.5 align-middle px-1.5 py-0 text-[9px]">{t('configs.group.fixedBadge')}</Badge>
+                        ) : null}
+                        {item.origin === 'external' ? (
+                          <Badge tone="amber" className="ms-1.5 align-middle px-1.5 py-0 text-[9px]">{t('configs.originExternalBadge')}</Badge>
+                        ) : null}
                         {Number(item.id) === Number(configId) ? (
                           <span className="ms-1.5 text-[9.5px] text-emerald-300">({t('configs.group.current')})</span>
                         ) : null}
@@ -476,12 +499,21 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                           onClick={() => onSelect(item.id)}
                         />
                       ) : null}
-                      <IconButton
-                        icon={Trash2}
-                        variant="ghost"
-                        label={t('configs.group.remove')}
-                        onClick={() => askRemoveInbound(item)}
-                      />
+                      {item.fixed && group.length > 1 ? (
+                        <IconButton
+                          icon={Pin}
+                          variant="ghost"
+                          label={t('configs.group.fixedLocked')}
+                          disabled
+                        />
+                      ) : (
+                        <IconButton
+                          icon={Trash2}
+                          variant="ghost"
+                          label={item.origin === 'external' ? t('configs.group.detach') : t('configs.group.remove')}
+                          onClick={() => askRemoveInbound(item)}
+                        />
+                      )}
                     </div>
                   </div>
                 ))}
@@ -657,31 +689,55 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
         {addableQuery.isLoading ? (
           <div className="space-y-2"><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /></div>
         ) : addable.length ? (
-          <div className="max-h-[380px] space-y-2 overflow-y-auto pe-1">
-            {addable.map((row) => {
-              const addGb = Number(config?.totalGb || 0);
-              const addDays = config?.expiryAt ? Math.max(1, Math.ceil((config.expiryAt - Date.now()) / 86400000)) : 0;
-              const rowBase = Number(row.priceFixed || 0) + Number(row.pricePerGb || 0) * addGb + Number(row.pricePerDay || 0) * addDays;
-              const rowPrice = Math.round(rowBase * (1 - Math.min(100, Math.max(0, Number(row.discountPercent || 0))) / 100));
-              return (
-                <button
-                  key={row.id}
-                  type="button"
-                  disabled={addInbound.isPending}
-                  onClick={() => addInbound.mutate(row.id)}
-                  className="flex w-full items-center justify-between gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-start transition hover:border-emerald-400/25 hover:bg-emerald-500/[0.04] disabled:opacity-60"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate text-[12px] font-medium text-slate-200">{row.remark || `#${row.id}`}</p>
-                    <p className="text-[10px] text-slate-500">
-                      {row.protocol}{row.network ? ` · ${row.network}` : ''}{row.nodeName ? ` · ${row.nodeName}` : ''}
-                    </p>
-                  </div>
-                  <span className="shrink-0 text-[11.5px] font-semibold text-emerald-300/90">{formatMoney(rowPrice, lang, currency)}</span>
-                </button>
-              );
-            })}
-          </div>
+          <>
+            {!group.some((item) => Number(item.inboundId) === fixedInboundId) && fixedInboundId > 0 ? (
+              <p className="mb-2 flex items-start gap-2 rounded-xl border border-sky-400/20 bg-sky-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-sky-100/80">
+                <Pin className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  {t('configs.group.addFixedHint', {
+                    inbound: addable.find((row) => Number(row.id) === fixedInboundId)?.remark
+                      || `#${fixedInboundId}`,
+                  })}
+                </span>
+              </p>
+            ) : null}
+            <div className="max-h-[380px] space-y-2 overflow-y-auto pe-1">
+              {addable.map((row) => {
+                const addGb = Number(config?.totalGb || 0);
+                const addDays = config?.expiryAt ? Math.max(1, Math.ceil((config.expiryAt - Date.now()) / 86400000)) : 0;
+                const rowBase = Number(row.priceFixed || 0) + Number(row.pricePerGb || 0) * addGb + Number(row.pricePerDay || 0) * addDays;
+                const rowPrice = Math.round(rowBase * (1 - Math.min(100, Math.max(0, Number(row.discountPercent || 0))) / 100));
+                const isFixed = fixedInboundId > 0 && Number(row.id) === fixedInboundId;
+                return (
+                  <button
+                    key={row.id}
+                    type="button"
+                    disabled={addInbound.isPending}
+                    onClick={() => addInbound.mutate(row.id)}
+                    className={cx(
+                      'flex w-full items-center justify-between gap-3 rounded-xl border px-3 py-2.5 text-start transition disabled:opacity-60',
+                      isFixed
+                        ? 'border-sky-400/30 bg-sky-500/[0.07] hover:border-sky-400/45 hover:bg-sky-500/[0.1]'
+                        : 'border-white/[0.06] bg-white/[0.02] hover:border-emerald-400/25 hover:bg-emerald-500/[0.04]'
+                    )}
+                  >
+                    <div className="min-w-0">
+                      <p className="flex items-center gap-1.5 truncate text-[12px] font-medium text-slate-200">
+                        <span className="truncate">{row.remark || `#${row.id}`}</span>
+                        {isFixed ? (
+                          <Badge tone="blue" className="shrink-0 px-1.5 py-0 text-[9px]">{t('configs.group.fixedBadge')}</Badge>
+                        ) : null}
+                      </p>
+                      <p className="text-[10px] text-slate-500">
+                        {row.protocol}{row.network ? ` · ${row.network}` : ''}{row.nodeName ? ` · ${row.nodeName}` : ''}
+                      </p>
+                    </div>
+                    <span className="shrink-0 text-[11.5px] font-semibold text-emerald-300/90">{formatMoney(rowPrice, lang, currency)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </>
         ) : (
           <EmptyState icon={Server} title={t('configs.group.noMore')} className="py-6" />
         )}

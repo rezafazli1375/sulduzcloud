@@ -14,6 +14,7 @@ import {
   KeyRound,
   Pencil,
   Percent,
+  Pin,
   Plus,
   RefreshCw,
   ShieldCheck,
@@ -72,6 +73,7 @@ const EMPTY_FORM = {
   status: 'active',
   permissions: [],
   allowed_inbounds: [],
+  fixed_inbound: 0,
   max_configs: 0,
   max_total_gb: 0,
   max_gb_per_config: 0,
@@ -108,12 +110,18 @@ function UserForm({ open, onClose, editing }) {
   const queryClient = useQueryClient();
   const [form, setForm] = useState(EMPTY_FORM);
   const [showPassword, setShowPassword] = useState(false);
+  const [savingFixed, setSavingFixed] = useState(false);
 
   const inboundsQuery = useQuery({
     queryKey: ['inbounds', 'form'],
     queryFn: () => api.get('/admin/inbounds'),
     enabled: open,
   });
+
+  const inboundRemark = (id) => {
+    const row = (inboundsQuery.data?.rows || []).find((item) => Number(item.id) === Number(id));
+    return row?.remark || `#${id}`;
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -130,6 +138,7 @@ function UserForm({ open, onClose, editing }) {
         status: editing.status || 'active',
         permissions: editing.permissions || [],
         allowed_inbounds: editing.allowedInbounds || [],
+        fixed_inbound: Number(editing.fixedInbound || 0),
         max_configs: editing.limits?.maxConfigs || 0,
         max_total_gb: editing.limits?.maxTotalGb || 0,
         max_gb_per_config: editing.limits?.maxGbPerConfig || 0,
@@ -143,9 +152,47 @@ function UserForm({ open, onClose, editing }) {
     setShowPassword(false);
   }, [open, editing]);
 
+  // Panel v1.4.16: older packages — especially the subscriptions adopted from
+  // another panel — usually do not carry the fixed inbound yet. Count them
+  // first (the endpoint is read-only with dryRun) and only write after the
+  // admin sees how many customer packages change, because every add creates a
+  // real x-ui client on that server.
+  const applyFixedInbound = async (userId, preview = null) => {
+    let summary = preview;
+    if (!summary) {
+      try {
+        summary = await api.post(`/admin/users/${userId}/fixed-inbound/apply`, { dryRun: true });
+      } catch (err) {
+        toast.error(translateError(err, t));
+        return;
+      }
+    }
+    const need = Number(summary?.needFix || 0);
+    if (!need) {
+      toast.success(t('resellers.form.fixedInboundNothing', { inbound: inboundRemark(summary?.fixedInbound || form.fixed_inbound) }));
+      return;
+    }
+    const go = await confirm({
+      title: t('resellers.form.fixedInboundApplyTitle'),
+      body: t('resellers.form.fixedInboundApplyBody', { n: need, inbound: inboundRemark(summary.fixedInbound || form.fixed_inbound) }),
+    });
+    if (!go) return;
+    try {
+      const result = await api.post(`/admin/users/${userId}/fixed-inbound/apply`, { dryRun: false });
+      const healed = Number(result?.healed || 0);
+      const skipped = Number(result?.skipped || 0);
+      if (healed) toast.success(t('resellers.form.fixedInboundDone', { n: healed, m: skipped }));
+      else toast.error(t('resellers.form.fixedInboundFailed', { reason: (result?.errors || [])[0] || '' }));
+      queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
+      queryClient.invalidateQueries({ queryKey: ['admin', 'user', userId] });
+    } catch (err) {
+      toast.error(translateError(err, t));
+    }
+  };
+
   const save = useMutation({
     mutationFn: (payload) => (editing ? api.patch(`/admin/users/${editing.id}`, payload) : api.post('/admin/users', payload)),
-    onSuccess: (result) => {
+    onSuccess: async (result) => {
       // Reusing the name of a deleted reseller brings that account back, so the
       // panel says so instead of pretending it is a brand new one.
       if (result?.revived) toast.success(t('resellers.form.revived'));
@@ -161,6 +208,10 @@ function UserForm({ open, onClose, editing }) {
         } else if (Number(result.import.conflicts || 0) || Number(result.import.failed || 0)) {
           toast.warning(importMessage(result.import, t));
         }
+      }
+      const pending = Number(result?.fixedInboundPreview?.needFix || 0);
+      if (pending > 0) {
+        await applyFixedInbound(result.user.id, result.fixedInboundPreview);
       }
       queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
       queryClient.invalidateQueries({ queryKey: ['admin', 'user'] });
@@ -208,6 +259,7 @@ function UserForm({ open, onClose, editing }) {
       max_gb_per_config: Number(form.max_gb_per_config || 0),
       max_days_per_config: Number(form.max_days_per_config || 0),
       allowed_inbounds: form.allowed_inbounds,
+      fixed_inbound: Number(form.fixed_inbound || 0),
     };
     if (form.password) payload.password = form.password;
     if (form.role === 'admin') payload.permissions = form.permissions;
@@ -320,6 +372,56 @@ function UserForm({ open, onClose, editing }) {
           </div>
           <Switch checked={Boolean(form.importConfigs)} onChange={(value) => setForm((prev) => ({ ...prev, importConfigs: value }))} />
         </div>
+
+        {form.role === 'reseller' ? (
+          <div className={cx(
+            'rounded-xl border px-3.5 py-3 transition',
+            Number(form.fixed_inbound) > 0 ? 'border-sky-400/25 bg-sky-500/[0.05]' : 'border-white/[0.07] bg-white/[0.02]'
+          )}>
+            <div className="flex items-center gap-2">
+              <Pin className="h-3.5 w-3.5 text-sky-300" />
+              <p className="text-[12.5px] font-medium text-slate-200">{t('resellers.form.fixedInbound')}</p>
+            </div>
+            <div className="mt-2.5 flex flex-wrap items-end gap-2">
+              <Select
+                className="min-w-[220px] flex-1"
+                disabled={inboundsQuery.isLoading}
+                value={String(Number(form.fixed_inbound) || 0)}
+                onChange={(e) => setForm((prev) => ({ ...prev, fixed_inbound: Number(e.target.value) }))}
+              >
+                {/* While the inbound list is still loading the saved base has no
+                    matching option yet, so the box would read «بدون اینباند ثابت»
+                    and look as if the base had been cleared. Say what is really
+                    happening instead, and block a pick until the list is there. */}
+                <option value="0">
+                  {inboundsQuery.isLoading && Number(form.fixed_inbound) > 0
+                    ? t('common.loading')
+                    : t('resellers.form.fixedInboundNone')}
+                </option>
+                {inbounds.map((row) => (
+                  <option key={row.id} value={row.id}>
+                    {`${row.remark || `#${row.id}`} (${row.protocol})${row.serverName ? ` · ${row.serverName}` : ''}`}
+                  </option>
+                ))}
+              </Select>
+              {editing && Number(form.fixed_inbound) > 0 ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  loading={savingFixed}
+                  icon={RefreshCw}
+                  onClick={() => {
+                    setSavingFixed(true);
+                    Promise.resolve(applyFixedInbound(editing.id)).finally(() => setSavingFixed(false));
+                  }}
+                >
+                  {t('resellers.form.fixedInboundApply')}
+                </Button>
+              ) : null}
+            </div>
+            <p className="mt-1.5 text-[10.5px] leading-5 text-slate-500">{t('resellers.form.fixedInboundHint')}</p>
+          </div>
+        ) : null}
 
         {form.role === 'admin' ? (
           <div>
@@ -590,6 +692,15 @@ function UserDetail({ userId, onClose, onEdit }) {
   });
   const discountList = discountsQuery.data?.discounts || [];
 
+  // The drawer names the fixed inbound by its remark, so it needs the inbound
+  // list too — only fetched while a fixed inbound is actually set.
+  const detailInboundsQuery = useQuery({
+    queryKey: ['admin', 'inbounds', 'fixed-label'],
+    queryFn: () => api.get('/admin/inbounds'),
+    staleTime: 60000,
+    enabled: Boolean(userId),
+  });
+
   const user = data?.user;
   const stats = data?.stats || {};
   const configs = data?.configs?.rows || [];
@@ -756,6 +867,18 @@ function UserDetail({ userId, onClose, onEdit }) {
                 <InfoRow label={t('resellers.table.lastLogin')} value={user.lastLoginAt ? relativeTime(user.lastLoginAt, lang) : '—'} />
                 <InfoRow label={t('common.createdAt')} value={formatDate(user.createdAt, lang)} />
               </div>
+              {Number(user.fixedInbound || 0) > 0 ? (
+                <div className="mt-2 flex items-start gap-2 rounded-xl border border-sky-400/20 bg-sky-500/[0.05] px-3 py-2">
+                  <Pin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sky-300" />
+                  <div className="min-w-0">
+                    <p className="text-[11.5px] font-medium text-slate-200">{t('resellers.form.fixedInbound')}</p>
+                    <p className="mt-0.5 truncate text-[10.5px] text-sky-100/80" dir="auto">
+                      {(detailInboundsQuery.data?.rows || []).find((row) => Number(row.id) === Number(user.fixedInbound))?.remark
+                        || `#${user.fixedInbound}`}
+                    </p>
+                  </div>
+                </div>
+              ) : null}
               {user.allowedInbounds?.length ? (
                 <div className="mt-2 flex flex-wrap gap-1 border-t border-white/[0.06] pt-3">
                   {user.allowedInbounds.map((id) => <Badge key={id} tone="cyan">#{id}</Badge>)}

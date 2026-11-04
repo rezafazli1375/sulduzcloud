@@ -1277,6 +1277,223 @@ function startMockXui(inboundRows) {
       fixtureDb.close();
     }
 
+    // ------------------------------------------- v1.4.16: fixed inbound & adopted packages
+    // The bug the owner reported: a subscription adopted from the old panel has
+    // no group token, so the drawer showed no inbound at all, adding one was
+    // refused as "already exists", and deleting one would have deleted the live
+    // client on the seller's panel. The fixed inbound is the safety base: every
+    // package — including the adopted ones — must carry it.
+    const FIXED = 'fixedshop';
+    const fixedShop = await request('POST', '/api/admin/users', {
+      cookies, csrf,
+      body: { username: FIXED, password: SHOP_PASS, name: 'نماینده اینباند ثابت', role: 'reseller', balance: 100000 },
+    });
+    const fixedShopId = fixedShop.json?.data?.user?.id;
+    const fixedLogin = await request('POST', '/api/auth/login', { body: { username: FIXED, password: SHOP_PASS } });
+    const fixedCookies = cookiesFrom(fixedLogin.headers);
+    const fixedCsrf = fixedLogin.json?.data?.csrf;
+
+    const fixedDb = new Database(path.join(DATA_DIR, 'panel.db'));
+    const fixedRowIds = [];
+    try {
+      const addLegacy = (inboundId, label) => {
+        const info = fixedDb.prepare(`INSERT INTO configs
+          (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, label, customer_name,
+           total_bytes, expiry_at, enabled, status, origin, created_at, updated_at)
+          VALUES (?, ?, ?, ?, '', '', ?, 'مشتری قدیمی', ?, ?, 1, 'active', 'external', ?, ?)`)
+          .run(fixedShopId, primaryId, inboundId, `legacy-${crypto.randomBytes(8).toString('hex')}`,
+            label, 3 * 1024 ** 3, Date.now() + 30 * 86400000, Date.now(), Date.now());
+        const id = Number(info.lastInsertRowid);
+        fixedRowIds.push(id);
+        return id;
+      };
+      const legacyA = addLegacy(902, 'legacy-a');
+      const legacyB = addLegacy(904, 'legacy-b');
+
+      const legacyDetail = await request('GET', `/api/admin/configs/${legacyA}`, { cookies });
+      const legacyGroup = legacyDetail.json?.data?.group || [];
+      check('an adopted config without a subscription token still lists its own inbound',
+        legacyGroup.length === 1 && Number(legacyGroup[0].inboundId) === 902
+        && legacyGroup[0].origin === 'external' && legacyGroup[0].removable === true,
+        `group=${legacyGroup.length}`);
+
+      // Second adopted row (legacy-b) already carries inbound 904; the old
+      // (sub_id, inbound_id) test matched it because every adopted row shares
+      // the empty token, so this request answered 409.
+      const walletBeforeAdd = Number((await request('GET', '/api/auth/me', { cookies: fixedCookies })).json?.data?.user?.balance || 0);
+      const legacyAdd = await request('POST', `/api/admin/configs/${legacyA}/inbounds`, {
+        cookies, csrf, body: { inboundId: 904 },
+      });
+      const legacyAdded = legacyAdd.json?.data?.config || {};
+      check('adding an inbound that another adopted package holds is not a false conflict',
+        legacyAdd.status === 201 && Number(legacyAdded.inboundId) === 904,
+        `status=${legacyAdd.status} code=${legacyAdd.json?.error?.code}`);
+
+      const legacyAfter = await request('GET', `/api/admin/configs/${legacyA}`, { cookies });
+      const afterGroup = legacyAfter.json?.data?.group || [];
+      const mintedToken = String(legacyAfter.json?.data?.config?.subId || '');
+      check('the new inbound joins the adopted package under one minted subscription token',
+        afterGroup.length === 2 && Boolean(mintedToken)
+        && afterGroup.some((item) => Number(item.inboundId) === 902)
+        && afterGroup.some((item) => Number(item.inboundId) === 904),
+        `group=${afterGroup.length} token=${mintedToken}`);
+      const sharedToken = fixedDb.prepare('SELECT COUNT(DISTINCT sub_id) AS n FROM configs WHERE id IN (?, ?)')
+        .get(legacyA, legacyAdded.id);
+      check('both members of the healed package share exactly one subscription token',
+        Number(sharedToken.n) === 1 && Boolean(mintedToken), `distinct=${sharedToken.n}`);
+
+      // Wallet billing is on from the earlier block. The add above joined a
+      // zero-tariff inbound, so the money path is proven on the SECOND adopted
+      // package with a priced inbound: exactly one charge, and the free heal
+      // below must not touch the wallet at all.
+      const paidAdd = await request('POST', `/api/admin/configs/${legacyB}/inbounds`, {
+        cookies, csrf, body: { inboundId: 903 },
+      });
+      const walletAfterAdd = Number((await request('GET', '/api/auth/me', { cookies: fixedCookies })).json?.data?.user?.balance || 0);
+      const addCharges = fixedDb.prepare(
+        "SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND type = 'purchase' AND description LIKE 'افزودن اینباند%'"
+      ).get(fixedShopId).c;
+      check('adding a priced inbound to an adopted package charges the reseller wallet once',
+        paidAdd.status === 201 && walletAfterAdd < walletBeforeAdd && Number(addCharges) === 1,
+        `status=${paidAdd.status} balance=${walletBeforeAdd}→${walletAfterAdd} charges=${addCharges}`);
+
+      // An adopted row is not this panel's customer: detaching it must leave the
+      // live x-ui client alone, while a panel-created row still deletes it.
+      fixedDb.prepare("UPDATE configs SET origin = 'external' WHERE id = ?").run(legacyAdded.id);
+      const detach = await request('DELETE', `/api/admin/configs/${legacyAdded.id}`, { cookies, csrf });
+      check('removing an adopted config only detaches it and never deletes the x-ui client',
+        detach.status === 200 && detach.json?.data?.detachedOnly === true
+        && mockXui.clients.has(String(legacyAdded.email)) === true,
+        `status=${detach.status} detached=${detach.json?.data?.detachedOnly} client=${mockXui.clients.has(String(legacyAdded.email))}`);
+
+      const fresh = await request('POST', '/api/reseller/configs', {
+        cookies: fixedCookies, csrf: fixedCsrf,
+        body: { inboundIds: [903], gb: 5, days: 10, customerName: 'مشتری جدید' },
+      });
+      const freshConfigs = fresh.json?.data?.configs || [];
+      check('a plain package can still be created for this reseller',
+        fresh.status === 201 && freshConfigs.length === 1 && Number(freshConfigs[0].inboundId) === 903,
+        `status=${fresh.status}`);
+      const deletePanelRow = await request('DELETE', `/api/reseller/configs/${freshConfigs[0].id}`, {
+        cookies: fixedCookies, csrf: fixedCsrf,
+      });
+      check('deleting a panel-created config does remove its x-ui client',
+        deletePanelRow.status === 200 && deletePanelRow.json?.data?.detachedOnly === false
+        && mockXui.clients.has(String(freshConfigs[0].email)) === false,
+        `detached=${deletePanelRow.json?.data?.detachedOnly}`);
+
+      // The owner now names a fixed inbound for this reseller: the PATCH only
+      // counts, the real write is the explicit apply call.
+      const badFixed = await request('PATCH', `/api/admin/users/${fixedShopId}`, {
+        cookies, csrf, body: { fixed_inbound: 999999 },
+      });
+      check('a fixed inbound that is not in the panel is refused',
+        badFixed.status === 422 && badFixed.json?.error?.code === 'invalid_fixed_inbound',
+        `status=${badFixed.status} code=${badFixed.json?.error?.code}`);
+
+      const fixedPatch = await request('PATCH', `/api/admin/users/${fixedShopId}`, {
+        cookies, csrf, body: { fixed_inbound: 901 },
+      });
+      const preview = fixedPatch.json?.data?.fixedInboundPreview || {};
+      check('saving the fixed inbound previews how many existing packages miss it',
+        fixedPatch.status === 200 && Number(fixedPatch.json?.data?.user?.fixedInbound) === 901
+        && Number(preview.packages) === 2 && Number(preview.needFix) === 2 && Number(preview.healed) === 0,
+        `packages=${preview.packages} needFix=${preview.needFix} healed=${preview.healed}`);
+
+      const liveBeforeDry = fixedDb.prepare('SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND deleted_at = 0').get(fixedShopId).c;
+      const dryRun = await request('POST', `/api/admin/users/${fixedShopId}/fixed-inbound/apply`, {
+        cookies, csrf, body: { dryRun: true },
+      });
+      check('the dry run counts without writing anything',
+        dryRun.status === 200 && Number(dryRun.json?.data?.needFix) === 2 && Number(dryRun.json?.data?.healed) === 0
+        && fixedDb.prepare('SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND deleted_at = 0').get(fixedShopId).c === liveBeforeDry,
+        `needFix=${dryRun.json?.data?.needFix} healed=${dryRun.json?.data?.healed} live=${liveBeforeDry}`);
+
+      const walletBeforeHeal = Number((await request('GET', '/api/auth/me', { cookies: fixedCookies })).json?.data?.user?.balance || 0);
+      const heal = await request('POST', `/api/admin/users/${fixedShopId}/fixed-inbound/apply`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      check('the heal adds the fixed inbound to every adopted package without charging',
+        heal.status === 200 && Number(heal.json?.data?.healed) === 2 && Number(heal.json?.data?.skipped) === 0,
+        `healed=${heal.json?.data?.healed} skipped=${heal.json?.data?.skipped} errors=${JSON.stringify(heal.json?.data?.errors || [])}`);
+      const walletAfterHeal = Number((await request('GET', '/api/auth/me', { cookies: fixedCookies })).json?.data?.user?.balance || 0);
+      check('the heal takes no money — the base is a safety net, not a sale',
+        walletAfterHeal === walletBeforeHeal, `${walletBeforeHeal} → ${walletAfterHeal}`);
+
+      const healedA = await request('GET', `/api/admin/configs/${legacyA}`, { cookies });
+      const healedGroup = healedA.json?.data?.group || [];
+      const fixedMember = healedGroup.find((item) => Number(item.inboundId) === 901) || {};
+      check('the adopted package now carries the fixed inbound and it is locked',
+        healedGroup.length === 2 && fixedMember.fixed === true && fixedMember.removable === false,
+        `group=${healedGroup.length} fixed=${Boolean(fixedMember.fixed)}`);
+      check('a healed inbound inherits the package pool instead of adding quota',
+        Number(fixedMember.totalBytes) === 3 * 1024 ** 3
+        && Number(fixedMember.expiryAt) > Date.now(),
+        `bytes=${fixedMember.totalBytes}`);
+
+      const dropFixed = await request('DELETE', `/api/admin/configs/${fixedMember.id}`, { cookies, csrf });
+      check('the fixed inbound cannot be taken off a multi-inbound package',
+        dropFixed.status === 409 && dropFixed.json?.error?.code === 'fixed_inbound_locked',
+        `status=${dropFixed.status} code=${dropFixed.json?.error?.code}`);
+
+      const secondHeal = await request('POST', `/api/admin/users/${fixedShopId}/fixed-inbound/apply`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      check('healing again changes nothing — no duplicate inbound is created',
+        secondHeal.status === 200 && Number(secondHeal.json?.data?.needFix) === 0
+        && Number(secondHeal.json?.data?.already) === 2 && Number(secondHeal.json?.data?.healed) === 0,
+        `needFix=${secondHeal.json?.data?.needFix} already=${secondHeal.json?.data?.already}`);
+
+      // New configs must get the base automatically, even when the reseller only
+      // ticks one other inbound, and the allow list must always keep the base.
+      const autoFixed = await request('POST', '/api/reseller/configs', {
+        cookies: fixedCookies, csrf: fixedCsrf,
+        body: { inboundIds: [903], gb: 5, days: 10, customerName: 'مشتری خودکار' },
+      });
+      const autoConfigs = autoFixed.json?.data?.configs || [];
+      check('creating a config forces the fixed inbound into the package',
+        autoFixed.status === 201 && autoConfigs.length === 2
+        && autoConfigs.map((item) => Number(item.inboundId)).sort().join(',') === '901,903'
+        && autoConfigs.every((item) => item.subId && item.subId === autoConfigs[0].subId),
+        `rows=${autoConfigs.length} ids=${autoConfigs.map((item) => item.inboundId).join(',')}`);
+
+      const allowList = await request('PATCH', `/api/admin/users/${fixedShopId}`, {
+        cookies, csrf, body: { allowed_inbounds: [903] },
+      });
+      check('the allowed-inbound list always keeps the fixed inbound',
+        allowList.status === 200
+        && [901, 903].every((id) => (allowList.json?.data?.user?.allowedInbounds || []).includes(id)),
+        `allowed=${JSON.stringify(allowList.json?.data?.user?.allowedInbounds || [])}`);
+
+      const resellerInbounds = await request('GET', '/api/reseller/inbounds', { cookies: fixedCookies });
+      const resellerRows = resellerInbounds.json?.data?.rows || [];
+      check('the reseller picker marks the fixed inbound and keeps it selectable',
+        Number(resellerInbounds.json?.data?.fixedInbound) === 901
+        && resellerRows.some((row) => Number(row.id) === 901 && row.fixed === true),
+        `fixedInbound=${resellerInbounds.json?.data?.fixedInbound} rows=${resellerRows.length}`);
+
+      const adminPicker = await request('GET', `/api/admin/inbounds?userId=${fixedShopId}`, { cookies });
+      check('the admin picker reports the same fixed inbound',
+        Number(adminPicker.json?.data?.fixedInbound) === 901
+        && (adminPicker.json?.data?.rows || []).some((row) => Number(row.id) === 901 && row.fixed === true));
+
+      // A single-inbound package is the whole customer, so its base is removable
+      // together with the config itself.
+      const soloLegacy = addLegacy(901, 'legacy-solo');
+      const soloGroup = (await request('GET', `/api/admin/configs/${soloLegacy}`, { cookies })).json?.data?.group || [];
+      check('a package of one keeps its fixed inbound removable with the config',
+        soloGroup.length === 1 && soloGroup[0].fixed === true && soloGroup[0].removable === true,
+        `fixed=${soloGroup[0]?.fixed} removable=${soloGroup[0]?.removable}`);
+      const deleteSolo = await request('DELETE', `/api/admin/configs/${soloLegacy}`, { cookies, csrf });
+      check('deleting that single adopted config detaches it',
+        deleteSolo.status === 200 && deleteSolo.json?.data?.detachedOnly === true,
+        `status=${deleteSolo.status}`);
+    } finally {
+      for (const id of fixedRowIds) fixedDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      fixedDb.prepare('DELETE FROM configs WHERE user_id = ?').run(fixedShopId);
+      fixedDb.close();
+    }
+
     const v1Bad = await request('GET', '/api/v1/me', { headers: { 'x-api-key': 'sc_invalid' } });
     check('api v1 rejects bad key', v1Bad.status === 401);
 
