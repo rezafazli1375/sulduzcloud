@@ -1,7 +1,7 @@
 'use strict';
 
 const { getDb } = require('../db');
-const { dayKey, statusOf, CONFIG_GROUP_KEY_SQL } = require('../utils');
+const { dayKey, statusOf, CONFIG_GROUP_KEY_SQL, CONFIG_GROUP_USED_SQL } = require('../utils');
 
 const DAY_MS = 86400000;
 
@@ -18,9 +18,11 @@ function dayRange(days) {
 
 // Counts customers (packages), not x-ui clients: a two-inbound package is one
 // customer. A package is ONE shared traffic pool (like a 3x-ui subscription):
-// its quota is the largest member quota and its usage is the sum of every
-// member's counters. Status follows the package, not each inbound; partially
-// inconsistent members (manual disable, mixed expiry) are reported as `mixed`.
+// its quota is the largest member quota and its usage follows
+// CONFIG_GROUP_USED_SQL: every distinct x-ui client contributes its own counters, so
+// an adopted customer who sits on several inbounds is counted once, not per inbound.
+// Status follows the package, not each inbound; partially inconsistent members (manual
+// disable, mixed expiry) are reported as `mixed`.
 function statusCounts(userId = 0) {
   const db = getDb();
   const scope = `${userId ? 'AND c.user_id = ?' : ''} AND ${VISIBLE_SQL}`;
@@ -46,7 +48,7 @@ function statusCounts(userId = 0) {
          SUM(CASE WHEN c.enabled = 0 THEN 1 ELSE 0 END) AS disabled_n,
          MAX(c.expiry_at) AS expiry_at,
          MAX(c.total_bytes) AS quota,
-         SUM(c.up_bytes + c.down_bytes) AS used
+         ${CONFIG_GROUP_USED_SQL} AS used
        FROM configs c WHERE c.deleted_at = 0 ${scope}
        GROUP BY gkey
      )`

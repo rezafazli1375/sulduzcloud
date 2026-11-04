@@ -192,12 +192,29 @@ router.get('/sub/:token', asyncH(async (req, res) => {
   ).all(token);
   if (!rows.length) throw new ApiError(404, 'not_found', 'Subscription not found');
 
-  // The package is one shared pool: every member row carries the same limit,
-  // usage is summed across inbounds and the latest expiry wins. Client apps
-  // read these numbers from the `subscription-userinfo` header.
+  // The package is one shared pool: every member row carries the same limit and
+  // the latest expiry wins. Client apps read these numbers from the
+  // `subscription-userinfo` header.
+  //
+  // Usage depends on HOW MANY x-ui clients stand behind the package. A package the
+  // panel created itself has one client per inbound, so the pool fills up only when
+  // the counters of all those clients are added together. A subscription adopted
+  // from another panel is ONE client attached to several inbounds, and the panel
+  // stores it as one row per inbound — every row carrying the same live counters.
+  // Summing those would multiply the customer's usage by his inbound count, so each
+  // client contributes its own highest row (same rule as the panel's own lists).
+  const perClient = new Map();
+  for (const row of rows) {
+    const key = String(row.email || '') || `id:${row.id}`;
+    const seen = perClient.get(key) || { up: 0, down: 0 };
+    perClient.set(key, {
+      up: Math.max(seen.up, Number(row.up_bytes || 0)),
+      down: Math.max(seen.down, Number(row.down_bytes || 0)),
+    });
+  }
   const quota = rows.reduce((max, row) => Math.max(max, Number(row.total_bytes || 0)), 0);
-  const upload = rows.reduce((sum, row) => sum + Number(row.up_bytes || 0), 0);
-  const download = rows.reduce((sum, row) => sum + Number(row.down_bytes || 0), 0);
+  const upload = [...perClient.values()].reduce((sum, item) => sum + item.up, 0);
+  const download = [...perClient.values()].reduce((sum, item) => sum + item.down, 0);
   const expireAt = rows.reduce((max, row) => Math.max(max, Number(row.expiry_at || 0)), 0);
   const userinfoHeader = `upload=${upload}; download=${download}; total=${quota}; expire=${expireAt > 0 ? Math.floor(expireAt / 1000) : 0}`;
 
@@ -216,8 +233,17 @@ router.get('/sub/:token', asyncH(async (req, res) => {
   }
 
   const links = [];
+  // x-ui answers with EVERY link that client has, so the fetch is per client and not
+  // per row: an adopted customer on three inbounds is three rows of one client, and
+  // asking three times would hand the app nine links, six of them duplicates. A row
+  // the reseller switched off is still skipped, but a disabled row never hides the
+  // client from a sibling that is enabled.
+  const fetched = new Set();
   for (const row of rows) {
     if (!row.enabled) continue;
+    const key = `${Number(row.server_id || 0)}|${String(row.email)}`;
+    if (fetched.has(key)) continue;
+    fetched.add(key);
     try {
       const server = serversService.resolveServer(row.server_id || 0);
       links.push(...await xui.clientLinks(row.email, server));
@@ -226,7 +252,7 @@ router.get('/sub/:token', asyncH(async (req, res) => {
     }
   }
   if (subCache.size > 1000) subCache.clear();
-  const body = Buffer.from(links.join('\n'), 'utf8').toString('base64');
+  const body = Buffer.from([...new Set(links)].join('\n'), 'utf8').toString('base64');
   subCache.set(token, { at: Date.now(), body });
   applyHeaders(res);
   return res.type('text/plain').send(body);

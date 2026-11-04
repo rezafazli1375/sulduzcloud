@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS configs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
   inbound_id INTEGER NOT NULL,
-  email TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL,
   sub_id TEXT NOT NULL DEFAULT '',
   xui_sub_id TEXT NOT NULL DEFAULT '',
   uuid TEXT NOT NULL DEFAULT '',
@@ -118,6 +118,12 @@ CREATE INDEX IF NOT EXISTS idx_configs_user ON configs(user_id);
 CREATE INDEX IF NOT EXISTS idx_configs_inbound ON configs(inbound_id);
 CREATE INDEX IF NOT EXISTS idx_configs_status ON configs(status);
 CREATE INDEX IF NOT EXISTS idx_configs_sub ON configs(sub_id);
+-- Panel v1.4.17: one x-ui client can be attached to several inbounds at the same
+-- time (that is exactly how a seller panel builds a multi-inbound subscription),
+-- so the email alone is no longer unique - a customer is the pair
+-- (email, inbound_id). The old UNIQUE(email) made the importer keep only the
+-- FIRST inbound of such a client and silently drop the rest.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_configs_email_inbound ON configs(email, inbound_id);
 
 CREATE TABLE IF NOT EXISTS usage_daily (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -278,6 +284,74 @@ function migrate(db) {
   // package can never end up with zero inbounds and a customer can never be left
   // without a subscription by removing the wrong inbound.
   ensureColumn(db, 'users', 'fixed_inbound', 'INTEGER NOT NULL DEFAULT 0');
+  // Panel v1.4.17: the old column-level UNIQUE(email) is replaced by
+  // UNIQUE(email, inbound_id). See rebuildConfigs().
+  rebuildConfigs(db);
+}
+
+/**
+ * `configs.email` was declared UNIQUE when the panel assumed one row per x-ui
+ * client. A client adopted out of an existing panel is routinely attached to
+ * several inbounds at once, and that is exactly what the importer has to record,
+ * so the constraint moves to the pair (email, inbound_id).
+ *
+ * SQLite cannot drop a column-level UNIQUE, so the table is rebuilt in place:
+ * the definition is regenerated from the live column list (which is already the
+ * final one because every ensureColumn() ran first), all rows are copied with
+ * their original ids, the secondary indexes are recreated and the new unique
+ * index is added. Nothing references configs by id, so the ids staying stable
+ * also keeps usage_daily and every stored link valid.
+ */
+function rebuildConfigs(db) {
+  const info = db.prepare('PRAGMA index_list(configs)').all();
+  const uniqueEmailOnly = info.some((idx) => {
+    if (Number(idx.unique) !== 1) return false;
+    if (idx.origin !== 'u' && idx.origin !== 1) return false;
+    const cols = db.prepare(`PRAGMA index_info('${idx.name}')`).all().map((c) => c.name);
+    return cols.length === 1 && cols[0] === 'email';
+  });
+  if (!uniqueEmailOnly) return;
+
+  const columns = db.prepare('PRAGMA table_info(configs)').all();
+  const names = columns.map((col) => col.name);
+  const defs = columns.map((col) => {
+    let def = `"${col.name}" ${col.type || 'TEXT'}`;
+    if (Number(col.pk) === 1) def += ' PRIMARY KEY AUTOINCREMENT';
+    else if (Number(col.notnull) === 1) def += ' NOT NULL';
+    if (col.dflt_value !== null && col.dflt_value !== undefined) def += ` DEFAULT ${col.dflt_value}`;
+    return def;
+  });
+  // sqlite_master carries the CREATE statement of every explicit index; the
+  // automatic ones (the UNIQUE constraint being removed, the primary key) have
+  // no SQL and are rebuilt by the table definition itself. idx_configs_email_inbound
+  // is created explicitly below, so it is not replayed here.
+  const otherIndexes = db.prepare(
+    `SELECT sql FROM sqlite_master
+      WHERE type = 'index' AND tbl_name = 'configs' AND sql IS NOT NULL
+        AND name <> 'idx_configs_email_inbound'`
+  ).all().map((row) => row.sql);
+
+  const before = Number(db.prepare('SELECT COUNT(*) AS c FROM configs').get().c);
+  const tx = db.transaction(() => {
+    const colList = names.map((name) => `"${name}"`).join(', ');
+    db.exec(`CREATE TABLE configs_new (\n  ${defs.join(',\n  ')}\n)`);
+    db.exec(`INSERT INTO configs_new (${colList}) SELECT ${colList} FROM configs`);
+    db.exec('DROP TABLE configs');
+    db.exec('ALTER TABLE configs_new RENAME TO configs');
+    for (const sql of otherIndexes) db.exec(sql);
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_configs_email_inbound ON configs(email, inbound_id)');
+  });
+  tx();
+
+  const after = Number(db.prepare('SELECT COUNT(*) AS c FROM configs').get().c);
+  if (after !== before) {
+    throw new Error(`[db] configs rebuild changed the row count (${before} -> ${after})`);
+  }
+  const bad = db.prepare('PRAGMA integrity_check').get();
+  if (String(Object.values(bad || {})[0]) !== 'ok') {
+    throw new Error(`[db] configs rebuild left the database unhealthy: ${JSON.stringify(bad)}`);
+  }
+  console.log(`[db] configs rebuilt without UNIQUE(email): ${after} rows, ids preserved`);
 }
 
 function rebuildInbounds(db) {

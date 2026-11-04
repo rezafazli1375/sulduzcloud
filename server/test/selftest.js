@@ -160,7 +160,10 @@ function startMockXui(inboundRows) {
         }
         if (route.startsWith('/clients/links/')) {
           const email = emailOf('/clients/links/');
-          return send([`vless://mock-${email}@127.0.0.1:1000?type=tcp#${encodeURIComponent(email)}`]);
+          // Real x-ui returns one link per inbound this client is attached to, which is
+          // what makes the adopted multi-inbound case testable from the panel side.
+          const attached = clients.get(email)?.inboundIds?.length ? clients.get(email).inboundIds : [1000];
+          return send(attached.map((id) => `vless://mock-${email}@127.0.0.1:${1000 + Number(id)}?type=tcp#${encodeURIComponent(email)}-${id}`));
         }
         if (route.startsWith('/clients/resetTraffic/')) return send(true);
         return send(null);
@@ -674,11 +677,57 @@ function startMockXui(inboundRows) {
     check(
       'existing subscriptions are adopted by telegram id',
       tgImport.status === 200
-        && tgImport.json.data.imported === 4
+        && tgImport.json.data.imported === 5
         && tgImport.json.data.restored === 0
         && tgImport.json.data.servers === 1,
       `imported=${tgImport.json?.data?.imported} servers=${tgImport.json?.data?.servers}`
     );
+    // v1.4.17: this client is attached to inbound 901 AND 902 on the seller panel.
+    // The panel used to record only the first one (configs.email was UNIQUE), which
+    // is why the owner saw a single inbound on his legacy configurations.
+    const adoptedRows = new Database(path.join(DATA_DIR, 'panel.db'))
+      .prepare("SELECT id, inbound_id, sub_id, origin FROM configs WHERE email = ? AND deleted_at = 0 ORDER BY inbound_id")
+      .all(`${TG_ID}-11111`);
+    check('every inbound of an adopted client gets its own row',
+      adoptedRows.length === 2 && adoptedRows.map((row) => row.inbound_id).join(',') === '901,902'
+        && adoptedRows.every((row) => row.origin === 'external'),
+      `rows=${adoptedRows.length} [${adoptedRows.map((row) => row.inbound_id).join(',')}]`);
+    check('both rows share ONE subscription token (one customer, one pool)',
+      adoptedRows.length === 2 && Boolean(adoptedRows[0].sub_id)
+        && adoptedRows[0].sub_id === adoptedRows[1].sub_id,
+      `tokens=${adoptedRows.map((row) => row.sub_id).join('|')}`);
+    const adoptedDetail = await request('GET', `/api/admin/configs/${adoptedRows?.[0]?.id}`, { cookies });
+    const adoptedGroup = adoptedDetail.json?.data?.group || [];
+    check('the edit drawer of the legacy config lists both inbounds',
+      adoptedDetail.status === 200 && adoptedGroup.length === 2
+        && adoptedGroup.map((item) => item.inboundId).sort().join(',') === '901,902',
+      `group=${adoptedGroup.length}`);
+    check('adoption never created, changed or removed a client on the panel',
+      mockXui.clients.get(`${TG_ID}-11111`)?.id === 'tg-uuid-1'
+        && mockXui.clients.get(`${TG_ID}-11111`)?.subId === 'tg-sub-1',
+      `id=${mockXui.clients.get(`${TG_ID}-11111`)?.id}`);
+    const tgListAfterAdopt = await request('GET', `/api/admin/configs?userId=${tgUserId}&pageSize=50`, { cookies });
+    const adoptedPackage = (tgListAfterAdopt.json?.data?.rows || [])
+      .find((row) => row.email === `${TG_ID}-11111`);
+    check('the customer still counts as ONE package carrying both inbounds',
+      Number(adoptedPackage?.groupCount) === 2
+        && (adoptedPackage?.inbounds || []).length === 2
+        && Number(adoptedPackage?.used) === 33,
+      `groupCount=${adoptedPackage?.groupCount} used=${adoptedPackage?.used}`);
+    // The customer's own subscription link: one x-ui client behind two rows must give
+    // two links, not four, and must advertise its counters once, not doubled.
+    const adoptedToken = adoptedRows?.[0]?.sub_id;
+    const adoptedFeed = await request('GET', `/api/sub/${adoptedToken}`);
+    const adoptedLinks = Buffer.from(String(adoptedFeed?.raw || ''), 'base64').toString('utf8').split('\n').filter(Boolean);
+    check('the adopted customer is served one link per inbound (no duplicates)',
+      adoptedFeed.status === 200 && adoptedLinks.length === 2 && new Set(adoptedLinks).size === 2
+        && adoptedLinks.every((link) => link.startsWith('vless://')),
+      `status=${adoptedFeed.status} links=${adoptedLinks.length} [${adoptedLinks.join(' ')}]`.slice(0, 200));
+    const adoptedInfo = String(adoptedFeed.headers?.['subscription-userinfo'] || '');
+    check('the adopted feed advertises the shared client once',
+      adoptedInfo.includes('upload=11') && adoptedInfo.includes('download=22')
+        && adoptedInfo.includes(`total=${5 * TG_GB}`),
+      `header=${adoptedInfo}`);
     const tgDetail = await request('GET', `/api/admin/users/${tgUserId}`, { cookies });
     const tgEmails = (tgDetail.json?.data?.configs?.rows || []).map((row) => row.email);
     check(
@@ -698,7 +747,7 @@ function startMockXui(inboundRows) {
     const tgImportAgain = await request('POST', `/api/admin/users/${tgUserId}/import`, { cookies, csrf, body: {} });
     check(
       'adopting twice refreshes instead of duplicating',
-      tgImportAgain.json?.data?.imported === 0 && tgImportAgain.json?.data?.refreshed === 4,
+      tgImportAgain.json?.data?.imported === 0 && tgImportAgain.json?.data?.refreshed === 5,
       `imported=${tgImportAgain.json?.data?.imported} refreshed=${tgImportAgain.json?.data?.refreshed}`
     );
 
@@ -770,7 +819,7 @@ function startMockXui(inboundRows) {
     check(
       'turning the switch back on re-runs adoption',
       tgOn.status === 200 && tgOn.json.data.user.importConfigs === true
-        && tgOn.json.data.import?.refreshed === 4,
+        && tgOn.json.data.import?.refreshed === 5,
       `refreshed=${tgOn.json?.data?.import?.refreshed}`
     );
     const tgOnList = await request('GET', '/api/reseller/configs', { cookies: tgCookies });

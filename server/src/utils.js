@@ -109,10 +109,40 @@ function statusOf(configRow, at = Date.now()) {
 
 // A customer package is every config of one reseller on one server that shares
 // the subscription token. Names are not identities, and legacy rows without a
-// token stay independent. `c` must be the configs table alias in the query.
+// token stay independent - with one exception: a subscription adopted out of a
+// seller panel keeps the SAME x-ui email on every inbound it is attached to, so
+// those rows are grouped by email and stay one customer with several inbounds.
+// `c` must be the configs table alias in the query.
 const CONFIG_GROUP_KEY_SQL = `(CASE WHEN c.sub_id <> ''
   THEN 'G:' || c.user_id || ':' || c.server_id || ':' || c.sub_id
+  WHEN c.origin = 'external' AND c.email <> ''
+    THEN 'E:' || c.user_id || ':' || c.server_id || ':' || c.email
   ELSE 'C:' || c.id END)`;
+
+// Traffic of one package, counted per x-ui CLIENT and only then added together:
+//   • a package the panel created itself has one distinct client per inbound, so
+//     their counters simply add up;
+//   • a subscription adopted from another panel is ONE client sitting on several
+//     inbounds, stored as one row per inbound with the seller's counters repeated on
+//     every row — that client must be counted once, not once per inbound;
+//   • a package can hold both at once (an adopted customer given a new inbound), so
+//     each client contributes its own highest row and the clients are summed.
+// The inner predicate mirrors groupRows(): the group is (user, server, token), or for
+// tokenless adopted rows (user, server, email), or that one row alone.
+// `c` must be the configs table alias of the grouped query.
+const CONFIG_GROUP_USED_SQL = `(
+  SELECT SUM(member_total) FROM (
+    SELECT MAX(c2.up_bytes + c2.down_bytes) AS member_total
+    FROM configs c2
+    WHERE c2.deleted_at = 0
+      AND (CASE
+        WHEN c.sub_id <> '' THEN c2.user_id = c.user_id AND c2.server_id = c.server_id AND c2.sub_id = c.sub_id
+        WHEN c.origin = 'external' AND c.email <> ''
+          THEN c2.user_id = c.user_id AND c2.server_id = c.server_id AND c2.email = c.email AND c2.origin = 'external'
+        ELSE c2.id = c.id
+      END)
+    GROUP BY c2.email
+  ))`;
 
 function sanitizeUser(row) {
   if (!row) return null;
@@ -311,6 +341,7 @@ module.exports = {
   parseNumberArray,
   statusOf,
   CONFIG_GROUP_KEY_SQL,
+  CONFIG_GROUP_USED_SQL,
   sanitizeUser,
   sanitizeConfig,
   pageParams,

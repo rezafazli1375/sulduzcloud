@@ -43,6 +43,7 @@ const TG = '700100200';
 
 const clients = new Map();
 const requestedServers = [];
+const xuiWrites = [];
 
 function seed() {
   const db = getDb();
@@ -144,6 +145,15 @@ function stubXui() {
   xui.inbounds = async () => [];
   xui.nodes = async () => [];
   xui.inboundsSlim = async () => [];
+  // Adoption is a read-only operation: it must never create, change or remove a
+  // client on the seller panel. Any write here is a bug, so make it loud.
+  for (const name of ['addClient', 'updateClient', 'deleteClient', 'resetTraffic',
+    'setEnabled', 'setIdentity', 'adjustMany', 'attachInbounds', 'detachInbounds']) {
+    xui[name] = async () => {
+      xuiWrites.push(name);
+      throw new Error(`adoption must never write to x-ui (${name})`);
+    };
+  }
 }
 
 async function run() {
@@ -201,8 +211,10 @@ async function run() {
   check('the matcher finds every naming style (own, prefixed, tgId, bare id)',
     first.matched === 9, `matched=${first.matched}`);
   check('imported new subscriptions + restored the deleted one',
-    first.imported === 6 && first.restored === 1,
+    first.imported === 7 && first.restored === 1,
     `imported=${first.imported} restored=${first.restored} skipped=${first.skipped} conflicts=${first.conflicts}`);
+  check('every inbound of an adopted client is recorded, not only the first',
+    first.attached === 9, `attached=${first.attached}`);
   check('an unreachable panel is reported, not fatal', first.failed === 1 && first.errors.length === 1, first.errors.join(' | '));
   check('disabled panels are never queried',
     !requestedServers.includes(2) && requestedServers.includes(1) && requestedServers.includes(3),
@@ -211,12 +223,14 @@ async function run() {
     first.conflicts === 1 && first.skipped === 1,
     `conflicts=${first.conflicts} skipped=${first.skipped}`);
 
-  const rows = db.prepare('SELECT * FROM configs WHERE user_id = ? ORDER BY email').all(Number(shop.id));
+  const rows = db.prepare('SELECT * FROM configs WHERE user_id = ? ORDER BY email, id').all(Number(shop.id));
+  const rowsOf = (email) => rows.filter((row) => row.email === email);
   const byEmail = new Map(rows.map((row) => [row.email, row]));
   check('prefix traps, suffix traps and foreign ids stay out of the reseller list',
     !byEmail.has('7001002000-33333') && !byEmail.has('999999-44444')
       && !byEmail.has('700100200-55555') && !byEmail.has('abc-700100200'));
-  const multi = byEmail.get('700100200-11111');
+  const multi = rowsOf('700100200-11111')[0];
+  const multiSiblings = rowsOf('700100200-11111');
   check('imported row keeps quota, usage, subId and uuid',
     multi
       && Number(multi.total_bytes) === 10 * GB
@@ -224,9 +238,17 @@ async function run() {
       && Number(multi.down_bytes) === 200
       && multi.xui_sub_id === 'sub-1'
       && multi.uuid === 'uuid-1'
-      && Number(multi.server_id) === 1
-      && multi.sub_id === '',
+      && Number(multi.server_id) === 1,
     multi ? `${multi.total_bytes}/${multi.up_bytes}/${multi.down_bytes}` : 'missing');
+  check('v1.4.17: one adopted client on two inbounds becomes two rows',
+    multiSiblings.length === 2
+      && multiSiblings.map((row) => Number(row.inbound_id)).sort().join(',') === '10,20'
+      && multiSiblings.every((row) => row.origin === 'external' && row.xui_sub_id === 'sub-1'),
+    `rows=${multiSiblings.length} [${multiSiblings.map((row) => row.inbound_id).join(',')}]`);
+  check('v1.4.17: both siblings share ONE group token (one customer, one pool)',
+    multiSiblings.length === 2 && multiSiblings[0].sub_id
+      && multiSiblings.every((row) => row.sub_id === multiSiblings[0].sub_id),
+    multiSiblings.map((row) => `'${row.sub_id}'`).join(' vs '));
   check('imported rows are marked as external (old panel)',
     Boolean(byEmail.get('german🇩🇪-700100200-39960'))
       && byEmail.get('german🇩🇪-700100200-39960').origin === 'external',
@@ -257,6 +279,8 @@ async function run() {
 
   const tx = db.prepare('SELECT COUNT(*) AS c FROM transactions').get().c;
   check('importing never charges the wallet', Number(tx) === 0, `transactions=${tx}`);
+  check('adoption never writes to the seller panel (read-only, no client created or removed)',
+    xuiWrites.length === 0, xuiWrites.join(','));
 
   // ------------------------------------------------------------ second run
   // The panel changed under us: quota, usage, expiry, uuid, subId and enable
@@ -271,7 +295,7 @@ async function run() {
 
   const second = await configsService.importTelegramClients(shop);
   check('re-running refreshes, never duplicates',
-    second.imported === 0 && second.restored === 0 && second.refreshed === 7
+    second.imported === 0 && second.restored === 0 && second.refreshed === 8
       && second.skipped === 1 && second.conflicts === 1,
     `imported=${second.imported} restored=${second.restored} refreshed=${second.refreshed} skipped=${second.skipped} conflicts=${second.conflicts}`);
   const refreshed = db.prepare("SELECT * FROM configs WHERE email = '700100200-11111'").get();
@@ -287,8 +311,56 @@ async function run() {
   check('a refresh keeps the reseller note and customer name',
     refreshed.note === 'keep me' && refreshed.customer_name === 'Cust',
     `${refreshed.note}/${refreshed.customer_name}`);
-  check('refreshing does not create a second row',
-    db.prepare("SELECT COUNT(*) AS c FROM configs WHERE email = '700100200-11111'").get().c === 1);
+  check('re-running keeps exactly the two rows of that client (no duplicates)',
+    db.prepare("SELECT COUNT(*) AS c FROM configs WHERE email = '700100200-11111'").get().c === 2);
+  // ------------------------------------------------- v1.4.17: one customer, two inbounds
+  const legacyPackage = configsService.listConfigs({ userId: shop.id }, { role: 'admin', id: 1 })
+    .rows.find((row) => row.email === '700100200-11111');
+  check('the adopted package lists every inbound the client is attached to',
+    legacyPackage
+      && legacyPackage.groupCount === 2
+      && (legacyPackage.inbounds || []).map((item) => item.id).sort().join(',') === '10,20',
+    legacyPackage ? `groupCount=${legacyPackage.groupCount} inbounds=${JSON.stringify(legacyPackage.inbounds)}` : 'package missing');
+  check('the shared client is counted ONCE in the pool, not once per inbound',
+    legacyPackage
+      && Number(legacyPackage.used) === 1100
+      && Number(legacyPackage.totalBytes) === 15 * GB,
+    legacyPackage ? `used=${legacyPackage.used} quota=${legacyPackage.totalBytes}` : 'package missing');
+  // 11111 is the only two-inbound customer; its 500+600 must not be summed twice.
+  // 22222:3 700100200:7 88888:11 77777:15 german:50 unrelated:90 => 176
+  check('the reseller traffic total does not double-count it',
+    usersService.userStats(shop.id).usedBytes === 1276,
+    `usedBytes=${usersService.userStats(shop.id).usedBytes}`);
+  const drawer = configsService.packageView(refreshed);
+  check('the edit drawer of an adopted config shows both inbounds',
+    drawer && (drawer.inbounds || []).map((item) => item.id).sort().join(',') === '10,20',
+    drawer ? `inbounds=${JSON.stringify((drawer.inbounds || []).map((item) => item.id))}` : 'no drawer');
+
+  // A package can hold an adopted customer AND a client this panel created for him
+  // (the fixed-inbound heal and «افزودن اینباند» both do that). Each x-ui client must
+  // then contribute its own counters once: the adopted one is repeated on its two
+  // rows, the new one appears once. 1100 + 150, never 500+600+500+600+150.
+  const mixedToken = refreshed.sub_id;
+  db.prepare(`INSERT INTO configs
+      (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, uuid, label, customer_name,
+       total_bytes, expiry_at, enabled, status, origin, up_bytes, down_bytes, created_at, updated_at)
+      VALUES (?, ?, ?, 'mixed-client-999', ?, '', 'uuid-mixed', 'added', '', ?, ?, 1, 'active', 'external', 100, 50, ?, ?)`)
+    .run(refreshed.user_id, refreshed.server_id, refreshed.inbound_id, mixedToken,
+      refreshed.total_bytes, refreshed.expiry_at, Date.now(), Date.now());
+  const mixedPackage = configsService.listConfigs({ userId: shop.id }, { role: 'admin', id: 1 })
+    .rows.find((row) => row.subId === mixedToken);
+  check('a package with the adopted client plus a new client counts each of them once',
+    mixedPackage && mixedPackage.groupCount === 3 && Number(mixedPackage.used) === 1250,
+    mixedPackage ? `groupCount=${mixedPackage.groupCount} used=${mixedPackage.used}` : 'package missing');
+  const mixedRow = db.prepare("SELECT * FROM configs WHERE email = 'mixed-client-999'").get();
+  check('the drawer of that mixed package agrees with the list',
+    Number(configsService.packageView(mixedRow).used) === 1250
+      && Number(configsService.packageView(refreshed).used) === 1250,
+    `used=${configsService.packageView(mixedRow).used}`);
+  check('the reseller total adds the new client without repeating the adopted one',
+    usersService.userStats(shop.id).usedBytes === 1426,
+    `usedBytes=${usersService.userStats(shop.id).usedBytes}`);
+  db.prepare("DELETE FROM configs WHERE email = 'mixed-client-999'").run();
 
   const noId = await configsService.importTelegramClients(legacy);
   check('a user without a telegram id imports nothing', noId.imported === 0 && noId.servers === 0);
@@ -296,7 +368,7 @@ async function run() {
   // ------------------------------------------------ package + stats integration
   const stats = usersService.userStats(shop.id);
   check('imported subscriptions appear in the reseller stats',
-    stats.packages === 7 && stats.configs === 7 && stats.externalPackages === 7,
+    stats.packages === 7 && stats.configs === 8 && stats.externalPackages === 7,
     `packages=${stats.packages} rows=${stats.configs} external=${stats.externalPackages}`);
   const listing = configsService.listConfigs({}, { role: 'admin', id: 1 });
   const shopRows = listing.rows.filter((row) => Number(row.userId) === Number(shop.id));
@@ -314,7 +386,7 @@ async function run() {
     `external=${externalOnly.total} panel=${panelOnly.total}`);
   const csvRows = configsService.exportRows({ origin: 'external' }, { role: 'admin' });
   check('CSV export honours the origin filter',
-    csvRows.length === 7 && csvRows.every((row) => row.origin === 'external'), `rows=${csvRows.length}`);
+    csvRows.length === 8 && csvRows.every((row) => row.origin === 'external'), `rows=${csvRows.length}`);
 
   // ------------------------------------------------- adoption switch off/on
   const off = usersService.updateUser(shop.id, { import_configs: false });
@@ -322,7 +394,7 @@ async function run() {
   const offImport = await configsService.importTelegramClients(off);
   check('a switched-off reseller imports nothing', offImport.enabled === false && offImport.matched === 0);
   check('switching off deletes nothing from the database',
-    db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external'").get(Number(shop.id)).c === 7);
+    db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external'").get(Number(shop.id)).c === 8);
   const offStats = usersService.userStats(shop.id);
   check('hidden adopted subscriptions leave the stats',
     offStats.packages === 0 && offStats.configs === 0 && offStats.externalPackages === 0,
@@ -338,8 +410,8 @@ async function run() {
   const backOn = usersService.updateUser(shop.id, { import_configs: true });
   const onImport = await configsService.importTelegramClients(backOn);
   check('turning it back on re-adopts the same rows',
-    sanitizeUser(backOn).importConfigs === true && onImport.refreshed === 7
-      && db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external'").get(Number(shop.id)).c === 7,
+    sanitizeUser(backOn).importConfigs === true && onImport.refreshed === 8
+      && db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external'").get(Number(shop.id)).c === 8,
     `refreshed=${onImport.refreshed}`);
   const onList = configsService.listConfigs({ userId: shop.id }, { role: 'admin', id: 1 });
   check('turning it back on shows the rows again', onList.rows.length === 7, `rows=${onList.rows.length}`);
@@ -370,7 +442,7 @@ async function run() {
     `rows=${off2List.rows.length} packages=${off2Stats.packages}`);
   check('the reseller still owns the hidden rows after switching off',
     Number(off2.import_configs) === 0
-      && db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external' AND deleted_at = 0").get(Number(shop.id)).c === 7);
+      && db.prepare("SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND origin = 'external' AND deleted_at = 0").get(Number(shop.id)).c === 8);
 
   // A reseller created with the switch already off imports nothing on create.
   const offUser = usersService.createUser({
@@ -381,6 +453,55 @@ async function run() {
   const offUserImport = await configsService.importTelegramClients(offUser);
   check('a reseller created switched off has no adoption pass',
     offUserImport.enabled === false && offUserImport.matched === 0);
+
+  // --------------------------- v1.4.17: the quota enforcer must not cut an adopted customer
+  // x-ui reports ONE set of counters per client, and an adopted customer is kept as
+  // one row per inbound with those same numbers repeated on every row. Adding them
+  // per row makes a three-inbound customer who used 4 GiB of his shared 10 GiB pool
+  // look 12 GiB deep, and the background sync would then switch off a paying
+  // customer who still has two thirds of his traffic left — on the SELLER's panel.
+  const heavyTg = '700100300';
+  const heavy = `${heavyTg}-90000`;
+  db.prepare(
+    `INSERT INTO inbounds (id, server_id, xui_id, remark, protocol, enabled, visible, updated_at)
+     VALUES (30, 1, 13, 'in-13', 'vless', 1, 1, ?)`
+  ).run(Date.now());
+  clients.set(heavy, {
+    email: heavy, inboundIds: [11, 12, 13], subId: 'sub-heavy', uuid: 'uuid-heavy', flow: '',
+    totalBytes: 10 * GB, expiryAt: FUTURE, enabled: true,
+    up: 2 * GB, down: 2 * GB, lastOnlineAt: NOW, comment: 'three inbounds', createdAt: NOW - 5000,
+  });
+  const heavyShop = usersService.createUser({
+    username: 'heavyshop', password: 'password123', role: 'reseller', telegram_id: heavyTg,
+  });
+  await configsService.importTelegramClients(heavyShop);
+  const heavyRows = db.prepare('SELECT * FROM configs WHERE email = ? AND deleted_at = 0 ORDER BY id').all(heavy);
+  check('a customer on three seller inbounds is adopted as three rows under one token',
+    heavyRows.length === 3 && new Set(heavyRows.map((item) => item.sub_id)).size === 1
+      && new Set(heavyRows.map((item) => Number(item.inbound_id))).size === 3,
+    `rows=${heavyRows.length}`);
+
+  const writesBefore = xuiWrites.length;
+  const sync = await configsService.syncConfigs({});
+  check('a full sync does not switch off a customer who is inside his shared pool',
+    xuiWrites.length === writesBefore && sync.disabled === 0,
+    `writes=${xuiWrites.slice(writesBefore).join(',')} disabled=${sync.disabled}`);
+  check('every row of that customer is still enabled in the panel',
+    db.prepare('SELECT COUNT(*) AS c FROM configs WHERE email = ? AND enabled = 1').get(heavy).c === 3);
+  const heavyPackage = configsService.listConfigs({ userId: heavyShop.id }, { role: 'admin', id: 1 }).rows[0];
+  check('the pool of that customer reads 4 GiB, not 12 GiB',
+    heavyPackage && heavyPackage.groupCount === 3
+      && Number(heavyPackage.used) === 4 * GB
+      && Number(heavyPackage.totalBytes) === 10 * GB,
+    heavyPackage ? `used=${heavyPackage.used} quota=${heavyPackage.totalBytes} n=${heavyPackage.groupCount}` : 'package missing');
+
+  // When the client really does use more than the pool, the panel switches the CLIENT
+  // off — once, not once per inbound row.
+  Object.assign(clients.get(heavy), { up: 7 * GB, down: 4 * GB });
+  await configsService.syncConfigs({});
+  const attempts = xuiWrites.slice(writesBefore);
+  check('a genuinely over-quota customer is written to once per client, not per inbound',
+    attempts.length === 1 && attempts[0] === 'setEnabled', attempts.join(','));
 }
 
 run()

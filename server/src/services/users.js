@@ -2,7 +2,7 @@
 
 const { getDb } = require('../db');
 const { hashPassword } = require('../auth');
-const { ApiError, sanitizeUser, parsePermissions, safeJsonParse, randomToken, escapeLike, CONFIG_GROUP_KEY_SQL } = require('../utils');
+const { ApiError, sanitizeUser, parsePermissions, safeJsonParse, randomToken, escapeLike, CONFIG_GROUP_KEY_SQL, CONFIG_GROUP_USED_SQL } = require('../utils');
 const { audit } = require('../audit');
 
 const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
@@ -52,16 +52,16 @@ function userStats(userId) {
          SUM(CASE WHEN c.enabled = 0 THEN 1 ELSE 0 END) AS disabled_n,
          MAX(c.expiry_at) AS expiry_at,
          MAX(c.total_bytes) AS quota,
-         SUM(c.up_bytes + c.down_bytes) AS used
+         ${CONFIG_GROUP_USED_SQL} AS used
        FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0
          AND (c.origin <> 'external' OR c.user_id IN (SELECT id FROM users WHERE import_configs = 1))
        GROUP BY gkey
      )`
   ).get(Number(userId));
-  // Adopted subscriptions are always their own package (empty group token), so
-  // this count is what the "old panel" tab shows.
+  // Adopted subscriptions are grouped by the x-ui email, so one customer with
+  // several inbounds is one package here, not several.
   const external = db.prepare(
-    `SELECT COUNT(*) AS c FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0 AND c.origin = 'external'
+    `SELECT COUNT(DISTINCT ${CONFIG_GROUP_KEY_SQL}) AS c FROM configs c WHERE c.user_id = ? AND c.deleted_at = 0 AND c.origin = 'external'
        AND c.user_id IN (SELECT id FROM users WHERE import_configs = 1)`
   ).get(Number(userId)).c;
   return {

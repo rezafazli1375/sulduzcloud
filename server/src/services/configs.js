@@ -21,6 +21,7 @@ const {
   safeJsonParse,
   pageParams,
   CONFIG_GROUP_KEY_SQL,
+  CONFIG_GROUP_USED_SQL,
 } = require('../utils');
 const { audit } = require('../audit');
 const { notifyUser } = require('../notify');
@@ -171,7 +172,7 @@ async function importTelegramClients(user, req) {
   const summary = {
     telegramId: String(user?.telegram_id || '').trim(),
     enabled: true, matched: 0, servers: 0, imported: 0, restored: 0, refreshed: 0,
-    skipped: 0, conflicts: 0, failed: 0, errors: [],
+    attached: 0, skipped: 0, conflicts: 0, failed: 0, errors: [],
   };
   if (!user || !summary.telegramId) return summary;
   // The reseller (or the admin on their behalf) turned adoption off: nothing is
@@ -184,15 +185,17 @@ async function importTelegramClients(user, req) {
   const serverList = serversService.listServers({ includeDisabled: false });
   summary.servers = serverList.length;
   const findInbound = db.prepare('SELECT id FROM inbounds WHERE server_id = ? AND xui_id = ?');
-  const findByEmail = db.prepare('SELECT id, user_id, origin, deleted_at FROM configs WHERE email = ?');
+  // One adopted x-ui client can be attached to several inbounds, and each of them
+  // is a row of its own here, so every lookup by email has to see all of them.
+  const findEmailRows = db.prepare('SELECT id, inbound_id, user_id, origin, sub_id, deleted_at FROM configs WHERE email = ?');
   const insertConfig = db.prepare(
     `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label,
       customer_name, customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status,
       up_bytes, down_bytes, last_up, last_down, last_online_at, last_synced_at, created_at, updated_at, origin)
-     VALUES (?, ?, ?, ?, '', ?, ?, ?, '', '', '', ?, ?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?, 'external')`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?, 'external')`
   );
   const restoreConfig = db.prepare(
-    `UPDATE configs SET user_id = ?, inbound_id = ?, server_id = ?, email = ?, sub_id = '', xui_sub_id = ?,
+    `UPDATE configs SET user_id = ?, inbound_id = ?, server_id = ?, email = ?, sub_id = ?, xui_sub_id = ?,
        uuid = ?, flow = ?, label = '', customer_name = '', customer_phone = '', note = ?, total_bytes = ?,
        expiry_at = ?, enabled = ?, status = 'active', sync_status = '', up_bytes = ?, down_bytes = ?,
        last_up = ?, last_down = ?, last_online_at = ?, last_synced_at = ?, created_at = ?, updated_at = ?,
@@ -200,11 +203,14 @@ async function importTelegramClients(user, req) {
      WHERE id = ?`
   );
   // Live quota/usage/expiry of an already adopted subscription. Notes and the
-  // customer fields stay as the reseller edited them.
+  // customer fields stay as the reseller edited them. The group token is only
+  // filled in when the row has none yet: a customer whose link already works
+  // keeps the token their subscription URL is built from.
   const refreshConfig = db.prepare(
     `UPDATE configs SET inbound_id = ?, server_id = ?, xui_sub_id = ?, uuid = ?, flow = ?,
        total_bytes = ?, expiry_at = ?, enabled = ?, up_bytes = ?, down_bytes = ?,
-       last_up = ?, last_down = ?, last_online_at = ?, last_synced_at = ?, sync_status = '', updated_at = ?
+       last_up = ?, last_down = ?, last_online_at = ?, last_synced_at = ?, sync_status = '',
+       sub_id = CASE WHEN sub_id = '' THEN ? ELSE sub_id END, updated_at = ?
      WHERE id = ?`
   );
 
@@ -255,77 +261,102 @@ async function importTelegramClients(user, req) {
             client.lastOnlineAt = full.lastOnlineAt || client.lastOnlineAt;
           }
         }
-        const inbound = inboundIds.map((id) => findInbound.get(Number(server.id), id)).find(Boolean);
-        if (!inbound) {
+        // Every inbound this client is attached to and this panel knows about is
+        // part of the same customer. Taking only the first one used to hide the
+        // rest of the subscription from the edit drawer, which is what the owner
+        // reported for the adopted (old) configs.
+        const attached = [];
+        const seenInbound = new Set();
+        for (const xuiId of inboundIds) {
+          const inbound = findInbound.get(Number(server.id), Number(xuiId));
+          if (!inbound || seenInbound.has(Number(inbound.id))) continue;
+          seenInbound.add(Number(inbound.id));
+          attached.push(inbound);
+        }
+        if (!attached.length) {
           summary.skipped += 1;
           continue;
         }
+        summary.attached += attached.length;
 
         const now = Date.now();
         const up = Number(client.up || 0);
         const down = Number(client.down || 0);
 
-        const existing = findByEmail.get(client.email);
-        if (existing && !existing.deleted_at) {
+        const rows = findEmailRows.all(client.email);
+        if (rows.some((item) => !item.deleted_at && Number(item.user_id) !== Number(user.id))) {
           // Never move a live subscription to another reseller.
-          if (Number(existing.user_id) !== Number(user.id)) {
-            summary.conflicts += 1;
-            continue;
-          }
-          // Re-running the fetch refreshes the adopted subscriptions. Rows that
-          // were created through this panel are left to the normal sync.
-          if (existing.origin === 'external') {
-            refreshConfig.run(
-              Number(inbound.id),
-              Number(server.id),
-              String(client.subId || ''),
-              String(client.uuid || ''),
-              String(client.flow || ''),
-              Number(client.totalBytes || 0),
-              Number(client.expiryAt || 0),
-              client.enabled === false ? 0 : 1,
-              up,
-              down,
-              up,
-              down,
-              Number(client.lastOnlineAt || 0),
-              now,
-              now,
-              Number(existing.id)
-            );
-            summary.refreshed += 1;
-          } else {
-            summary.skipped += 1;
-          }
+          summary.conflicts += 1;
           continue;
         }
-        const values = [
-          Number(user.id),
-          Number(inbound.id),
-          Number(server.id),
-          String(client.email),
-          String(client.subId || ''),
-          String(client.uuid || ''),
-          String(client.flow || ''),
-          String(client.comment || '').slice(0, 500),
-          Number(client.totalBytes || 0),
-          Number(client.expiryAt || 0),
-          client.enabled === false ? 0 : 1,
-          up,
-          down,
-          up,
-          down,
-          Number(client.lastOnlineAt || 0),
-          now,
-          Number(client.createdAt || now),
-          now,
-        ];
-        if (existing) {
-          restoreConfig.run(...values, Number(existing.id));
-          summary.restored += 1;
-        } else {
-          insertConfig.run(...values);
-          summary.imported += 1;
+        // One group token for the whole customer, so the drawer, the shared pool
+        // and the subscription URL see one customer with several inbounds. A
+        // token that already exists on any sibling is reused: the customer's
+        // current link must keep working.
+        const tokenHolder = rows.find((item) => !item.deleted_at && item.sub_id)
+          || rows.find((item) => item.sub_id);
+        const groupToken = tokenHolder ? String(tokenHolder.sub_id) : randomToken(16);
+
+        for (const inbound of attached) {
+          const existing = rows.find((item) => Number(item.inbound_id) === Number(inbound.id));
+          const common = [
+            Number(user.id),
+            Number(inbound.id),
+            Number(server.id),
+            String(client.email),
+            groupToken,
+            String(client.subId || ''),
+            String(client.uuid || ''),
+            String(client.flow || ''),
+            String(client.comment || '').slice(0, 500),
+            Number(client.totalBytes || 0),
+            Number(client.expiryAt || 0),
+            client.enabled === false ? 0 : 1,
+            up,
+            down,
+            up,
+            down,
+            Number(client.lastOnlineAt || 0),
+            now,
+            Number(client.createdAt || now),
+            now,
+          ];
+          if (existing && !existing.deleted_at) {
+            // Re-running the fetch refreshes the adopted subscriptions. Rows that
+            // were created through this panel are left to the normal sync.
+            if (existing.origin === 'external') {
+              refreshConfig.run(
+                Number(inbound.id),
+                Number(server.id),
+                String(client.subId || ''),
+                String(client.uuid || ''),
+                String(client.flow || ''),
+                Number(client.totalBytes || 0),
+                Number(client.expiryAt || 0),
+                client.enabled === false ? 0 : 1,
+                up,
+                down,
+                up,
+                down,
+                Number(client.lastOnlineAt || 0),
+                now,
+                groupToken,
+                now,
+                Number(existing.id)
+              );
+              summary.refreshed += 1;
+            } else {
+              summary.skipped += 1;
+            }
+            continue;
+          }
+          if (existing) {
+            restoreConfig.run(...common, Number(existing.id));
+            summary.restored += 1;
+          } else {
+            insertConfig.run(...common);
+            summary.imported += 1;
+          }
         }
       } catch (err) {
         summary.failed += 1;
@@ -576,9 +607,27 @@ const GROUP_KEY_SQL = CONFIG_GROUP_KEY_SQL;
 function mergeGroup(members, base = null) {
   const first = base || members[0];
   const now = Date.now();
-  const used = members.reduce((sum, m) => sum + Number(m.used || 0), 0);
-  const up = members.reduce((sum, m) => sum + Number(m.up || 0), 0);
-  const down = members.reduce((sum, m) => sum + Number(m.down || 0), 0);
+  // Traffic is counted per x-ui CLIENT and only then added together. A package the
+  // panel created itself holds one distinct client per inbound, so their counters
+  // genuinely add up. An adopted customer is ONE client attached to several inbounds:
+  // every one of its rows carries the SAME live counters, and summing them would
+  // report the traffic once per inbound. A package can also hold both at once (an
+  // adopted customer given a new inbound), so each distinct email contributes its own
+  // highest row and those are summed. Must mirror CONFIG_GROUP_USED_SQL.
+  const perClient = new Map();
+  for (const member of members) {
+    const key = String(member.email || '') || `id:${member.id}`;
+    const seen = perClient.get(key) || { used: 0, up: 0, down: 0 };
+    perClient.set(key, {
+      used: Math.max(seen.used, Number(member.used || 0)),
+      up: Math.max(seen.up, Number(member.up || 0)),
+      down: Math.max(seen.down, Number(member.down || 0)),
+    });
+  }
+  const combine = (key) => [...perClient.values()].reduce((sum, item) => sum + item[key], 0);
+  const used = combine('used');
+  const up = combine('up');
+  const down = combine('down');
   const quota = members.reduce((max, m) => Math.max(max, Number(m.totalBytes || 0)), 0);
   const expiryAt = members.reduce((max, m) => Math.max(max, Number(m.expiryAt || 0)), 0);
   const enabledCount = members.filter((m) => m.enabled).length;
@@ -624,7 +673,7 @@ function mergeGroup(members, base = null) {
 function packageStatusSql(now = Date.now()) {
   return `CASE
     WHEN MAX(c.expiry_at) > 0 AND MAX(c.expiry_at) <= ${now} THEN 'expired'
-    WHEN MAX(c.total_bytes) > 0 AND SUM(c.up_bytes + c.down_bytes) >= MAX(c.total_bytes) THEN 'depleted'
+    WHEN MAX(c.total_bytes) > 0 AND ${CONFIG_GROUP_USED_SQL} >= MAX(c.total_bytes) THEN 'depleted'
     WHEN SUM(c.enabled) = 0 THEN 'disabled'
     WHEN SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
               AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes) THEN 1 ELSE 0 END) = COUNT(*)
@@ -773,8 +822,7 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
   // A customer with several inbounds is one package: renewing from any of its
   // configs applies to the whole group and is charged once, at the highest
   // inbound tariff of the group (not the sum of tariffs).
-  const siblings = groupRows(row);
-  const targets = siblings.length ? siblings : [row];
+  const targets = packageRows(row);
   const reseller = getResellerRow(row.user_id);
   let amount = Math.round(Number(price || 0));
   if (!amount && reseller) {
@@ -808,39 +856,44 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
     };
   });
 
+  const byRowId = new Map(updates.map((item) => [Number(item.row.id), item]));
+  // One batch per x-ui client: an adopted customer is one client spread over
+  // several rows, and renewing him must be one panel write, not one per inbound.
   const applied = [];
   try {
-    for (const update of updates) {
+    for (const client of distinctClients(targets)) {
+      const batch = client.map((item) => byRowId.get(Number(item.id))).filter(Boolean);
+      if (!batch.length) continue;
       try {
-        await applyToXui(update.row, {
-          totalBytes: update.newTotal,
-          expiryAt: update.newExpiry,
+        await applyToXui(batch[0].row, {
+          totalBytes: batch[0].newTotal,
+          expiryAt: batch[0].newExpiry,
           enabled: true,
         });
       } catch (err) {
         // A sibling whose x-ui client vanished must not block the rest of the
         // package; the config being extended itself still fails loudly.
-        if (err?.code === 'xui_client_missing' && Number(update.row.id) !== Number(row.id)) {
-          console.error(`[configs] extend: sibling ${update.row.email} missing in x-ui, skipped`);
+        if (err?.code === 'xui_client_missing' && !client.some((item) => Number(item.id) === Number(row.id))) {
+          console.error(`[configs] extend: sibling ${batch[0].row.email} missing in x-ui, skipped`);
           continue;
         }
         throw err;
       }
-      applied.push(update);
+      applied.push(batch);
     }
     if (billingEnabled() && amount > 0) {
       chargeReseller(reseller, amount, `تمدید بسته ${targets.length} اینباندی (+${gb}GB مشترک / +${addDays}d)`, 'renew', req);
     }
   } catch (err) {
-    for (const update of applied.reverse()) {
+    for (const batch of applied.reverse()) {
       try {
-        await applyToXui(update.row, {
-          totalBytes: update.currentTotal,
-          expiryAt: update.currentExpiry,
-          enabled: Boolean(update.row.enabled),
+        await applyToXui(batch[0].row, {
+          totalBytes: batch[0].currentTotal,
+          expiryAt: batch[0].currentExpiry,
+          enabled: Boolean(batch[0].row.enabled),
         });
       } catch (revertErr) {
-        console.error(`[configs] extend: revert failed for ${update.row.email}:`, revertErr.message);
+        console.error(`[configs] extend: revert failed for ${batch[0].row.email}:`, revertErr.message);
       }
     }
     throw err;
@@ -852,16 +905,18 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
      WHERE id = ?`
   );
   const resetDb = db().prepare('UPDATE configs SET up_bytes = 0, down_bytes = 0, last_up = 0, last_down = 0 WHERE id = ?');
-  for (const update of applied) {
+  for (const batch of applied) {
     if (resetUsage) {
       try {
-        await xui.resetTraffic(update.row.email, serverOfConfig(update.row));
+        await xui.resetTraffic(batch[0].row.email, serverOfConfig(batch[0].row));
       } catch (err) {
-        console.error(`[configs] extend: reset traffic failed for ${update.row.email}:`, err.message);
+        console.error(`[configs] extend: reset traffic failed for ${batch[0].row.email}:`, err.message);
       }
     }
-    updateDb.run(update.newTotal, update.newExpiry, now, now, update.row.id);
-    if (resetUsage) resetDb.run(update.row.id);
+    for (const update of batch) {
+      updateDb.run(update.newTotal, update.newExpiry, now, now, update.row.id);
+      if (resetUsage) resetDb.run(update.row.id);
+    }
   }
 
   audit(req, 'config.extend', 'config', row.id, {
@@ -870,7 +925,7 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
     resetUsage,
     amount,
     groupSize: targets.length,
-    applied: applied.length,
+    applied: applied.reduce((sum, batch) => sum + batch.length, 0),
   });
   if (reseller) {
     notifyUser(reseller.id, {
@@ -903,31 +958,31 @@ async function setQuota(id, patch, req, viewer) {
   if (patch.enabled !== undefined) next.enabled = Boolean(patch.enabled);
   if (!Object.keys(next).length) throw new ApiError(422, 'nothing_to_change', 'Nothing to change');
 
-  const targets = groupRows(row).length ? groupRows(row) : [row];
+  const targets = packageRows(row);
   const applied = [];
   try {
-    for (const target of targets) {
+    for (const client of distinctClients(targets)) {
       try {
-        await applyToXui(target, next);
+        await applyToXui(client[0], next);
       } catch (err) {
-        if (err?.code === 'xui_client_missing' && Number(target.id) !== Number(row.id)) {
-          console.error(`[configs] quota: sibling ${target.email} missing in x-ui, skipped`);
+        if (err?.code === 'xui_client_missing' && !client.some((item) => Number(item.id) === Number(row.id))) {
+          console.error(`[configs] quota: sibling ${client[0].email} missing in x-ui, skipped`);
           continue;
         }
         throw err;
       }
-      applied.push(target);
+      applied.push(...client);
     }
   } catch (err) {
-    for (const target of applied.reverse()) {
+    for (const client of distinctClients(applied).reverse()) {
       try {
-        await applyToXui(target, {
-          totalBytes: Number(target.total_bytes || 0),
-          expiryAt: Number(target.expiry_at || 0),
-          enabled: Boolean(target.enabled),
+        await applyToXui(client[0], {
+          totalBytes: Number(client[0].total_bytes || 0),
+          expiryAt: Number(client[0].expiry_at || 0),
+          enabled: Boolean(client[0].enabled),
         });
       } catch (revertErr) {
-        console.error(`[configs] quota: revert failed for ${target.email}:`, revertErr.message);
+        console.error(`[configs] quota: revert failed for ${client[0].email}:`, revertErr.message);
       }
     }
     throw err;
@@ -949,27 +1004,27 @@ async function setQuota(id, patch, req, viewer) {
 async function toggleConfig(id, enabled, req, viewer) {
   const { row } = configDetail(id, viewer);
   const value = Boolean(enabled);
-  const targets = groupRows(row).length ? groupRows(row) : [row];
+  const targets = packageRows(row);
   const applied = [];
   try {
-    for (const target of targets) {
+    for (const client of distinctClients(targets)) {
       try {
-        await xui.setEnabled(target.email, value, serverOfConfig(target));
+        await xui.setEnabled(client[0].email, value, serverOfConfig(client[0]));
       } catch (err) {
-        if (err?.code === 'xui_client_missing' && Number(target.id) !== Number(row.id)) {
-          console.error(`[configs] toggle: sibling ${target.email} missing in x-ui, skipped`);
+        if (err?.code === 'xui_client_missing' && !client.some((item) => Number(item.id) === Number(row.id))) {
+          console.error(`[configs] toggle: sibling ${client[0].email} missing in x-ui, skipped`);
           continue;
         }
         throw err;
       }
-      applied.push(target);
+      applied.push(...client);
     }
   } catch (err) {
-    for (const target of applied.reverse()) {
+    for (const client of distinctClients(applied).reverse()) {
       try {
-        await xui.setEnabled(target.email, !value, serverOfConfig(target));
+        await xui.setEnabled(client[0].email, !value, serverOfConfig(client[0]));
       } catch (revertErr) {
-        console.error(`[configs] toggle: revert failed for ${target.email}:`, revertErr.message);
+        console.error(`[configs] toggle: revert failed for ${client[0].email}:`, revertErr.message);
       }
     }
     throw err;
@@ -986,33 +1041,39 @@ async function toggleConfig(id, enabled, req, viewer) {
 // because the pool is no longer exhausted.
 async function resetUsage(id, req, viewer) {
   const { row } = configDetail(id, viewer);
-  const targets = groupRows(row).length ? groupRows(row) : [row];
+  const targets = packageRows(row);
+  const clients = distinctClients(targets);
   const quota = targets.reduce((max, target) => Math.max(max, Number(target.total_bytes || 0)), 0);
-  const used = targets.reduce((sum, target) => sum + Number(target.up_bytes || 0) + Number(target.down_bytes || 0), 0);
+  // The pool is per x-ui client: an adopted customer's counters repeat on every
+  // one of his rows, so summing rows would call him depleted when he isn't.
+  const used = clients
+    .reduce((sum, client) => sum + Math.max(...client.map((target) => Number(target.up_bytes || 0) + Number(target.down_bytes || 0))), 0);
   const wasDepleted = quota > 0 && used >= quota;
+  const clearRow = db().prepare('UPDATE configs SET up_bytes = 0, down_bytes = 0, last_up = 0, last_down = 0, updated_at = ? WHERE id = ?');
   let reset = 0;
-  for (const target of targets) {
+  for (const client of clients) {
     try {
-      await xui.resetTraffic(target.email, serverOfConfig(target));
-      db().prepare('UPDATE configs SET up_bytes = 0, down_bytes = 0, last_up = 0, last_down = 0, updated_at = ? WHERE id = ?')
-        .run(Date.now(), target.id);
+      await xui.resetTraffic(client[0].email, serverOfConfig(client[0]));
+      for (const target of client) clearRow.run(Date.now(), target.id);
       reset += 1;
     } catch (err) {
-      if (err?.code === 'xui_client_missing' && Number(target.id) !== Number(row.id)) {
-        console.error(`[configs] reset: sibling ${target.email} missing in x-ui, skipped`);
+      if (err?.code === 'xui_client_missing' && !client.some((item) => Number(item.id) === Number(row.id))) {
+        console.error(`[configs] reset: sibling ${client[0].email} missing in x-ui, skipped`);
         continue;
       }
       throw err;
     }
   }
   if (wasDepleted) {
-    for (const target of targets) {
+    for (const client of clients) {
       try {
-        await xui.setEnabled(target.email, true, serverOfConfig(target));
-        db().prepare('UPDATE configs SET enabled = 1, sync_status = ?, updated_at = ? WHERE id = ?')
-          .run('', Date.now(), target.id);
+        await xui.setEnabled(client[0].email, true, serverOfConfig(client[0]));
+        for (const target of client) {
+          db().prepare('UPDATE configs SET enabled = 1, sync_status = ?, updated_at = ? WHERE id = ?')
+            .run('', Date.now(), target.id);
+        }
       } catch (err) {
-        console.error(`[configs] reset: re-enable failed for ${target.email}:`, err.message);
+        console.error(`[configs] reset: re-enable failed for ${client[0].email}:`, err.message);
       }
     }
   }
@@ -1080,12 +1141,28 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
 /**
  * Every config that shares a subscription ID belongs to the same customer
  * group: one /sub/<subId> link lists all of them.
+ *
+ * Subscriptions adopted out of an existing panel carry no token of ours, but the
+ * same x-ui client is attached to several inbounds there and keeps one email
+ * across all of them, so those rows are grouped by (email, reseller, server).
+ * Without that the panel would treat every inbound of one adopted customer as a
+ * separate customer and show only one inbound each.
  */
 function groupRows(row) {
-  if (!row || !row.sub_id) return [];
-  return getDb()
-    .prepare('SELECT * FROM configs WHERE sub_id = ? AND user_id = ? AND server_id = ? AND deleted_at = 0 ORDER BY id')
-    .all(row.sub_id, row.user_id, Number(row.server_id || 0) || 1);
+  if (!row) return [];
+  const db = getDb();
+  if (row.sub_id) {
+    return db
+      .prepare('SELECT * FROM configs WHERE sub_id = ? AND user_id = ? AND server_id = ? AND deleted_at = 0 ORDER BY id')
+      .all(row.sub_id, row.user_id, Number(row.server_id || 0) || 1);
+  }
+  if (String(row.origin || '') === 'external' && row.email) {
+    return db
+      .prepare(`SELECT * FROM configs WHERE email = ? AND user_id = ? AND server_id = ?
+         AND origin = 'external' AND deleted_at = 0 ORDER BY id`)
+      .all(row.email, row.user_id, Number(row.server_id || 0) || 1);
+  }
+  return [];
 }
 
 /**
@@ -1099,6 +1176,47 @@ function packageRows(row) {
   if (!row) return [];
   const members = groupRows(row);
   return members.length ? members : [row];
+}
+
+/**
+ * The package a row belongs to — the JavaScript mirror of CONFIG_GROUP_KEY_SQL and of
+ * packageRows(): one group per subscription token, or, for a tokenless subscription
+ * adopted from another panel, one group per x-ui client email.
+ *
+ * Anything that aggregates a package in JavaScript has to use this key. A subscription
+ * adopted from the seller panel is ONE x-ui client kept as one row per inbound with the
+ * client's own counters repeated on every row, so a group built from the token alone
+ * (or from the row id) would either split that customer into several packages or add his
+ * traffic once per inbound — and the shared-pool enforcement would then switch off a
+ * customer who has only used a third of his quota.
+ */
+function packageKeyOf(row) {
+  if (!row) return '';
+  if (row.sub_id) return `G:${row.user_id}:${row.server_id}:${row.sub_id}`;
+  if (String(row.origin || '') === 'external' && row.email) {
+    return `E:${row.user_id}:${row.server_id}:${String(row.email).toLowerCase()}`;
+  }
+  return `C:${row.id}`;
+}
+
+/**
+ * Group panel rows by the x-ui CLIENT they stand for. A package the panel made
+ * has one client per row (distinct emails sharing a token), so this returns
+ * single-row groups and behaves exactly as before. An adopted customer is ONE
+ * x-ui client stored as one row per inbound, so his rows collapse into one
+ * group: quota, expiry, enable/disable and traffic reset are then sent to the
+ * seller panel once per customer instead of once per inbound, while every row
+ * still gets its own database update.
+ */
+function distinctClients(rows) {
+  const byClient = new Map();
+  for (const row of rows || []) {
+    if (!row) continue;
+    const key = `${Number(row.server_id || 0)}|${String(row.email || '').toLowerCase()}`;
+    if (!byClient.has(key)) byClient.set(key, []);
+    byClient.get(key).push(row);
+  }
+  return [...byClient.values()];
 }
 
 function groupFor(row) {
@@ -1348,7 +1466,10 @@ async function applyFixedInbound(userId, { dryRun = false } = {}, req) {
   };
   for (const row of rows) {
     const members = packageRows(row);
-    const key = row.sub_id ? `G:${row.server_id}:${row.sub_id}` : `C:${row.id}`;
+    // One attach per CUSTOMER, not per row: an adopted client spread over three
+    // inbounds is one package, and keying by the token alone would call it three
+    // packages of one and attach the fixed inbound three times.
+    const key = packageKeyOf(row);
     if (seen.has(key)) continue;
     seen.add(key);
     summary.packages += 1;
@@ -1412,9 +1533,6 @@ async function syncConfigs({ pruneUsageDays } = {}) {
   // Package aggregates are collected during the same pass so the shared pool can
   // be enforced right after the counters are written.
   const groups = new Map();
-  const groupKeyOf = (row) => (row.sub_id
-    ? `G:${row.user_id}:${row.server_id}:${row.sub_id}`
-    : `C:${row.id}`);
   const tx = db.transaction(() => {
     for (const row of rows) {
       const sid = Number(row.server_id || 0) || (serverList[0] ? Number(serverList[0].id) : 0);
@@ -1438,11 +1556,19 @@ async function syncConfigs({ pruneUsageDays } = {}) {
         client.enabled ? 1 : 0, client.uuid || row.uuid, client.subId || row.xui_sub_id,
         '', Date.now(), Date.now(), row.id);
       synced += 1;
-      const gkey = groupKeyOf(row);
-      if (!groups.has(gkey)) groups.set(gkey, { quota: 0, used: 0, members: [] });
+      const gkey = packageKeyOf(row);
+      if (!groups.has(gkey)) groups.set(gkey, { quota: 0, perClient: new Map(), members: [] });
       const group = groups.get(gkey);
       group.quota = Math.max(group.quota, Number(row.total_bytes || 0));
-      group.used += up + down;
+      // The pool is per x-ui CLIENT, not per panel row. An adopted customer
+      // sitting on three inbounds is ONE client whose counters repeat on every
+      // row of that client, so adding up_bytes once per row would read as triple
+      // usage and the shared-pool rule below would switch off a customer who has
+      // used a third of his quota. Take the max per client, then sum clients —
+      // the mirror of CONFIG_GROUP_USED_SQL.
+      const clientKey = String(row.email || '').toLowerCase() || `id:${row.id}`;
+      const seenTotal = group.perClient.get(clientKey) || 0;
+      if (up + down > seenTotal) group.perClient.set(clientKey, up + down);
       group.members.push({
         id: row.id,
         email: row.email,
@@ -1459,15 +1585,23 @@ async function syncConfigs({ pruneUsageDays } = {}) {
   let disabled = 0;
   const serverCache = new Map();
   for (const group of groups.values()) {
-    if (group.quota <= 0 || group.used < group.quota) continue;
+    const used = [...group.perClient.values()].reduce((sum, value) => sum + value, 0);
+    if (group.quota <= 0 || used < group.quota) continue;
+    // One call per x-ui client: the same email on several inbounds is one
+    // customer, and switching him off twice only multiplies the panel writes.
+    const done = new Set();
     for (const member of group.members) {
       if (!member.enabled) continue;
+      const clientKey = `${member.serverId}|${String(member.email).toLowerCase()}`;
+      if (done.has(clientKey)) continue;
+      done.add(clientKey);
       try {
         if (!serverCache.has(member.serverId)) {
           serverCache.set(member.serverId, serversService.resolveServer(member.serverId));
         }
         await xui.setEnabled(member.email, false, serverCache.get(member.serverId));
-        db.prepare('UPDATE configs SET enabled = 0, updated_at = ? WHERE id = ?').run(Date.now(), member.id);
+        db.prepare('UPDATE configs SET enabled = 0, updated_at = ? WHERE id = ?')
+          .run(Date.now(), member.id);
         disabled += 1;
       } catch (err) {
         console.error(`[configs] shared pool: could not disable ${member.email}:`, err.message);
@@ -1491,9 +1625,6 @@ function expiredNotifications() {
   if (!monitor.expiryAlerts) return { sent: 0 };
   const days = Array.isArray(monitor.expiryDays) ? monitor.expiryDays : [3, 1];
   const now = Date.now();
-  const groupKeyOf = (row) => (row.sub_id
-    ? `G:${row.user_id}:${row.server_id}:${row.sub_id}`
-    : `C:${row.id}`);
   const labelOf = (row) => row.customer_name || row.label || row.email;
   let sent = 0;
   for (const day of days) {
@@ -1506,12 +1637,12 @@ function expiredNotifications() {
     // One representative row per package.
     const packages = new Map();
     for (const row of rows) {
-      const gkey = groupKeyOf(row);
+      const gkey = packageKeyOf(row);
       const current = packages.get(gkey);
       if (!current || Number(row.expiry_at) > Number(current.expiry_at)) packages.set(gkey, row);
     }
     for (const row of packages.values()) {
-      const key = `expiry:${groupKeyOf(row)}:${day}:${new Date(row.expiry_at).toISOString().slice(0, 10)}`;
+      const key = `expiry:${packageKeyOf(row)}:${day}:${new Date(row.expiry_at).toISOString().slice(0, 10)}`;
       const inserted = notifyUser(row.user_id, {
         type: 'warning',
         title: `بسته ${labelOf(row)} به‌زودی منقضی می‌شود`,
@@ -1529,14 +1660,19 @@ function expiredNotifications() {
   ).all();
   const pools = new Map();
   for (const row of usedRows) {
-    const gkey = groupKeyOf(row);
-    if (!pools.has(gkey)) pools.set(gkey, { row, quota: 0, used: 0 });
+    const gkey = packageKeyOf(row);
+    if (!pools.has(gkey)) pools.set(gkey, { row, quota: 0, perClient: new Map() });
     const pool = pools.get(gkey);
     pool.quota = Math.max(pool.quota, Number(row.total_bytes || 0));
-    pool.used += Number(row.up_bytes || 0) + Number(row.down_bytes || 0);
+    // Same rule as the shared-pool enforcement: one x-ui client counts once,
+    // however many inbounds of his the panel knows about.
+    const clientKey = String(row.email || '').toLowerCase() || `id:${row.id}`;
+    const total = Number(row.up_bytes || 0) + Number(row.down_bytes || 0);
+    if (total > (pool.perClient.get(clientKey) || 0)) pool.perClient.set(clientKey, total);
   }
   for (const [gkey, pool] of pools) {
-    if (pool.quota <= 0 || pool.used * 100 < pool.quota * percent) continue;
+    const used = [...pool.perClient.values()].reduce((sum, value) => sum + value, 0);
+    if (pool.quota <= 0 || used * 100 < pool.quota * percent) continue;
     const key = `traffic:${gkey}:${percent}:${dayKey()}`;
     const inserted = notifyUser(pool.row.user_id, {
       type: 'warning',
