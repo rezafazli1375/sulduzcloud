@@ -248,7 +248,10 @@ export default function Configs() {
                             </span>
                             <div className="min-w-0">
                               <p className="flex items-center gap-1.5">
-                                <span className="max-w-[190px] truncate text-[12.5px] font-medium text-slate-200">{row.customerName || row.label || '—'}</span>
+                                {/* An adopted (legacy) customer carries no name of ours:
+                                    his remark on the node panel IS the client email, so
+                                    the row falls back to it instead of printing a dash. */}
+                                <span className="max-w-[190px] truncate text-[12.5px] font-medium text-slate-200">{row.customerName || row.label || row.email || '—'}</span>
                                 {row.origin === 'external' ? (
                                   <Badge tone="amber" className="shrink-0">{t('configs.originExternalBadge')}</Badge>
                                 ) : null}
