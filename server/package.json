@@ -1,6 +1,6 @@
 {
   "name": "sulduzcloud",
-  "version": "1.4.14",
+  "version": "1.4.15",
   "private": true,
   "description": "Sulduz Cloud - Reseller VPN Management Panel",
   "main": "src/index.js",

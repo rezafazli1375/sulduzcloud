@@ -202,15 +202,35 @@ export function Switch({ checked, onChange, disabled, label }) {
 
 export function Checkbox({ checked, onChange, label, className, disabled }) {
   return (
-    // "relative" is load-bearing: it makes the label the containing block of the
-    // hidden input below. Without it the absolutely positioned input belongs to
-    // the dialog, does not scroll with the modal body, and focusing it (label
-    // click) makes Chrome scroll the whole dialog upward.
-    <label className={cx('relative inline-flex cursor-pointer items-center gap-2 text-[13px] text-slate-300', disabled && 'opacity-50', className)}>
+    // Both "relative" here and "absolute inset-0" on the input below are
+    // load-bearing. The control must be a real laid-out box covering this label,
+    // never a 1x1 clipped (sr-only) element: inside a modal the clipped input is
+    // laid out outside the nested scroll containers (overlay -> 70vh body -> the
+    // 180px inbound list), so when a click focuses it Chrome "reveals" it by
+    // scrolling the modal overlay by hundreds of pixels and the edit dialog
+    // slides off screen — the bug the owner reported as «صفحه ویرایش ناپدید
+    // میشه». Same class of bug as v1.4.12, which only fixed the containing block.
+    //
+    // onMouseDown pre-focuses with preventScroll, so the browser's own
+    // focus-on-mousedown becomes a no-op and cannot scroll anything, while the
+    // click/activation path (and therefore toggling) is untouched.
+    <label
+      className={cx('relative inline-flex cursor-pointer items-center gap-2 text-[13px] text-slate-300', disabled && 'opacity-50', className)}
+      onMouseDown={(e) => e.currentTarget.querySelector('input')?.focus({ preventScroll: true })}
+    >
+      <input
+        type="checkbox"
+        className="peer absolute inset-0 z-[1] m-0 cursor-pointer appearance-none bg-transparent opacity-0 disabled:pointer-events-none"
+        checked={Boolean(checked)}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+      />
       <span
         className={cx(
           'flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-md border transition',
-          checked ? 'border-emerald-400/50 bg-emerald-500/90 text-[#04120f]' : 'border-white/15 bg-white/[0.04]'
+          checked ? 'border-emerald-400/50 bg-emerald-500/90 text-[#04120f]' : 'border-white/15 bg-white/[0.04]',
+          // Keyboard focus stays visible even though the input itself is transparent.
+          'peer-focus-visible:ring-2 peer-focus-visible:ring-emerald-400/60 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-[#050811]'
         )}
       >
         {/* Always mounted: toggling only animates opacity, so React never has to
@@ -220,7 +240,6 @@ export function Checkbox({ checked, onChange, label, className, disabled }) {
           strokeWidth={3}
         />
       </span>
-      <input type="checkbox" className="sr-only" checked={Boolean(checked)} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
       {label}
     </label>
   );
