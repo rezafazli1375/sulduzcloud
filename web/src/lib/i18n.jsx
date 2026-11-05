@@ -2,7 +2,10 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 
 const fa = {
   app: {
-    name: 'سالادوز کلود',
+    // The brand is "Sulduz Cloud"; the boot screen renders before the panel's
+    // `panelName` setting has arrived, so it carries its own copy of the name —
+    // which is why a typo here ("سالادوز") was visible on every page load.
+    name: 'سولدوز کلود',
     nameEn: 'Sulduz Cloud',
     tagline: 'پنل مدیریت نمایندگی و کانفیگ',
     controlPanel: 'پنل مدیریت',
