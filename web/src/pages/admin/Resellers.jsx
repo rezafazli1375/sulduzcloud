@@ -24,6 +24,7 @@ import {
   UserX,
   Users,
   Wallet,
+  WifiOff,
 } from 'lucide-react';
 import { useAuth } from '../../lib/auth.jsx';
 import { useI18n, translateError } from '../../lib/i18n.jsx';
@@ -113,6 +114,7 @@ function UserForm({ open, onClose, editing }) {
   const [showPassword, setShowPassword] = useState(false);
   const [savingFixed, setSavingFixed] = useState(false);
   const [merging, setMerging] = useState(false);
+  const [recreating, setRecreating] = useState(false);
 
   const inboundsQuery = useQuery({
     queryKey: ['inbounds', 'form'],
@@ -157,8 +159,8 @@ function UserForm({ open, onClose, editing }) {
   // Panel v1.4.16: older packages — especially the subscriptions adopted from
   // another panel — usually do not carry the fixed inbound yet. Count them
   // first (the endpoint is read-only with dryRun) and only write after the
-  // admin sees how many customer packages change, because every add creates a
-  // real x-ui client on that server.
+  // admin sees how many customer packages change: the pass attaches the channel
+  // to the x-ui clients that already stand behind them, on another seller's panel.
   const applyFixedInbound = async (userId, preview = null) => {
     let summary = preview;
     if (!summary) {
@@ -192,11 +194,11 @@ function UserForm({ open, onClose, editing }) {
     }
   };
 
-  // Panel v1.4.18: a customer package that is spread over more than one x-ui
-  // client cannot be listed by the node's own subscription server, so such a
-  // package is handed this panel's aggregated link instead of the node address
-  // the owner configured. Merging moves the extra channels onto the client the
-  // customer already uses, which puts his link back on the node. Count first
+  // Panel v1.4.18: a customer package spread over more than one x-ui client has
+  // channels that his own client's node link does not cover, so the drawer has to
+  // offer a second address beside it. The owner wants every customer holding the
+  // node's link, so merging moves the extra channels onto the client the customer
+  // already subscribes to — one client, one node link, whole package. Count first
   // (dryRun is read-only) because the real pass deletes the duplicate client
   // this panel created on the x-ui panel.
   const mergePackages = async (userId) => {
@@ -223,6 +225,42 @@ function UserForm({ open, onClose, editing }) {
       const skipped = Number(result?.skipped || 0);
       if (merged) toast.success(t('resellers.form.mergeDone', { n: merged, m: skipped }));
       else toast.error(t('resellers.form.mergeFailed', { reason: (result?.errors || [])[0] || '' }));
+      queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
+      queryClient.invalidateQueries({ queryKey: ['configs'] });
+    } catch (err) {
+      toast.error(translateError(err, t));
+    }
+  };
+
+  // Panel v1.4.21: the other direction of the same repair — customers whose
+  // x-ui client is gone from the node panel. Those packages serve nothing: every
+  // link errors out and no channel can be added. Count first (dryRun is
+  // read-only), then build ONE client back per package with the same email,
+  // UUID and subscription id, so the customer's old link works again.
+  const recreateMissing = async (userId) => {
+    let preview = null;
+    try {
+      preview = await api.post(`/admin/users/${userId}/recreate-missing`, { dryRun: true });
+    } catch (err) {
+      toast.error(translateError(err, t));
+      return;
+    }
+    const missing = Number(preview?.missing || 0);
+    if (!missing) {
+      toast.success(t('resellers.form.recreateNothing', { n: Number(preview?.packages || 0) }));
+      return;
+    }
+    const go = await confirm({
+      title: t('resellers.form.recreateTitle'),
+      body: t('resellers.form.recreateBody', { n: missing }),
+    });
+    if (!go) return;
+    try {
+      const result = await api.post(`/admin/users/${userId}/recreate-missing`, { dryRun: false });
+      const restored = Number(result?.restored || 0);
+      const skipped = Number(result?.skipped || 0);
+      if (restored) toast.success(t('resellers.form.recreateDone', { n: restored, m: skipped }));
+      else toast.error(t('resellers.form.recreateFailed', { reason: (result?.errors || [])[0] || '' }));
       queryClient.invalidateQueries({ queryKey: ['admin', 'configs'] });
       queryClient.invalidateQueries({ queryKey: ['configs'] });
     } catch (err) {
@@ -487,6 +525,33 @@ function UserForm({ open, onClose, editing }) {
                 }}
               >
                 {t('resellers.form.mergeButton')}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Panel v1.4.21: the customers whose x-ui client was deleted on the node
+            panel. One client is built back per package, with the same email, UUID
+            and subscription id, so their old link works again. */}
+        {editing ? (
+          <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] px-3.5 py-3">
+            <div className="flex items-center gap-2">
+              <WifiOff className="h-3.5 w-3.5 text-rose-300" />
+              <p className="text-[12.5px] font-medium text-slate-200">{t('resellers.form.recreateCard')}</p>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+              <p className="min-w-0 flex-1 text-[10.5px] leading-5 text-slate-500">{t('resellers.form.recreateHint')}</p>
+              <Button
+                variant="ghost"
+                size="sm"
+                loading={recreating}
+                icon={RefreshCw}
+                onClick={() => {
+                  setRecreating(true);
+                  Promise.resolve(recreateMissing(editing.id)).finally(() => setRecreating(false));
+                }}
+              >
+                {t('resellers.form.recreateButton')}
               </Button>
             </div>
           </div>

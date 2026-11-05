@@ -123,13 +123,24 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const links = detail.data?.links || [];
   const subUrl = detail.data?.subUrl || '';
   const linksError = detail.data?.error || '';
-  // Where the subscription link comes from: the node's own subscription server
-  // (one x-ui client holding every inbound of the customer) or, only when a
-  // package really spans several x-ui clients, this panel's aggregated link.
+  // Where the subscription link comes from. Since v1.4.20 the customer is always
+  // handed the link the NODE panel shows for his own x-ui client — the panel never
+  // inserts its own address in front of it unless the server carries no
+  // subscription base at all.
   const subs = detail.data?.subscriptions || null;
   const nodeLinks = Array.isArray(subs?.node) ? subs.node.filter((item) => item?.url) : [];
   const clientCount = Number(subs?.clientCount || nodeLinks.length || 1);
   const isPanelLink = subs?.source === 'panel';
+  // A package still spread over two clients (a leftover from before v1.4.18): the
+  // channels the shown link does NOT carry stay listed right under it.
+  const otherNodeLinks = nodeLinks.filter((item) => item.url !== subUrl);
+  // The customer's x-ui client is gone from the node panel. The panel asks the
+  // node about the client on every open, so a null client with no error means
+  // "there is no such client" — an error would mean the node could not answer.
+  const clientMissing = Boolean(config)
+    && detail.data?.client === null
+    && !linksError
+    && !detail.isFetching;
 
   const addableQuery = useQuery({
     queryKey: ['config-inbounds', isAdmin, config?.userId],
@@ -243,6 +254,15 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     onError,
   });
 
+  // Panel v1.4.21: the customer's x-ui client was deleted on the node panel.
+  // This builds ONE client back — same email, UUID and subscription id, every
+  // channel of the package on it — so the customer's old link works again.
+  const recreate = useMutation({
+    mutationFn: () => api.post(`${base}/${configId}/recreate`),
+    onSuccess: () => { toast.success(t('configs.detail.recreated')); refresh(); },
+    onError,
+  });
+
   const removeInbound = useMutation({
     mutationFn: (targetId) => api.del(`${base}/${targetId}`),
     onSuccess: (data, targetId) => {
@@ -299,6 +319,15 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
       : t('common.irreversible');
     const ok = await confirm({ title: t('configs.actions.reset'), body, danger: true });
     if (ok) reset.mutate();
+  };
+
+  const askRecreate = async () => {
+    const ok = await confirm({
+      title: t('configs.detail.recreateConfirm'),
+      body: t('configs.detail.recreateBody'),
+      confirmText: t('configs.actions.recreate'),
+    });
+    if (ok) recreate.mutate();
   };
 
   const allLinks = [subUrl, ...links].filter(Boolean);
@@ -384,6 +413,28 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
               </div>
             </div>
 
+            {clientMissing ? (
+              <div className="rounded-2xl border border-rose-400/25 bg-rose-500/[0.07] p-4">
+                <div className="flex items-start gap-3">
+                  <WifiOff className="mt-0.5 h-4 w-4 shrink-0 text-rose-300" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[12.5px] font-semibold text-rose-100">{t('configs.detail.clientMissingTitle')}</p>
+                    <p className="mt-1 text-[11px] leading-5 text-rose-100/75">{t('configs.detail.clientMissingBody')}</p>
+                    <Button
+                      variant="soft"
+                      size="sm"
+                      icon={RefreshCw}
+                      className="mt-3"
+                      onClick={askRecreate}
+                      loading={recreate.isPending}
+                    >
+                      {t('configs.actions.recreate')}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
             <SectionCard title={t('configs.detail.title')} bodyClass="p-4" className="border-white/[0.06]">
               <div className="grid gap-x-6 sm:grid-cols-2">
                 <InfoRow label={t('configs.detail.email')} value={config.email} mono />
@@ -432,12 +483,24 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                   </div>
                   <p className="break-all rounded-lg bg-[#050811]/60 px-2 py-1.5 font-mono text-[10.5px] leading-5 text-emerald-100/80" dir="ltr">{subUrl}</p>
                   <p className="mt-1 text-[10px] text-slate-400">
-                    {isPanelLink ? t('configs.detail.subSourcePanel') : t('configs.detail.subSourceNode')}
+                    {
+                      // eslint-disable-next-line no-nested-ternary
+                      isPanelLink
+                        ? t('configs.detail.subSourcePanel')
+                        : clientCount > 1
+                          ? t('configs.detail.subSourceNodeSplit')
+                          : t('configs.detail.subSourceNode')
+                    }
                   </p>
-                  {isPanelLink && nodeLinks.length > 1 ? (
-                    <div className="mt-1.5 space-y-1.5">
-                      <p className="text-[10px] text-slate-400">{t('configs.detail.subNodeLinks')}</p>
-                      {nodeLinks.map((item) => (
+                  {clientCount > 1 ? (
+                    <div className="mt-2 space-y-1.5">
+                      <p className="rounded-lg border border-amber-400/20 bg-amber-500/[0.06] px-2 py-1.5 text-[10px] leading-4 text-amber-200">
+                        {t('configs.detail.subSplitCaution', { n: clientCount })}
+                      </p>
+                      {otherNodeLinks.length ? (
+                        <p className="text-[10px] text-slate-400">{t('configs.detail.subOtherLinks')}</p>
+                      ) : null}
+                      {otherNodeLinks.map((item) => (
                         <div key={item.url} className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2 py-1.5">
                           <span className="min-w-0 truncate text-[10px] text-slate-400" dir="ltr">
                             {item.email} · {t('configs.detail.subInbounds', { n: item.inboundCount || 1 })}
@@ -449,6 +512,16 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                           <p className="w-full break-all font-mono text-[10px] text-slate-500" dir="ltr">{item.url}</p>
                         </div>
                       ))}
+                      {subs?.aggregated && subs.aggregated !== subUrl ? (
+                        <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2 py-1.5">
+                          <span className="text-[10px] text-slate-400">{t('configs.detail.subCombinedLink')}</span>
+                          <div className="flex shrink-0 items-center gap-0.5">
+                            <IconButton icon={QrCode} variant="ghost" label={t('common.qr')} onClick={() => setQr({ title: t('common.subscription'), value: subs.aggregated })} />
+                            <CopyButton value={subs.aggregated} iconOnly />
+                          </div>
+                          <p className="w-full break-all font-mono text-[10px] text-slate-500" dir="ltr">{subs.aggregated}</p>
+                        </div>
+                      ) : null}
                     </div>
                   ) : null}
                 </div>

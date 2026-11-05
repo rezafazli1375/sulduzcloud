@@ -84,19 +84,60 @@ function isOneClientPackage(row) {
 }
 
 /**
+ * The rows standing for one x-ui client, in the order a link should be picked.
+ * `head` is the row that carries the client's own subscription id on the node.
+ */
+function groupHeadOf(members) {
+  return (members || []).find((item) => item && item.xui_sub_id) || (members || [])[0] || {};
+}
+
+// [adopted?, channels, owns-the-group-token]: the client the seller's own panel
+// serves the customer under is the one whose link is his real subscription, then
+// the client covering the most channels, then the client that holds the token the
+// package is grouped by. `ownsGroupToken` keeps panel-created leftovers behaving
+// the way they read in the list: the row that carries the group token leads.
+function rankGroupOf(row, members) {
+  const head = groupHeadOf(members);
+  return [
+    String(head.origin || '') === 'external' ? 1 : 0,
+    (members || []).length,
+    String(head.xui_sub_id || '') === String(row?.sub_id || '') ? 1 : 0,
+  ];
+}
+
+function compareGroups(a, b) {
+  for (let i = 0; i < a.rank.length; i += 1) {
+    if (a.rank[i] !== b.rank[i]) return b.rank[i] - a.rank[i];
+  }
+  return Number(a.head?.id || 0) - Number(b.head?.id || 0);
+}
+
+/**
+ * The x-ui client whose node link IS this package's subscription.
+ *
+ * Since v1.4.18 a package is one client attached to every channel, so its own
+ * link on the node already carries the whole package and this panel has nothing
+ * to aggregate. The owner's rule for the address is explicit: what the customer
+ * is handed must be the link the seller's panel (پنل ثنایی) itself shows for him,
+ * never an address of this panel. That stays true for the leftovers that are
+ * still spread over two clients — the customer's own client leads, and the extra
+ * link is offered next to it until consolidation merges them into one.
+ */
+function primaryClientGroup(row, groups) {
+  const list = (groups || packageClientGroups(row))
+    .map((members) => ({ members, head: groupHeadOf(members) }))
+    .map((item) => ({ ...item, rank: rankGroupOf(row, item.members) }));
+  return list.sort(compareGroups)[0] || { members: [], head: {} };
+}
+
+/**
  * The subscription URL the customer should be handed.
  *
- * A package is ONE x-ui client attached to several inbounds whenever the client
- * was adopted from a panel or ordered through this panel since v1.4.18. That
- * client's own subscription link lives on the node — the base configured per
- * server (sub_base, e.g. https://sbs.example.com:8443/sub) — and x-ui already
- * lists every inbound the client is attached to there, so the panel has nothing
- * to aggregate and must not insert itself between the customer and the node.
- *
- * Only when a package genuinely spans MORE THAN ONE x-ui client can no single
- * node link cover it: x-ui 3.2.5+ rejects a subId already in use, so each client
- * carries its own private subId and this panel serves one combined subscription
- * for the group token instead.
+ * `base` is built from the server's own sub_base (e.g. https://sbs.example.com:8443/sub),
+ * which is exactly what the x-ui panel puts in front of the client's subId, so the
+ * string this panel prints and the string the seller's panel prints are the same
+ * link. Only when the server carries no sub_base at all can the node link not be
+ * built, and then the panel's own address is the fallback.
  */
 function nodeSubUrlFor(config, server) {
   const xuiCfg = settings.getSetting('xui');
@@ -123,21 +164,22 @@ function panelSubUrlFor(config) {
 }
 
 function subUrlFor(config, server) {
-  const nodeUrl = nodeSubUrlFor(config, server);
-  if (isOneClientPackage(config)) return nodeUrl || panelSubUrlFor(config);
-  return panelSubUrlFor(config) || nodeUrl;
+  return subscriptionsOf(config, server).primary;
 }
 
 /**
- * Every subscription link a package can be reached by, for the detail drawer:
- * the node link of each x-ui client it holds, plus the panel's aggregated link
- * when there is more than one client. `primary` is what the panel hands out.
+ * Every subscription link a package can be reached by, for the detail drawer.
+ * `primary` is what the panel hands out — the node link of the customer's own
+ * client — and `node` lists one link per x-ui client so nothing is hidden. The
+ * panel's combined address stays available as `aggregated` while a package is
+ * still spread over more than one client (and for the customers who were already
+ * given that link, since /api/sub/<token> keeps answering).
  */
 function subscriptionsOf(row, server) {
   const srv = server || serverOfConfig(row);
   const groups = packageClientGroups(row);
   const node = groups.map((members) => {
-    const head = members.find((item) => item.xui_sub_id) || members[0] || {};
+    const head = groupHeadOf(members);
     return {
       email: String(head.email || ''),
       subId: String(head.xui_sub_id || head.sub_id || ''),
@@ -148,12 +190,17 @@ function subscriptionsOf(row, server) {
   }).filter((item) => item.url);
   const aggregated = panelSubUrlFor(row);
   const multiple = groups.length > 1;
+  const best = nodeSubUrlFor(primaryClientGroup(row, groups).head, srv);
+  const primary = best || aggregated || '';
   return {
     clientCount: groups.length,
     node,
     aggregated: multiple ? aggregated : '',
-    primary: (!multiple && node[0]?.url) ? node[0].url : (aggregated || node[0]?.url || ''),
-    source: (!multiple && node[0]?.url) ? 'node' : (aggregated ? 'panel' : node[0]?.url ? 'node' : ''),
+    primary,
+    // A split package cannot be covered by one node link until it is consolidated,
+    // so the drawer has to say which channels the shown link is missing.
+    partial: Boolean(best) && multiple,
+    source: best ? 'node' : (aggregated ? 'panel' : ''),
   };
 }
 
@@ -1453,9 +1500,21 @@ async function attachInbound(row, inbound, req, { free = false } = {}) {
   // he has; minting another client would split one customer across two links and
   // force this panel to aggregate them again — the very thing that moved his
   // subscription off the node address.
-  const hostRows = members.filter((item) => clientKeyOf(item) === clientKeyOf(row));
-  const host = hostRows.find((item) => item.xui_sub_id) || hostRows[0] || row;
-  const email = String(host.email || '') || emailFor(user);
+  //
+  // Which client that is matters: it is the one the customer actually subscribes
+  // to (the adopted one when the package has it), not whichever row happened to be
+  // handed in. And there is deliberately NO "else mint emailFor(user)" fallback
+  // any more — inventing a client when the package's own identity is unknown is
+  // exactly what turned the fixed-inbound heal into 34 extra x-ui clients on the
+  // ثنایی panel today, one per customer, each holding only that channel. The
+  // channel cannot be attached without a client, so the request says so.
+  const onPanel = members.filter((item) => Number(item.server_id || 0) === Number(targetServer.id));
+  const host = primaryClientGroup(row, distinctClients(onPanel.length ? onPanel : members)).head || row;
+  const email = String(host.email || '').trim();
+  if (!email) {
+    throw new ApiError(409, 'package_client_missing',
+      'کلاینت x-ui این بسته مشخص نیست؛ اینباند اضافه نشد — به‌جای آن کلاینت تازهای ساخته نمی‌شود / This package’s x-ui client cannot be identified, so no new client was created to carry the inbound');
+  }
   const uuid = String(host.uuid || '') || randomUUID();
   // A package adopted from another panel carries no group token of ours. Minting
   // one here keeps the bookkeeping (and the panel's aggregated link) usable as a
@@ -1475,6 +1534,13 @@ async function attachInbound(row, inbound, req, { free = false } = {}) {
     throw err instanceof ApiError ? err : new ApiError(502, 'xui_error', `افزودن اینباند ناموفق بود: ${err.message}`);
   }
   const xuiSubId = String(attachedClient?.subId || host.xui_sub_id || groupToken);
+  // The row must never get ahead of the node: if x-ui did not put this channel on
+  // the customer's client, the package would show a channel his subscription does
+  // not contain. Fail the request instead of writing that row.
+  if (!(attachedClient?.inboundIds || []).map(Number).includes(xuiId)) {
+    throw new ApiError(502, 'xui_attach_failed',
+      `اینباند روی اشتراک مشتری در نود ثبت نشد / x-ui did not attach this inbound to the customer's client on the node: ${email}`);
+  }
 
   let insertedId = 0;
   try {
@@ -1647,10 +1713,27 @@ async function consolidatePackage(row, { dryRun = false } = {}, req) {
       clients: groups.length, rows: members.length, moved: 0,
     };
   }
-  // The client to keep: an adopted subscription owns the customer's live link and
-  // his counters, so it wins; otherwise the client with the most rows, and on a
+  // The client to keep. The rule of this panel: a customer has ONE subscription
+  // per x-ui panel, and the one that stays is the subscription he actually uses.
+  //
+  // The client this panel minted for the reseller's fixed inbound is the one that
+  // goes — it holds nothing but that single channel, and it is a copy of the
+  // customer's own subscription, not a second account of his. That rule comes
+  // FIRST, because it is the one case the old order got wrong: with one row on
+  // each side the "older client" won, the customer's live link was deleted and
+  // the reference subscription he was given stopped working.
+  //
+  // After that: an adopted subscription owns the customer's live link and his
+  // counters, so it wins; then the client covering the most channels, and on a
   // tie the oldest row.
-  const rank = (items) => [String(items[0]?.origin || '') === 'external' ? 1 : 0, items.length, -Number(items[0]?.id || 0)];
+  const fixedId = usersService.fixedInboundId(getResellerRow(row.user_id));
+  const fixedOnly = (items) => fixedId > 0 && items.every((item) => Number(item.inbound_id) === fixedId);
+  const rank = (items) => [
+    fixedOnly(items) ? 0 : 1,
+    String(items[0]?.origin || '') === 'external' ? 1 : 0,
+    items.length,
+    -Number(items[0]?.id || 0),
+  ];
   const sorted = [...groups].sort((a, b) => {
     const left = rank(a);
     const right = rank(b);
@@ -1691,7 +1774,22 @@ async function consolidatePackage(row, { dryRun = false } = {}, req) {
   if (xuiIds.length) {
     // Attach first: the customer's own client covers every channel before the
     // duplicate one disappears, so there is no moment without a link.
-    await xui.updateClient(host.email, {}, xuiIds, server);
+    //
+    // And then PROVE it. On x-ui 3.8.5 the update endpoint does not attach a client
+    // to a channel it is not already in, so a merge that looked successful left one
+    // customer with a deleted duplicate and a node link missing that channel. The
+    // duplicate is only removed once the kept client really holds every inbound.
+    const attached = await xui.updateClient(host.email, {}, xuiIds, server);
+    const now = new Set(((attached && attached.inboundIds) || []).map(Number));
+    const missing = xuiIds.filter((id) => !now.has(id));
+    if (missing.length) {
+      info.changed = false;
+      info.skipped = true;
+      info.reason = 'attach-failed';
+      info.errors = [...(info.errors || []),
+        `${host.email}: x-ui did not attach inbound(s) ${missing.join(', ')} — the duplicate client was kept, nothing deleted`];
+      return info;
+    }
   }
   const groupToken = host.sub_id || randomToken(16);
   if (!host.sub_id) {
@@ -1754,6 +1852,186 @@ async function consolidatePackages({ userId = 0, dryRun = false } = {}, req) {
     }
   }
   if (!dryRun && summary.merged) audit(req, 'config.consolidate_all', 'user', Number(userId || 0), summary);
+  return summary;
+}
+
+/**
+ * Give a customer whose subscription is gone from the node ONE subscription back.
+ *
+ * A customer whose x-ui client was deleted on the node panel has nothing left:
+ * every link 404s and the package can neither serve nor be edited, because adding
+ * a channel needs a client to attach it to. This rebuilds exactly ONE client for
+ * him — the same email, the same UUID and the same subscription id he had, so the
+ * link and the configuration already on his phone keep working — and attaches
+ * EVERY channel of the package to it, the reseller's fixed inbound included.
+ *
+ * The rows of the panel are then pointed at that one client, so the package is a
+ * single subscription again: the rule of this panel is one client per customer
+ * per x-ui panel, with all of his inbounds on it.
+ *
+ * Nothing is charged: the customer already paid for this package, and the panel
+ * is only putting back what the node lost.
+ */
+async function recreatePackageClient(id, req, viewer) {
+  const { row } = configDetail(id, viewer);
+  const db = getDb();
+  const user = getResellerRow(row.user_id);
+  if (!user) throw new ApiError(404, 'user_not_found', 'Reseller not found');
+  const members = packageRows(row);
+  const server = serverOfConfig(row);
+  // The identity to restore: an adopted customer keeps HIS email, UUID and
+  // subscription id (the ones his own configuration file carries), a package this
+  // panel made keeps ours. The rows keep their own origin — a row of ours stays
+  // ours, an adopted row stays adopted.
+  const own = members.find((item) => String(item.origin || '') === 'external') || members[0];
+  const email = String(own.email || '').trim();
+  if (!email) {
+    throw new ApiError(409, 'package_client_missing',
+      'کلاینت x-ui این بسته مشخص نیست / This package’s x-ui client cannot be identified');
+  }
+  const uuid = String(own.uuid || '') || randomUUID();
+  const subId = String(own.xui_sub_id || own.sub_id || '') || randomToken(16);
+  // Every channel of the package goes onto that one client — the reseller's fixed
+  // inbound included. That is what makes the package ONE subscription.
+  const inboundRows = members.map((item) => getInboundRow(item.inbound_id)).filter(Boolean);
+  const foreign = inboundRows.find((item) => Number(item.server_id || 0) !== Number(server.id));
+  if (foreign) {
+    throw new ApiError(422, 'server_mismatch',
+      'همه اینباندهای این بسته باید روی یک سرور باشند / All inbounds of this package must belong to the same x-ui panel');
+  }
+  const xuiIds = [...new Set(inboundRows.map((item) => Number(item.xui_id || 0)).filter((n) => n > 0))];
+  if (!xuiIds.length) {
+    throw new ApiError(422, 'inbound_required', 'این بسته هیچ اینباندی ندارد / This package has no channel to restore');
+  }
+  // The email must be free on the node: recreating over a live client would
+  // silently take over its traffic and its channels.
+  const live = await xui.getClient(email, server);
+  if (live) {
+    throw new ApiError(409, 'xui_client_exists',
+      `اشتراک این مشتری روی نود هست و ساخته نمی‌شود / This customer’s subscription is still on the node panel: ${email}`);
+  }
+  const totalBytes = members.reduce((max, item) => Math.max(max, Number(item.total_bytes || 0)), 0);
+  const expiryAt = members.reduce((max, item) => Math.max(max, Number(item.expiry_at || 0)), 0);
+  const enabled = members.some((item) => Number(item.enabled || 0) === 1);
+  const comment = [own.label, own.customer_name, own.customer_phone].filter(Boolean).join(' | ').slice(0, 120);
+
+  let created = null;
+  try {
+    created = await xui.addClient(
+      { email, subId, uuid, flow: '', totalBytes, expiryAt, enabled, comment },
+      xuiIds,
+      server
+    );
+  } catch (err) {
+    throw err instanceof ApiError
+      ? err
+      : new ApiError(502, 'xui_error', `ساخت مجدد اشتراک ناموفق بود: ${err.message}`);
+  }
+  const liveEmail = String(created?.email || email);
+  const liveUuid = String(created?.uuid || uuid);
+  const liveSubId = String(created?.subId || subId);
+  const attached = new Set((created?.inboundIds || []).map(Number));
+  const missing = xuiIds.filter((id) => !attached.has(id));
+  if (missing.length) {
+    // The node did not take every channel: the package would promise channels the
+    // subscription does not carry. The client stays (the customer at least has
+    // what the node accepted) and the panel says exactly what is missing.
+    await xui.deleteClient(liveEmail, false, server);
+    throw new ApiError(502, 'xui_attach_failed',
+      `نود همهٔ اینباندهای بسته را نگرفت (${missing.join(', ')}) — اشتراک ساخته نشد / x-ui did not attach every inbound of the package, so no subscription was left behind`);
+  }
+
+  // Two rows of one package can hold the SAME channel on two different clients —
+  // that is what a leftover duplicate looks like. Once they share one email the
+  // unique index (email, inbound) would reject them, so the redundant row of that
+  // channel goes first; the package's pool and expiry live on the row that stays.
+  const byInbound = new Map();
+  for (const item of members) {
+    const key = Number(item.inbound_id);
+    const current = byInbound.get(key);
+    if (!current) { byInbound.set(key, item); continue; }
+    const keep = String(current.email || '').toLowerCase() === liveEmail.toLowerCase() ? current : item;
+    const drop = keep === current ? item : current;
+    db.prepare('DELETE FROM configs WHERE id = ?').run(Number(drop.id));
+    db.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(Number(drop.id));
+    byInbound.set(key, keep);
+  }
+  const groupToken = own.sub_id || randomToken(16);
+  db.transaction(() => {
+    for (const item of byInbound.values()) {
+      db.prepare('UPDATE configs SET email = ?, uuid = ?, sub_id = ?, xui_sub_id = ?, sync_status = ?, updated_at = ? WHERE id = ?')
+        .run(liveEmail, liveUuid, groupToken, liveSubId, '', Date.now(), Number(item.id));
+    }
+  })();
+
+  const info = {
+    ok: true,
+    email: liveEmail,
+    uuid: liveUuid,
+    subId: liveSubId,
+    serverId: Number(server.id || 0),
+    inbounds: xuiIds,
+    members: byInbound.size,
+    link: nodeSubUrlFor({ xui_sub_id: liveSubId, sub_id: groupToken }, server),
+    enabled,
+  };
+  audit(req, 'config.recreate', 'config', Number(row.id), info);
+  return info;
+}
+
+/**
+ * Give back the subscriptions of every customer of one reseller whose client is
+ * gone from the node. `dryRun` only lists them.
+ *
+ * Only packages the panel still has switched ON are restored: a package the
+ * reseller disabled stays as it is, and the operator decides what to do with it.
+ */
+async function recreateMissingPackages({ userId = 0, dryRun = false } = {}, req) {
+  const db = getDb();
+  const rows = userId
+    ? db.prepare('SELECT * FROM configs WHERE user_id = ? AND deleted_at = 0 ORDER BY id').all(Number(userId))
+    : db.prepare('SELECT * FROM configs WHERE deleted_at = 0 ORDER BY id').all();
+  const seen = new Set();
+  const summary = { packages: 0, missing: 0, restored: 0, skipped: 0, dryRun: Boolean(dryRun), details: [], errors: [] };
+  for (const row of rows) {
+    const key = packageKeyOf(row);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    summary.packages += 1;
+    const members = packageRows(row);
+    const emails = [...new Set(members.map((item) => String(item.email || '')))];
+    const server = serverOfConfig(row);
+    const onNode = [];
+    for (const email of emails) {
+      if (!email) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const client = await xui.getClient(email, server);
+      if (client) onNode.push(email);
+    }
+    if (onNode.length) continue;
+    summary.missing += 1;
+    const label = row.label || row.customer_name || row.email;
+    if (dryRun) {
+      summary.details.push({ id: Number(row.id), label, email: emails[0] || '', members: members.length });
+      continue;
+    }
+    if (!members.some((item) => Number(item.enabled || 0) === 1)) {
+      summary.skipped += 1;
+      summary.details.push({ id: Number(row.id), label, email: emails[0] || '', reason: 'package-disabled' });
+      continue;
+    }
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const info = await recreatePackageClient(members[0].id, req, { role: 'admin' });
+      summary.restored += 1;
+      summary.details.push({ id: Number(row.id), label, email: info.email, link: info.link, members: info.members });
+    } catch (err) {
+      summary.skipped += 1;
+      summary.errors.push(`${label}: ${err.message}`);
+      summary.details.push({ id: Number(row.id), label, error: err.message });
+    }
+  }
+  if (!dryRun && summary.restored) audit(req, 'config.recreate_all', 'user', Number(userId || 0), summary);
   return summary;
 }
 
@@ -1975,6 +2253,8 @@ module.exports = {
   isOneClientPackage,
   consolidatePackage,
   consolidatePackages,
+  recreatePackageClient,
+  recreateMissingPackages,
   extendConfig,
   setQuota,
   toggleConfig,

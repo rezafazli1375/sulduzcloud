@@ -242,6 +242,15 @@ router.post('/users/:id/consolidate', auth.requirePerm('users'), asyncH(async (r
   res.json({ ok: true, data: { ...result, dryRun } });
 }));
 
+// Panel v1.4.21: the same thing for the OTHER direction — customers whose x-ui
+// client is gone from the node panel. `dryRun` only lists them; the write puts
+// one client back per package and never touches a package that is switched off.
+router.post('/users/:id/recreate-missing', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const dryRun = req.body?.dryRun === true || String(req.body?.dryRun) === 'true';
+  const result = await configsService.recreateMissingPackages({ userId: num(req.params.id), dryRun }, req);
+  res.json({ ok: true, data: { ...result, dryRun } });
+}));
+
 router.post('/users/:id/status', auth.requirePerm('users'), (req, res) => {
   const user = usersService.setStatus(num(req.params.id), String(req.body?.status || ''), req);
   res.json({ ok: true, data: { user: sanitizeUser(user) } });
@@ -442,6 +451,14 @@ router.post('/configs/:id/inbounds', auth.requirePerm('configs'), asyncH(async (
 router.post('/configs/:id/reset', auth.requirePerm('configs'), asyncH(async (req, res) => {
   const config = await configsService.resetUsage(num(req.params.id), req, { role: 'admin' });
   res.json({ ok: true, data: { config } });
+}));
+
+// Panel v1.4.21: put ONE x-ui client back for a customer whose client was
+// deleted on the node panel — same email, UUID and subscription id, every
+// channel of the package on it, the reseller's fixed inbound included.
+router.post('/configs/:id/recreate', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const result = await configsService.recreatePackageClient(num(req.params.id), req, { role: 'admin' });
+  res.json({ ok: true, data: result });
 }));
 
 router.delete('/configs/:id', auth.requirePerm('configs'), asyncH(async (req, res) => {

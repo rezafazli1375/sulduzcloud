@@ -275,9 +275,11 @@ function migrate(db) {
   // exist on the panels under their Telegram id are pulled into their list.
   // Turning it off only hides those rows; the clients stay untouched in x-ui.
   ensureColumn(db, 'users', 'import_configs', 'INTEGER NOT NULL DEFAULT 1');
-  // `origin` separates customers created through this panel from subscriptions
-  // adopted out of an existing x-ui/sanaei panel. A single client is always one
-  // origin, so packages never mix the two in the grouped list.
+  // `origin` records who WROTE the row: this panel or the adoption pass that pulled
+  // an existing subscription out of a seller's x-ui panel. It is a per-row fact, not
+  // a per-client one — since v1.4.18 a channel added to an adopted customer joins his
+  // existing client but stays a row of ours ('panel'), which is what lets removing it
+  // undo our own write instead of deleting something on the seller's panel.
   ensureColumn(db, 'configs', 'origin', "TEXT NOT NULL DEFAULT 'panel'");
   // Panel v1.4.16: every reseller can name one FIXED inbound. It is the base of
   // a package — pre-selected when a config is created and never removable — so a

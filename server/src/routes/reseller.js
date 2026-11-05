@@ -213,6 +213,15 @@ router.post('/configs/:id/reset', asyncH(async (req, res) => {
   res.json({ ok: true, data: { config } });
 }));
 
+// Panel v1.4.21: the customer's x-ui client was deleted on the node panel, so
+// every link 404s and the package cannot even take a new channel. This puts ONE
+// client back — the same email, UUID and subscription id, with every channel of
+// the package on it, the reseller's fixed inbound included.
+router.post('/configs/:id/recreate', asyncH(async (req, res) => {
+  const result = await configsService.recreatePackageClient(num(req.params.id), req, req.user);
+  res.json({ ok: true, data: result });
+}));
+
 router.delete('/configs/:id', asyncH(async (req, res) => {
   const result = await configsService.removeConfig(num(req.params.id), {}, req, req.user);
   // detachedOnly  — an adopted row: nothing was written to the other panel.

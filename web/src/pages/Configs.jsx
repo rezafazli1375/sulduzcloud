@@ -255,6 +255,11 @@ export default function Configs() {
                                 {row.origin === 'external' ? (
                                   <Badge tone="amber" className="shrink-0">{t('configs.originExternalBadge')}</Badge>
                                 ) : null}
+                                {/* The x-ui client of this customer is gone from the node
+                                    panel: every link of the package errors out. */}
+                                {row.syncStatus === 'missing' ? (
+                                  <Badge tone="rose" className="shrink-0">{t('configs.detail.clientMissingBadge')}</Badge>
+                                ) : null}
                               </p>
                               {grouped ? (
                                 <p className="flex items-center gap-1 text-[10px] text-cyan-300/80">
@@ -341,6 +346,7 @@ export default function Configs() {
                       <p className="flex items-center gap-1.5">
                         <span className="truncate text-[12.5px] font-semibold text-slate-100">{row.customerName || row.label || row.email}</span>
                         {row.origin === 'external' ? <Badge tone="amber" className="shrink-0">{t('configs.originExternalBadge')}</Badge> : null}
+                        {row.syncStatus === 'missing' ? <Badge tone="rose" className="shrink-0">{t('configs.detail.clientMissingBadge')}</Badge> : null}
                       </p>
                       {grouped ? (
                         <p className="flex items-center gap-1 text-[9.5px] text-cyan-300/80">

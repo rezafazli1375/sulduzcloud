@@ -156,7 +156,18 @@ async function listClients(server) {
 }
 
 async function getClient(email, server) {
-  const obj = await request('GET', `/clients/get/${enc(email)}`, undefined, { server });
+  let obj = null;
+  try {
+    obj = await request('GET', `/clients/get/${enc(email)}`, undefined, { server });
+  } catch (err) {
+    // x-ui 3.8.5 answers a client that is not on the panel with `success:false`
+    // and the message "Obtain (record not found)" instead of an empty body. That
+    // is the answer, not a failure: this customer has no client here — and the
+    // panel has to be able to see that, because it is what a customer whose
+    // subscription was deleted on the node looks like.
+    if (err && err.code === 'xui_error' && /not found/i.test(String(err.message || ''))) return null;
+    throw err;
+  }
   if (!obj) return null;
   const client = obj.client || obj.Client || obj;
   return normalizeClient(client, obj.inboundIds);
@@ -184,43 +195,105 @@ async function addClient(client, inboundIds, server) {
     inboundIds: inboundIds.map(Number),
   };
   await request('POST', '/clients/add', payload, { server });
-  return getClient(client.email, server);
+  const live = await getClient(client.email, server);
+  // Prove the node really put him on every channel of the order. `clients/add` is
+  // the one call that is supposed to attach the whole list, but a customer who is
+  // missing a channel while the panel already wrote a row for it is the exact
+  // breakage v1.4.20 was asked to close, so anything the add did not take is
+  // attached through the endpoint that provably does — and a channel the node
+  // still refuses is reported instead of being written off as a success.
+  if (!live) {
+    throw new ApiError(502, 'xui_add_unverified', `x-ui accepted the new client but does not list it: ${client.email}`);
+  }
+  const wanted = [...new Set((inboundIds || []).map(Number))].filter((id) => Number.isFinite(id) && id > 0);
+  const have = new Set((live.inboundIds || []).map(Number));
+  const missing = wanted.filter((id) => !have.has(id));
+  if (missing.length) return attachInbounds(live.email, missing, server);
+  return live;
 }
 
 async function updateClient(email, patch, inboundIds, server) {
   const current = await getClient(email, server);
   if (!current) throw new ApiError(404, 'xui_client_missing', 'Client does not exist on the x-ui panel');
-  // A subscription imported from the panel can already be attached to several
-  // inbounds. Updating its quota must never detach the other ones, so the
-  // existing attachments are kept and the requested ones are added.
-  // Detaching is a separate operation (detachInbounds).
-  const mergedIds = [...new Set([
-    ...(current.inboundIds || []).map(Number),
-    ...((inboundIds && inboundIds.length ? inboundIds : []).map(Number)),
-  ])].filter((id) => Number.isFinite(id) && id > 0);
-  const merged = {
-    ...current,
-    ...patch,
-    email: current.email,
-    inboundIds: mergedIds.length ? mergedIds : current.inboundIds,
-  };
+  const wanted = [...new Set(((inboundIds && inboundIds.length ? inboundIds : [])).map(Number))]
+    .filter((id) => Number.isFinite(id) && id > 0);
+  const merged = { ...current, ...patch, email: current.email };
   const body = buildClientPayload(merged);
-  const query = merged.inboundIds && merged.inboundIds.length
-    ? `?inboundIds=${merged.inboundIds.join(',')}`
-    : '';
-  await request('POST', `/clients/update/${enc(current.email)}${query}`, body, { server });
+  // x-ui 3.8.5 rewrites the client only in the inbounds that ALREADY hold it, and
+  // a channel listed in ?inboundIds= that it is not in yet is silently ignored —
+  // proven live on dash, where the consolidation pass left the customer one channel
+  // short while the panel believed the merge succeeded. So the fields go in without
+  // an attachment list (that alone keeps every channel he has), and a channel that
+  // is genuinely new is attached through its own endpoint below.
+  await request('POST', `/clients/update/${enc(current.email)}`, body, { server });
+  const attached = new Set((current.inboundIds || []).map(Number));
+  const missing = wanted.filter((id) => !attached.has(id));
+  if (missing.length) return attachInbounds(current.email, missing, server);
   return getClient(current.email, server);
+}
+
+/**
+ * Attach an EXISTING client to more inbounds, keeping the ones he already has.
+ *
+ * The route table read out of the x-ui 3.8.5 binary offers two ways to do this —
+ * `POST /clients/<email>/attach` and `POST /clients/bulkAttach {emails, inboundIds}`
+ * — and this panel uses bulkAttach because that one answers with the lists it built
+ * (`attached`, `skipped`, `errors`) and it is the call that provably moved the
+ * channel back onto the customer's own client on dash after
+ * `clients/update?inboundIds=` had silently ignored it.
+ *
+ * Whatever the answer claims, the result is re-read from `/clients/get` and compared:
+ * a pass that "succeeded" without attaching is exactly what dropped a customer's
+ * channel once and must never delete a duplicate client again.
+ */
+async function attachInbounds(email, inboundIds, server) {
+  const ids = [...new Set((inboundIds || []).map(Number))].filter((id) => Number.isFinite(id) && id > 0);
+  if (!ids.length) throw new ApiError(422, 'inbounds_required', 'No inbound to attach was given');
+  const obj = await request('POST', '/clients/bulkAttach', { emails: [String(email)], inboundIds: ids }, { server });
+  const errors = (obj && obj.errors) || [];
+  if (errors.length) {
+    throw new ApiError(422, 'xui_error', `x-ui refused to attach ${email}: ${errors.join('; ')}`);
+  }
+  const client = await getClient(email, server);
+  const now = new Set(((client && client.inboundIds) || []).map(Number));
+  const missing = ids.filter((id) => !now.has(id));
+  if (missing.length) {
+    const skipped = (obj && obj.skipped) || [];
+    throw new ApiError(422, 'xui_attach_failed',
+      `x-ui did not attach ${email} to inbound(s) ${missing.join(', ')}${skipped.length ? ` (skipped: ${skipped.join(', ')})` : ''}`);
+  }
+  return client;
+}
+
+/**
+ * Take channels off a client that keeps the rest. `/clients/<email>/detach` is
+ * the endpoint the panel's own dialog uses; detaching every channel leaves the
+ * client without an inbound, which is what a real delete is for (deleteClient).
+ */
+async function detachInbounds(email, inboundIds, server) {
+  const ids = [...new Set((inboundIds || []).map(Number))].filter((id) => Number.isFinite(id) && id > 0);
+  if (!ids.length) throw new ApiError(422, 'inbounds_required', 'No inbound to detach was given');
+  await request('POST', `/clients/${enc(email)}/detach`, { inboundIds: ids }, { server });
+  const client = await getClient(email, server);
+  // A client detached from its last channel is gone from x-ui entirely.
+  if (!client) return null;
+  const now = new Set((client.inboundIds || []).map(Number));
+  const still = ids.filter((id) => now.has(id));
+  if (still.length) {
+    throw new ApiError(422, 'xui_detach_failed', `x-ui still holds ${email} on inbound(s) ${still.join(', ')}`);
+  }
+  return client;
 }
 
 /**
  * Set the exact list of inbounds a client is attached to.
  *
- * x-ui's update endpoint takes the attachment list from the ?inboundIds= query
- * and treats it as the complete set (that is why updateClient() above merges the
- * current attachments in first, so a quota edit cannot silently drop channels).
- * Replacing the list is therefore the way to take ONE channel off a customer who
- * keeps the rest — used when an inbound is removed from a package whose rows all
- * stand for the same x-ui client.
+ * There is no "replace the attachment list" call on x-ui 3.8.5: the update
+ * endpoint only rewrites the client where it already exists. So the difference is
+ * computed here and applied through the two endpoints that really move channels —
+ * bulkAttach for the new ones, `/clients/<email>/detach` for the ones going away —
+ * and attaching happens FIRST, so a customer is never left without a channel even
+ * for the moment between the two calls.
  */
 async function setInbounds(email, inboundIds, server) {
   const current = await getClient(email, server);
@@ -229,8 +302,12 @@ async function setInbounds(email, inboundIds, server) {
   if (!ids.length) {
     throw new ApiError(422, 'inbounds_required', 'A client cannot be left without any inbound');
   }
-  const body = buildClientPayload(current);
-  await request('POST', `/clients/update/${enc(email)}?inboundIds=${ids.join(',')}`, body, { server });
+  const have = (current.inboundIds || []).map(Number);
+  const add = ids.filter((id) => !have.includes(id));
+  const remove = have.filter((id) => !ids.includes(id));
+  if (add.length) await attachInbounds(email, add, server);
+  if (remove.length) await detachInbounds(email, remove, server);
+  if (!add.length && !remove.length) return current;
   return getClient(email, server);
 }
 
@@ -272,16 +349,6 @@ async function adjustMany(emails, { addDays = 0, addBytes = 0 } = {}, server) {
     addDays: Number(addDays || 0),
     addBytes: Math.round(Number(addBytes || 0)),
   }, { server });
-}
-
-async function attachInbounds(email, inboundIds, server) {
-  await request('POST', `/clients/${enc(email)}/attach`, { inboundIds: inboundIds.map(Number) }, { server });
-  return true;
-}
-
-async function detachInbounds(email, inboundIds, server) {
-  await request('POST', `/clients/${enc(email)}/detach`, { inboundIds: inboundIds.map(Number) }, { server });
-  return true;
 }
 
 async function clientLinks(email, server) {

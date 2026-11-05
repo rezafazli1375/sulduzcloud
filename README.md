@@ -4,7 +4,7 @@
 
 A bilingual (Persian/English) reseller & config management panel for 3x-ui, with a premium dark UI, per-reseller limits, wallet, tickets, live node status, backups and a reseller REST API.
 
-Version 1.4.19 · Node.js 20+ · SQLite · React 18 · multi-panel
+Version 1.4.21 · Node.js 20+ · SQLite · React 18 · multi-panel
 
 ---
 
@@ -315,7 +315,7 @@ Environment variables, the systemd unit and the nginx sample are documented in t
 cd server && npm run selftest
 ```
 
-The self-test suite reports its own check count on every run (v1.4.19 covers setup, auth, session revocation, CSRF, multi-panel management, one-client packages — create, add a channel, take one off, rotate the subscription id, merge a package that was split over two clients — quota pooling, renewal and the node-vs-panel subscription address, all against a mock 3x-ui that enforces the real subId uniqueness rule, plus wallet charges, quotas, tickets, backups, audit log and API keys) on a temporary database.
+The self-test suite reports its own check count on every run (v1.4.21 covers setup, auth, session revocation, CSRF, multi-panel management, one-client packages — create, add a channel, take one off, rotate the subscription id, merge a package that was split over two clients (the client that holds only the reseller's fixed inbound is the copy that goes, the customer's own client survives and receives that channel), and refuse to delete a duplicate when the node refused the attach — quota pooling, renewal and the subscription address (a customer is always handed the node's own link for his x-ui client — the panel only falls back to its aggregated `/api/sub/<token>` address when the server has no subscription base, and keeps serving that route for customers who already hold it), plus rebuilding a customer whose x-ui client was deleted on the node (one client back, same email/uuid/subscription id, every channel of the package on it) all against a mock 3x-ui that enforces the real subId uniqueness rule and the real attachment rule (a channel only moves with `clients/bulkAttach` / `clients/<email>/detach`; `clients/update` rewrites the client where it already lives and ignores a channel it is not in yet, and a client that is not on the panel answers "record not found"), plus wallet charges, quotas, tickets, backups, audit log and API keys) on a temporary database.
 
 ### License
 

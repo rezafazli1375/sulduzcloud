@@ -96,6 +96,18 @@ async function waitForServer(child) {
  */
 function startMockXui(inboundRows) {
   const clients = new Map();
+  // Every call the panel makes is recorded, so a test can prove WHICH endpoint it
+  // used: on the real x-ui 3.8.5 a channel only moves through bulkAttach, and the
+  // suite must catch a regression back to the update query.
+  const calls = [];
+  // Emails the panel is not allowed to attach: the live question of what the panel
+  // does when x-ui refuses an attach, without any duplicate client being deleted.
+  const refuseAttach = new Set();
+  // A node that does not take the whole inbound list on clients/add. The panel has
+  // to notice that from the re-read and attach the leftovers through bulkAttach —
+  // it must never paper over a missing channel by writing a row the node does not
+  // serve, and never by creating a second client for the same customer.
+  const quirks = { addKeepsOnlyFirst: false };
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (chunk) => { raw += chunk; });
@@ -104,6 +116,7 @@ function startMockXui(inboundRows) {
       const route = decodeURIComponent(url.pathname.replace(/^\/panel\/api/, ''));
       let body = {};
       try { body = raw ? JSON.parse(raw) : {}; } catch (_) { body = {}; }
+      calls.push({ method: req.method, route, query: Object.fromEntries(url.searchParams.entries()), body });
       const send = (obj) => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ success: true, msg: '', obj }));
@@ -126,12 +139,20 @@ function startMockXui(inboundRows) {
         if (route === '/clients/list') return send([...clients.values()]);
         if (route.startsWith('/clients/get/')) {
           const client = clients.get(emailOf('/clients/get/'));
-          return send(client ? { client, inboundIds: client.inboundIds || [] } : null);
+          // The real panel answers a client that is not on it with success:false
+          // and "Obtain (record not found)" — not with an empty body. The double
+          // has to answer the same way, or the panel would never learn that a
+          // customer has no subscription on the node any more.
+          if (!client) return failMsg('Obtain (record not found)');
+          return send({ client, inboundIds: client.inboundIds || [] });
         }
         if (route === '/clients/add') {
           const incoming = body.client || {};
           if (subIdTaken(incoming.subId)) return failMsg(`subId already in use: ${incoming.subId}`);
-          clients.set(String(incoming.email), { ...incoming, id: incoming.id, inboundIds: (body.inboundIds || []).map(Number) });
+          const wanted = (body.inboundIds || []).map(Number);
+          clients.set(String(incoming.email), {
+            ...incoming, id: incoming.id, inboundIds: quirks.addKeepsOnlyFirst ? wanted.slice(0, 1) : wanted,
+          });
           return send(null);
         }
         if (route.startsWith('/clients/update/')) {
@@ -142,10 +163,50 @@ function startMockXui(inboundRows) {
           if (next.subId && next.subId !== current.subId && subIdTaken(next.subId, email)) {
             return failMsg(`subId already in use: ${next.subId}`);
           }
+          // x-ui 3.8.5 semantics, proven live on dash: the update endpoint rewrites
+          // the client in the inbounds that already hold it. A channel listed in
+          // ?inboundIds= that the client is NOT in is ignored — it neither attaches
+          // nor detaches anything. Channels move through bulkAttach / <email>/detach.
           const inboundIds = url.searchParams.get('inboundIds');
-          if (inboundIds) next.inboundIds = inboundIds.split(',').map(Number);
+          if (inboundIds) {
+            const listed = inboundIds.split(',').map(Number);
+            next.inboundIds = (current.inboundIds || []).filter((id) => listed.includes(Number(id)));
+            if (!next.inboundIds.length) next.inboundIds = current.inboundIds || [];
+          }
           clients.set(email, next);
           return send(null);
+        }
+        if (route === '/clients/bulkAttach') {
+          // The endpoint the panel's own "attach clients" dialog posts to, with the
+          // same body ({emails, inboundIds}) and the same answer shape.
+          const ids = (body.inboundIds || []).map(Number);
+          const attached = [];
+          const skipped = [];
+          const errors = [];
+          for (const raw of body.emails || []) {
+            const email = String(raw);
+            const current = clients.get(email);
+            if (!current) { errors.push(`${email}: record not found`); continue; }
+            const before = (current.inboundIds || []).map(Number);
+            if (refuseAttach.has(email)) { skipped.push(email); continue; }
+            const next = [...new Set([...before, ...ids])];
+            if (next.length === before.length) skipped.push(email);
+            else attached.push(email);
+            clients.set(email, { ...current, inboundIds: next });
+          }
+          return send({ attached, skipped, errors });
+        }
+        if (/^\/clients\/[^/]+\/detach$/.test(route)) {
+          const email = decodeURIComponent(route.split('/')[2]);
+          const current = clients.get(email);
+          if (!current) return failMsg(`Obtain (record not found)`);
+          const drop = (body.inboundIds || []).map(Number);
+          // A client lives inside the inbounds' settings: detaching the last channel
+          // removes it from the panel altogether.
+          const rest = (current.inboundIds || []).map(Number).filter((id) => !drop.includes(id));
+          if (!rest.length) clients.delete(email);
+          else clients.set(email, { ...current, inboundIds: rest });
+          return send(true);
         }
         if (route.startsWith('/clients/del/')) {
           clients.delete(emailOf('/clients/del/'));
@@ -166,6 +227,25 @@ function startMockXui(inboundRows) {
           return send(attached.map((id) => `vless://mock-${email}@127.0.0.1:${1000 + Number(id)}?type=tcp#${encodeURIComponent(email)}-${id}`));
         }
         if (route.startsWith('/clients/resetTraffic/')) return send(true);
+        if (route === '/clients/onlines') return send([]);
+        if (route === '/clients/bulkAdjust') return send((body.emails || []).map((email) => ({ email, ok: true })));
+        if (route.startsWith('/clients/subLinks/')) {
+          const subId = emailOf('/clients/subLinks/');
+          const owner = [...clients.values()].find((c) => String(c.subId || '') === String(subId));
+          if (!owner) return send([]);
+          const attached = (owner.inboundIds || []).length ? owner.inboundIds : [1000];
+          return send(attached.map((id) => `vless://mock-${owner.email}@127.0.0.1:${1000 + Number(id)}?type=tcp#${encodeURIComponent(owner.email)}-${id}`));
+        }
+        // Anything else does not exist on x-ui. Answering 404 instead of a friendly
+        // `null` is what makes this double catch an invented endpoint — the panel
+        // once "attached" through /clients/<email>/attach, a route the real binary
+        // has never had, and the mock let it pass.
+        const known = route.startsWith('/clients/') || route.startsWith('/inbounds/') || route.startsWith('/nodes/');
+        if (known) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ success: false, msg: `not found: ${route}`, obj: null }));
+          return undefined;
+        }
         return send(null);
       } catch (err) {
         res.writeHead(500, { 'content-type': 'application/json' });
@@ -175,7 +255,7 @@ function startMockXui(inboundRows) {
     });
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, clients }));
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, clients, calls, refuseAttach, quirks }));
   });
 }
 
@@ -1569,9 +1649,23 @@ function startMockXui(inboundRows) {
         `needFix=${dryRun.json?.data?.needFix} healed=${dryRun.json?.data?.healed} live=${liveBeforeDry}`);
 
       const walletBeforeHeal = Number((await request('GET', '/api/auth/me', { cookies: fixedCookies })).json?.data?.user?.balance || 0);
+      // v1.4.20 guard, from the live defect: this heal pass on the ثنایی panel ran
+      // under v1.4.17 and minted ONE NEW x-ui client per customer (34 of them, each
+      // holding only Status2), which is what split one package across two clients
+      // and pushed the subscription link behind this panel. The heal must move the
+      // channel onto the client the customer already has, so the node must finish
+      // the pass with exactly the clients it started with.
+      const clientsBeforeHeal = mockXui.clients.size;
+      const callsBeforeHeal = mockXui.calls.length;
       const heal = await request('POST', `/api/admin/users/${fixedShopId}/fixed-inbound/apply`, {
         cookies, csrf, body: { dryRun: false },
       });
+      const healCalls = mockXui.calls.slice(callsBeforeHeal);
+      check('the heal pass creates no x-ui client at all — a channel joins an existing customer',
+        heal.status === 200 && mockXui.clients.size === clientsBeforeHeal
+        && healCalls.some((call) => call.route === '/clients/bulkAttach')
+        && healCalls.every((call) => call.route !== '/clients/add'),
+        `clients=${clientsBeforeHeal}→${mockXui.clients.size} add=${healCalls.filter((call) => call.route === '/clients/add').length} bulkAttach=${healCalls.filter((call) => call.route === '/clients/bulkAttach').length}`);
       check('the heal adds the fixed inbound to every adopted package without charging',
         heal.status === 200 && Number(heal.json?.data?.healed) === 2 && Number(heal.json?.data?.skipped) === 0,
         `healed=${heal.json?.data?.healed} skipped=${heal.json?.data?.skipped} errors=${JSON.stringify(heal.json?.data?.errors || [])}`);
@@ -1589,6 +1683,15 @@ function startMockXui(inboundRows) {
         Number(fixedMember.totalBytes) === 3 * 1024 ** 3
         && Number(fixedMember.expiryAt) > Date.now(),
         `bytes=${fixedMember.totalBytes}`);
+      // v1.4.20 #88, from the live defect: the healed channel is a row THIS panel
+      // wrote, so it keeps origin 'panel' while the adopted rows of the same customer
+      // stay 'external'. That split is what makes removing the channel undo our own
+      // write on the node instead of silently forgetting it, and it is the shape the
+      // ثنایی census finds today (an adopted customer plus one channel of ours).
+      check('the healed channel is a row this panel wrote, beside the adopted ones',
+        String(fixedMember.origin || '') === 'panel'
+        && healedGroup.filter((item) => String(item.origin || '') === 'external').length === 1,
+        `origin=${fixedMember.origin} group=${healedGroup.map((item) => `${item.inboundId}:${item.origin}`).join(',')}`);
 
       // v1.4.18: the heal added the channel to the customer's OWN client, so the
       // package is still one client and his subscription link stays on the node —
@@ -1682,11 +1785,22 @@ function startMockXui(inboundRows) {
     // duplicate client this panel created — never an adopted one.
     const MERGE_GB = 1024 ** 3;
     const splitToken = `split${crypto.randomBytes(8).toString('hex')}`;
-    const hostEmail = `merge-host-${crypto.randomBytes(6).toString('hex')}`;
-    const dupEmail = `merge-dup-${crypto.randomBytes(6).toString('hex')}`;
+    // The customer's own client: the subscription he really uses, on two channels.
+    const ownEmail = `merge-own-${crypto.randomBytes(6).toString('hex')}`;
+    // The client this panel minted for the reseller's FIXED inbound: it carries
+    // that one channel and nothing else, so it is the copy that goes.
+    const fixedEmail = `merge-fixed-${crypto.randomBytes(6).toString('hex')}`;
     const extToken = `ext${crypto.randomBytes(8).toString('hex')}`;
     const extEmailA = `merge-ext-a-${crypto.randomBytes(6).toString('hex')}`;
     const extEmailB = `merge-ext-b-${crypto.randomBytes(6).toString('hex')}`;
+    // Declared out here because the `finally` cleanup below names them too: a
+    // `const` inside the try is block-scoped and would throw there.
+    const noSafeOwn = `merge-nosafe-own-${crypto.randomBytes(6).toString('hex')}`;
+    const noSafeFixed = `merge-nosafe-fixed-${crypto.randomBytes(6).toString('hex')}`;
+    const noSafeToken = `nosafe${crypto.randomBytes(8).toString('hex')}`;
+    // Declared outside the try for the same reason as the two above: the `finally`
+    // below has to clean the client of the stubborn-node order up too.
+    let stubbornEmail = '';
     const splitDb = new Database(path.join(DATA_DIR, 'panel.db'));
     const splitRowIds = [];
     const addSplitRow = ({ email, inboundId, token, xuiSubId, origin }) => {
@@ -1708,17 +1822,29 @@ function startMockXui(inboundRows) {
       });
     };
     try {
-      const hostRow = addSplitRow({ email: hostEmail, inboundId: 901, token: splitToken, xuiSubId: splitToken, origin: 'panel' });
-      const dupRow = addSplitRow({ email: dupEmail, inboundId: 903, token: splitToken, xuiSubId: `private-${dupEmail}`, origin: 'panel' });
-      addSplitClient(hostEmail, splitToken, [901]);
-      addSplitClient(dupEmail, `private-${dupEmail}`, [903]);
+      // The shape the live panel really has: the customer's own client holds
+      // several channels, the fixed-inbound client holds that single channel and
+      // nothing else — the copy of his subscription this panel made.
+      const ownRow = addSplitRow({ email: ownEmail, inboundId: 903, token: splitToken, xuiSubId: `private-${ownEmail}`, origin: 'panel' });
+      addSplitRow({ email: ownEmail, inboundId: 904, token: splitToken, xuiSubId: `private-${ownEmail}`, origin: 'panel' });
+      const fixedRow = addSplitRow({ email: fixedEmail, inboundId: 901, token: splitToken, xuiSubId: `private-${fixedEmail}`, origin: 'panel' });
+      addSplitClient(ownEmail, `private-${ownEmail}`, [903, 904]);
+      addSplitClient(fixedEmail, `private-${fixedEmail}`, [901]);
 
-      const splitLinks = await request('GET', `/api/admin/configs/${hostRow}/links`, { cookies });
+      const splitLinks = await request('GET', `/api/admin/configs/${ownRow}/links`, { cookies });
       const splitSubs = splitLinks.json?.data?.subscriptions || {};
-      check('a package held by two x-ui clients is served by the panel’s aggregated link',
-        splitLinks.status === 200 && Number(splitSubs.clientCount) === 2 && splitSubs.source === 'panel'
-        && String(splitLinks.json?.data?.subUrl || '') === `http://127.0.0.1/api/sub/${splitToken}`,
-        `subUrl=${splitLinks.json?.data?.subUrl} clients=${splitSubs.clientCount} source=${splitSubs.source}`);
+      // The owner's rule for the address: a customer is handed the subscription the
+      // NODE panel serves for his own x-ui client — never this panel's address — even
+      // while the package is still spread over two clients. The combined link and the
+      // other client's link stay listed underneath, and the /api/sub/<token> route
+      // keeps answering for everyone who was already given it.
+      check('a package held by two x-ui clients is still handed the node link of its own client',
+        splitLinks.status === 200 && Number(splitSubs.clientCount) === 2 && splitSubs.source === 'node'
+        && String(splitLinks.json?.data?.subUrl || '') === `https://sub.example.com/sub/private-${ownEmail}`
+        && splitSubs.partial === true
+        && String(splitSubs.aggregated || '') === `http://127.0.0.1/api/sub/${splitToken}`
+        && Number((splitSubs.node || []).filter((item) => item.url !== splitSubs.primary).length) === 1,
+        `subUrl=${splitLinks.json?.data?.subUrl} clients=${splitSubs.clientCount} source=${splitSubs.source} partial=${splitSubs.partial} aggregated=${splitSubs.aggregated}`);
       check('every client of a split package keeps its own node link in the drawer',
         Number(splitSubs.node?.length) === 2
         && (splitSubs.node || []).every((item) => String(item.url || '').startsWith('https://sub.example.com/sub/')),
@@ -1728,48 +1854,63 @@ function startMockXui(inboundRows) {
       const mergeDry = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
         cookies, csrf, body: { dryRun: true },
       });
-      const dryInfo = (mergeDry.json?.data?.details || []).find((item) => item.email === hostEmail) || {};
+      const dryInfo = (mergeDry.json?.data?.details || []).find((item) => item.email === ownEmail) || {};
       check('the dry run reports the split without writing anything to x-ui',
         mergeDry.status === 200 && Number(mergeDry.json?.data?.packages) === 1
         && Number(mergeDry.json?.data?.split) === 1 && Number(mergeDry.json?.data?.merged) === 1
         && Number(dryInfo.moved) === 1 && dryInfo.dryRun === true
         && mockXui.clients.size === clientsBeforeMerge
-        && String(splitDb.prepare('SELECT email FROM configs WHERE id = ?').get(dupRow).email) === dupEmail,
-        `status=${mergeDry.status} packages=${mergeDry.json?.data?.packages} split=${mergeDry.json?.data?.split} clients=${mockXui.clients.size} host=${dryInfo.email} moved=${dryInfo.moved}`);
+        && String(splitDb.prepare('SELECT email FROM configs WHERE id = ?').get(fixedRow).email) === fixedEmail,
+        `status=${mergeDry.status} packages=${mergeDry.json?.data?.packages} split=${mergeDry.json?.data?.split} clients=${mockXui.clients.size} own=${dryInfo.email} moved=${dryInfo.moved}`);
 
-      const hostClientBefore = mockXui.clients.get(hostEmail) || {};
+      const ownClientBefore = mockXui.clients.get(ownEmail) || {};
       const mergeRun = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
         cookies, csrf, body: { dryRun: false },
       });
-      const dupRowAfter = splitDb.prepare('SELECT * FROM configs WHERE id = ?').get(dupRow);
-      const mergedClient = mockXui.clients.get(hostEmail) || {};
+      const fixedRowAfter = splitDb.prepare('SELECT * FROM configs WHERE id = ?').get(fixedRow);
+      const mergedClient = mockXui.clients.get(ownEmail) || {};
       check('consolidating moves the extra channel onto the customer’s own client',
         mergeRun.status === 200 && Number(mergeRun.json?.data?.merged) === 1
         && Number(mergeRun.json?.data?.split) === 1
-        && mockXui.clients.has(dupEmail) === false && mockXui.clients.has(hostEmail) === true
-        && (mergedClient.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,903'
-        && String(dupRowAfter?.email || '') === hostEmail && String(dupRowAfter?.sub_id || '') === splitToken
-        && String(dupRowAfter?.xui_sub_id || '') === splitToken,
-        `status=${mergeRun.status} merged=${mergeRun.json?.data?.merged} dup=${mockXui.clients.has(dupEmail)} attached=${(mergedClient.inboundIds || []).join(',')} row=${dupRowAfter?.email}/${dupRowAfter?.sub_id}`);
+        && mockXui.clients.has(fixedEmail) === false && mockXui.clients.has(ownEmail) === true
+        && (mergedClient.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,903,904'
+        && String(fixedRowAfter?.email || '') === ownEmail && String(fixedRowAfter?.sub_id || '') === splitToken
+        && String(fixedRowAfter?.xui_sub_id || '') === `private-${ownEmail}`,
+        `status=${mergeRun.status} merged=${mergeRun.json?.data?.merged} fixed=${mockXui.clients.has(fixedEmail)} attached=${(mergedClient.inboundIds || []).join(',')} row=${fixedRowAfter?.email}/${fixedRowAfter?.sub_id}`);
       check('the merge leaves the surviving client’s pool, expiry and identity alone',
-        Number(mergedClient.totalGB) === Number(hostClientBefore.totalGB)
-        && Number(mergedClient.expiryTime) === Number(hostClientBefore.expiryTime)
-        && String(mergedClient.subId) === splitToken
+        Number(mergedClient.totalGB) === Number(ownClientBefore.totalGB)
+        && Number(mergedClient.expiryTime) === Number(ownClientBefore.expiryTime)
+        && String(mergedClient.subId) === `private-${ownEmail}`
         && (mergeRun.json?.data?.errors || []).length === 0,
         `total=${mergedClient.totalGB} expiry=${mergedClient.expiryTime} subId=${mergedClient.subId} errors=${JSON.stringify(mergeRun.json?.data?.errors || [])}`);
-      const mergedLinks = await request('GET', `/api/admin/configs/${hostRow}/links`, { cookies });
+      const mergedLinks = await request('GET', `/api/admin/configs/${ownRow}/links`, { cookies });
       const mergedSubs = mergedLinks.json?.data?.subscriptions || {};
       check('after the merge the customer’s link is the node address again',
         Number(mergedSubs.clientCount) === 1 && mergedSubs.source === 'node'
-        && Number(mergedSubs.node?.[0]?.inboundCount) === 2 && mergedSubs.aggregated === ''
-        && String(mergedLinks.json?.data?.subUrl || '') === `https://sub.example.com/sub/${splitToken}`,
+        && Number(mergedSubs.node?.[0]?.inboundCount) === 3 && mergedSubs.aggregated === ''
+        && String(mergedLinks.json?.data?.subUrl || '') === `https://sub.example.com/sub/private-${ownEmail}`,
         `subUrl=${mergedLinks.json?.data?.subUrl} clients=${mergedSubs.clientCount} inbounds=${mergedSubs.node?.[0]?.inboundCount}`);
+
+      // The live defect this guards: x-ui 3.8.5 ignores a channel listed in the
+      // update endpoint's ?inboundIds= when the client is not in it yet, so the
+      // merge "succeeded" while the customer lost that channel. The channel has to
+      // move through bulkAttach, and the update call must not pretend to attach.
+      const movedByAttach = mockXui.calls.filter((c) => c.route === '/clients/bulkAttach'
+        && (c.body.emails || []).map(String).includes(String(ownEmail))
+        && (c.body.inboundIds || []).map(Number).includes(901));
+      const updatePretendingToAttach = mockXui.calls.filter((c) => c.route.startsWith('/clients/update/')
+        && String(c.route).endsWith(String(ownEmail)) && c.query.inboundIds);
+      check('a channel the client is not in yet moves through bulkAttach, not the update query',
+        movedByAttach.length >= 1 && updatePretendingToAttach.length === 0,
+        `bulkAttach=${movedByAttach.length} update-with-list=${updatePretendingToAttach.length}`);
 
       // Two adopted clients under one token are two different customers' live
       // subscriptions: merging would delete one of them, so the pass only reports.
-      const extRowA = addSplitRow({ email: extEmailA, inboundId: 901, token: extToken, xuiSubId: `${extEmailA}-sub`, origin: 'external' });
+      // Neither of them holds the fixed inbound, so the rule of the owner's fixed
+      // client cannot decide between them either.
+      const extRowA = addSplitRow({ email: extEmailA, inboundId: 903, token: extToken, xuiSubId: `${extEmailA}-sub`, origin: 'external' });
       addSplitRow({ email: extEmailB, inboundId: 902, token: extToken, xuiSubId: `${extEmailB}-sub`, origin: 'external' });
-      addSplitClient(extEmailA, `${extEmailA}-sub`, [901]);
+      addSplitClient(extEmailA, `${extEmailA}-sub`, [903]);
       addSplitClient(extEmailB, `${extEmailB}-sub`, [902]);
       const extDry = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
         cookies, csrf, body: { dryRun: true },
@@ -1790,6 +1931,24 @@ function startMockXui(inboundRows) {
         && String(splitDb.prepare('SELECT email FROM configs WHERE id = ?').get(extRowA).email) === extEmailA,
         `merged=${extRun.json?.data?.merged} skipped=${extRun.json?.data?.skipped} clients=${mockXui.clients.has(extEmailA)}/${mockXui.clients.has(extEmailB)}`);
 
+      // A package the pass must NOT touch still has to show the customer his own
+      // node link — the adopted client leads, because that is the client the seller's
+      // panel serves him under.
+      const extLinks = await request('GET', `/api/admin/configs/${extRowA}/links`, { cookies });
+      const extSubs = extLinks.json?.data?.subscriptions || {};
+      check('two adopted clients under one token: the customer is given his own client’s node link',
+        Number(extSubs.clientCount) === 2 && extSubs.source === 'node' && extSubs.partial === true
+        && String(extLinks.json?.data?.subUrl || '') === `https://sub.example.com/sub/${extEmailA}-sub`
+        && String(extSubs.aggregated || '') === `http://127.0.0.1/api/sub/${extToken}`
+        && Number((extSubs.node || []).length) === 2,
+        `subUrl=${extLinks.json?.data?.subUrl} source=${extSubs.source} node=${JSON.stringify((extSubs.node || []).map((n) => n.url))}`);
+      const extFeed = await request('GET', `/api/sub/${extToken}`);
+      const extFeedLinks = Buffer.from(String(extFeed?.raw || ''), 'base64').toString('utf8').split('\n').filter(Boolean);
+      check('and the panel’s combined address keeps working for customers who already have it',
+        extFeed.status === 200 && extFeedLinks.length === 2
+        && extFeedLinks.every((link) => link.startsWith('vless://')),
+        `status=${extFeed.status} links=${extFeedLinks.length}`);
+
       // Nothing left to do: a second pass over the same reseller is a no-op.
       const mergeAgain = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
         cookies, csrf, body: { dryRun: false },
@@ -1799,10 +1958,255 @@ function startMockXui(inboundRows) {
         && Number(mergeAgain.json?.data?.merged) === 0 && Number(mergeAgain.json?.data?.skipped) === 1
         && Number(mergeAgain.json?.data?.single) === 1,
         `split=${mergeAgain.json?.data?.split} merged=${mergeAgain.json?.data?.merged} skipped=${mergeAgain.json?.data?.skipped}`);
+
+      // What the double must actually behave like, and what the panel must do when
+      // the node refuses to take the channel: the duplicate client stays, because
+      // deleting it is what would leave the customer with one channel fewer.
+      const probeEmail = `merge-probe-${crypto.randomBytes(6).toString('hex')}`;
+      addSplitClient(probeEmail, `probe-${probeEmail}-sub`, [901]);
+      const rawUpdate = await fetch(`http://127.0.0.1:${mockXui.port}/panel/api`
+        + `/clients/update/${encodeURIComponent(probeEmail)}?inboundIds=901,902`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: probeEmail, subId: `probe-${probeEmail}-sub` }),
+      }).then((r) => r.json()).catch(() => null);
+      check('the x-ui double behaves like 3.8.5: an update cannot attach a new channel',
+        rawUpdate && rawUpdate.success === true
+        && (mockXui.clients.get(probeEmail)?.inboundIds || []).map(Number).join(',') === '901',
+        `attached=${(mockXui.clients.get(probeEmail)?.inboundIds || []).join(',')}`);
+      mockXui.clients.delete(probeEmail);
+
+      // What the fixed-inbound client must behave like, and what the panel must do
+      // when the node refuses to take the channel: the copy that was going to go
+      // stays, because deleting it is what would leave the customer with one
+      // channel fewer. The refusal is put on the client that survives.
+      const noSafeFixedRow = addSplitRow({ email: noSafeFixed, inboundId: 901, token: noSafeToken, xuiSubId: `private-${noSafeFixed}`, origin: 'panel' });
+      const noSafeOwnRow = addSplitRow({ email: noSafeOwn, inboundId: 902, token: noSafeToken, xuiSubId: `private-${noSafeOwn}`, origin: 'panel' });
+      addSplitClient(noSafeFixed, `private-${noSafeFixed}`, [901]);
+      addSplitClient(noSafeOwn, `private-${noSafeOwn}`, [902]);
+      mockXui.refuseAttach.add(noSafeOwn);
+      const refusedRun = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      const refusedInfo = (refusedRun.json?.data?.details || []).find((item) => item.email === noSafeOwn) || {};
+      check('when x-ui refuses the attach the fixed-inbound client is NOT deleted',
+        Number(refusedRun.json?.data?.merged) === 0
+        && mockXui.clients.has(noSafeFixed) === true && mockXui.clients.has(noSafeOwn) === true
+        && (mockXui.clients.get(noSafeFixed)?.inboundIds || []).map(Number).join(',') === '901'
+        && String(splitDb.prepare('SELECT email FROM configs WHERE id = ?').get(noSafeFixedRow).email) === noSafeFixed,
+        `merged=${refusedRun.json?.data?.merged} fixed=${mockXui.clients.has(noSafeFixed)} row=${splitDb.prepare('SELECT email FROM configs WHERE id = ?').get(noSafeFixedRow)?.email} info=${JSON.stringify(refusedInfo)}`);
+      const refusedErrs = refusedRun.json?.data?.errors || [];
+      check('a refused attach is reported as an error instead of a silent success',
+        refusedErrs.length >= 1 && refusedErrs.some((message) => /attach/i.test(String(message))),
+        `errors=${JSON.stringify(refusedErrs)}`);
+      mockXui.refuseAttach.delete(noSafeOwn);
+      // Now that the node accepts it, the same package merges and the copy is gone.
+      const fixedRun = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      const fixedClient = mockXui.clients.get(noSafeOwn) || {};
+      check('once the attach works the same package merges and loses its fixed-inbound copy',
+        Number(fixedRun.json?.data?.merged) === 1 && mockXui.clients.has(noSafeFixed) === false
+        && (fixedClient.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,902'
+        && String(fixedClient.subId) === `private-${noSafeOwn}`,
+        `merged=${fixedRun.json?.data?.merged} fixed=${mockXui.clients.has(noSafeFixed)} attached=${(fixedClient.inboundIds || []).join(',')}`);
+      const noSafeLinks = await request('GET', `/api/admin/configs/${noSafeFixedRow}/links`, { cookies });
+      check('and the customer of that package is handed the node address',
+        noSafeLinks.json?.data?.subscriptions?.source === 'node'
+        && String(noSafeLinks.json?.data?.subUrl || '').startsWith('https://sub.example.com/sub/'),
+        `source=${noSafeLinks.json?.data?.subscriptions?.source} subUrl=${noSafeLinks.json?.data?.subUrl}`);
+
+      // A node that does not take the whole channel list on clients/add must be
+      // caught by the re-read the panel does right after it: the leftovers go in
+      // through bulkAttach and the customer still gets ONE client. Writing a row
+      // per channel — or a client per channel — is the defect the owner reported
+      // on the live panel, so the count of clients is part of the assertion.
+      await request('POST', `/api/admin/users/${fixedShopId}/balance`, {
+        cookies, csrf, body: { amount: 90000, description: 'شارژ تست نود لجوج' },
+      });
+      const stubbornCallsBefore = mockXui.calls.length;
+      const clientsBeforeStubborn = mockXui.clients.size;
+      mockXui.quirks.addKeepsOnlyFirst = true;
+      const stubbornBuy = await request('POST', '/api/reseller/configs', {
+        cookies: fixedCookies, csrf: fixedCsrf,
+        body: { inboundIds: [903], gb: 4, days: 15, customerName: 'مشتری نود لجوج' },
+      });
+      mockXui.quirks.addKeepsOnlyFirst = false;
+      const stubbornConfigs = stubbornBuy.json?.data?.configs || [];
+      stubbornEmail = String(stubbornConfigs[0]?.email || '');
+      const stubbornClient = mockXui.clients.get(stubbornEmail) || {};
+      const stubbornCalls = mockXui.calls.slice(stubbornCallsBefore);
+      for (const item of stubbornConfigs) splitRowIds.push(Number(item.id));
+      check('a node that took only the first channel on add is repaired through bulkAttach',
+        stubbornBuy.status === 201 && stubbornConfigs.length === 2
+        && (stubbornClient.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,903'
+        && stubbornCalls.filter((call) => call.route === '/clients/add').length === 1
+        && stubbornCalls.some((call) => call.route === '/clients/bulkAttach'),
+        `status=${stubbornBuy.status} rows=${stubbornConfigs.length} attached=${(stubbornClient.inboundIds || []).join(',')} add=${stubbornCalls.filter((call) => call.route === '/clients/add').length} bulk=${stubbornCalls.filter((call) => call.route === '/clients/bulkAttach').length} err=${stubbornBuy.json?.error?.message || ''}`);
+      check('and even a stubborn node ends with ONE client for the package',
+        new Set(stubbornConfigs.map((item) => item.email)).size === 1
+        && mockXui.clients.size === clientsBeforeStubborn + 1,
+        `emails=${new Set(stubbornConfigs.map((item) => item.email)).size} addedClients=${mockXui.clients.size - clientsBeforeStubborn}`);
     } finally {
       for (const id of splitRowIds) splitDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
-      for (const email of [hostEmail, dupEmail, extEmailA, extEmailB]) mockXui.clients.delete(email);
+      for (const email of [ownEmail, fixedEmail, extEmailA, extEmailB, noSafeOwn, noSafeFixed, stubbornEmail]) {
+        if (email) mockXui.clients.delete(email);
+      }
       splitDb.close();
+    }
+
+    // ------------------------------------------- v1.4.21: the owner's tie-break
+    // The rule the owner stated: a customer holds ONE subscription per x-ui panel
+    // and every channel of his sits on it. The client this panel minted for the
+    // reseller's fixed inbound carries that single channel and nothing else — it
+    // is a copy of the customer's own subscription, not a second account of his,
+    // so it is the one that goes. With one row on each side the old order (the
+    // older client wins) kept exactly the wrong one and deleted the customer's
+    // live link — the live defect the owner showed with his own customer.
+    const tieToken = `tie${crypto.randomBytes(8).toString('hex')}`;
+    const tieOwnEmail = `tie-own-${crypto.randomBytes(6).toString('hex')}`;
+    const tieFixedEmail = `tie-fixed-${crypto.randomBytes(6).toString('hex')}`;
+    const tieDb = new Database(path.join(DATA_DIR, 'panel.db'));
+    const tieRowIds = [];
+    const addTieRow = ({ email, inboundId, token, xuiSubId, origin, uuid }) => {
+      const info = tieDb.prepare(`INSERT INTO configs
+        (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, uuid, label, customer_name,
+         total_bytes, expiry_at, enabled, status, origin, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'بسته تساوی', 'مشتری تساوی', ?, ?, 1, 'active', ?, ?, ?)`)
+        .run(fixedShopId, primaryId, inboundId, email, token, xuiSubId, uuid || crypto.randomUUID(),
+          10 * MERGE_GB, Date.now() + 30 * 86400000, origin, Date.now(), Date.now());
+      const id = Number(info.lastInsertRowid);
+      tieRowIds.push(id);
+      return id;
+    };
+    try {
+      // The fixed-inbound client is written FIRST, so it also carries the older
+      // row id — the exact shape of the live defect: one row on each side.
+      const tieFixedRow = addTieRow({ email: tieFixedEmail, inboundId: 901, token: tieToken, xuiSubId: `private-${tieFixedEmail}`, origin: 'panel' });
+      addTieRow({ email: tieOwnEmail, inboundId: 902, token: tieToken, xuiSubId: tieToken, origin: 'panel' });
+      const tieClient = (email, subId, inboundIds) => ({
+        email, id: crypto.randomUUID(), subId, security: 'auto',
+        totalGB: 10 * MERGE_GB, expiryTime: Date.now() + 30 * 86400000, enable: true,
+        up: 0, down: 0, inboundIds,
+      });
+      mockXui.clients.set(tieFixedEmail, tieClient(tieFixedEmail, `private-${tieFixedEmail}`, [901]));
+      mockXui.clients.set(tieOwnEmail, tieClient(tieOwnEmail, tieToken, [902]));
+
+      const tieRun = await request('POST', `/api/admin/users/${fixedShopId}/consolidate`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      const tieOwnClient = mockXui.clients.get(tieOwnEmail) || {};
+      const tieFixedRowAfter = tieDb.prepare('SELECT * FROM configs WHERE id = ?').get(tieFixedRow);
+      check('the client that holds only the fixed inbound is the one that goes',
+        Number(tieRun.json?.data?.merged) === 1
+        && mockXui.clients.has(tieFixedEmail) === false
+        && mockXui.clients.has(tieOwnEmail) === true
+        && (tieOwnClient.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,902'
+        && String(tieFixedRowAfter?.email || '') === tieOwnEmail
+        && String(tieFixedRowAfter?.sub_id || '') === tieToken,
+        `merged=${tieRun.json?.data?.merged} fixed=${mockXui.clients.has(tieFixedEmail)} own=${mockXui.clients.has(tieOwnEmail)} attached=${(tieOwnClient.inboundIds || []).join(',')} row=${tieFixedRowAfter?.email}/${tieFixedRowAfter?.sub_id}`);
+      const tieLinks = await request('GET', `/api/admin/configs/${tieFixedRow}/links`, { cookies });
+      check('and the customer of that package keeps one node link that carries every channel',
+        Number(tieLinks.json?.data?.subscriptions?.clientCount) === 1
+        && Number(tieLinks.json?.data?.subscriptions?.node?.[0]?.inboundCount) === 2
+        && String(tieLinks.json?.data?.subUrl || '') === `https://sub.example.com/sub/${tieToken}`,
+        `clients=${tieLinks.json?.data?.subscriptions?.clientCount} inbounds=${tieLinks.json?.data?.subscriptions?.node?.[0]?.inboundCount} subUrl=${tieLinks.json?.data?.subUrl}`);
+    } finally {
+      for (const id of tieRowIds) tieDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      mockXui.clients.delete(tieFixedEmail);
+      mockXui.clients.delete(tieOwnEmail);
+      tieDb.close();
+    }
+
+    // ------------------------------------- v1.4.21: bringing a deleted client back
+    // A customer whose x-ui client was deleted on the node panel has nothing left:
+    // every link errors out and the package cannot even take a new channel. The
+    // panel builds ONE client back — the same email, UUID and subscription id,
+    // with EVERY channel of the package on it, the reseller's fixed inbound
+    // included — so the customer's old link works again.
+    const goneToken = `gone${crypto.randomBytes(8).toString('hex')}`;
+    const goneEmail = `gone-client-${crypto.randomBytes(6).toString('hex')}`;
+    const goneUuid = crypto.randomUUID();
+    const bulkEmail = `bulk-client-${crypto.randomBytes(6).toString('hex')}`;
+    const offEmail = `off-client-${crypto.randomBytes(6).toString('hex')}`;
+    const goneDb = new Database(path.join(DATA_DIR, 'panel.db'));
+    const goneRowIds = [];
+    const addGoneRow = ({ email, inboundId, token, uuid, enabled }) => {
+      const info = goneDb.prepare(`INSERT INTO configs
+        (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, uuid, label, customer_name,
+         total_bytes, expiry_at, enabled, status, origin, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'بسته بی‌کلاینت', 'مشتری بی‌کلاینت', ?, ?, ?, 'active', 'panel', ?, ?)`)
+        .run(fixedShopId, primaryId, inboundId, email, token, token, uuid,
+          10 * MERGE_GB, Date.now() + 30 * 86400000, enabled === false ? 0 : 1, Date.now(), Date.now());
+      const id = Number(info.lastInsertRowid);
+      goneRowIds.push(id);
+      return id;
+    };
+    try {
+      // A package of two channels whose client was deleted on the node: the
+      // fixed inbound (901) is one of them, so the rebuild has to carry it.
+      const goneRow = addGoneRow({ email: goneEmail, inboundId: 902, token: goneToken, uuid: goneUuid });
+      addGoneRow({ email: goneEmail, inboundId: 901, token: goneToken, uuid: goneUuid });
+      const goneDetail = await request('GET', `/api/admin/configs/${goneRow}`, { cookies });
+      check('a customer whose client is gone from the node is reported as such',
+        goneDetail.status === 200 && goneDetail.json?.data?.client === null,
+        `status=${goneDetail.status} client=${JSON.stringify(goneDetail.json?.data?.client)}`);
+
+      const goneDry = await request('POST', `/api/admin/users/${fixedShopId}/recreate-missing`, {
+        cookies, csrf, body: { dryRun: true },
+      });
+      check('the dry run lists the packages without a client and writes nothing',
+        goneDry.status === 200 && Number(goneDry.json?.data?.missing) === 1
+        && mockXui.clients.has(goneEmail) === false
+        && (goneDry.json?.data?.details || []).some((item) => item.email === goneEmail),
+        `status=${goneDry.status} missing=${goneDry.json?.data?.missing} details=${JSON.stringify(goneDry.json?.data?.details || [])}`);
+
+      const goneRun = await request('POST', `/api/admin/configs/${goneRow}/recreate`, { cookies, csrf });
+      const goneClient = mockXui.clients.get(goneEmail) || {};
+      check('one client is built back with the same identity and every channel of the package',
+        goneRun.status === 200 && mockXui.clients.has(goneEmail) === true
+        && (goneClient.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,902'
+        && String(goneClient.subId) === goneToken
+        && String(goneRun.json?.data?.email || '') === goneEmail,
+        `status=${goneRun.status} attached=${(goneClient.inboundIds || []).join(',')} subId=${goneClient.subId}`);
+      const goneRowAfter = goneDb.prepare('SELECT * FROM configs WHERE id = ?').get(goneRow);
+      check('the panel rows point at that one client again',
+        String(goneRowAfter?.email || '') === goneEmail
+        && String(goneRowAfter?.sub_id || '') === goneToken
+        && String(goneRowAfter?.uuid || '') === goneUuid,
+        `email=${goneRowAfter?.email} token=${goneRowAfter?.sub_id} uuid=${goneRowAfter?.uuid}`);
+      const goneLinks = await request('GET', `/api/admin/configs/${goneRow}/links`, { cookies });
+      check('the customer is handed his node link again',
+        goneLinks.json?.data?.subscriptions?.source === 'node'
+        && String(goneLinks.json?.data?.subUrl || '') === `https://sub.example.com/sub/${goneToken}`
+        && Number(goneLinks.json?.data?.subscriptions?.node?.[0]?.inboundCount) === 2,
+        `source=${goneLinks.json?.data?.subscriptions?.source} subUrl=${goneLinks.json?.data?.subUrl}`);
+
+      // A client that is still on the node must never be rebuilt over: it would
+      // take over his traffic and his channels.
+      const goneTwice = await request('POST', `/api/admin/configs/${goneRow}/recreate`, { cookies, csrf });
+      check('a second rebuild is refused while the client is on the node',
+        goneTwice.status === 409 && goneTwice.json?.error?.code === 'xui_client_exists'
+        && (mockXui.clients.get(goneEmail)?.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,902',
+        `status=${goneTwice.status} code=${goneTwice.json?.error?.code}`);
+
+      // The bulk pass: one package is restored, a package the reseller switched
+      // off is left alone for the operator to decide.
+      addGoneRow({ email: bulkEmail, inboundId: 903, token: `bulk${crypto.randomBytes(8).toString('hex')}`, uuid: crypto.randomUUID() });
+      addGoneRow({ email: offEmail, inboundId: 904, token: `off${crypto.randomBytes(8).toString('hex')}`, uuid: crypto.randomUUID(), enabled: false });
+      const bulkRun = await request('POST', `/api/admin/users/${fixedShopId}/recreate-missing`, {
+        cookies, csrf, body: { dryRun: false },
+      });
+      check('the bulk pass restores the missing packages and leaves the switched-off one alone',
+        bulkRun.status === 200 && Number(bulkRun.json?.data?.restored) === 1
+        && Number(bulkRun.json?.data?.skipped) === 1
+        && mockXui.clients.has(bulkEmail) === true
+        && mockXui.clients.has(offEmail) === false,
+        `restored=${bulkRun.json?.data?.restored} skipped=${bulkRun.json?.data?.skipped} bulk=${mockXui.clients.has(bulkEmail)} off=${mockXui.clients.has(offEmail)}`);
+    } finally {
+      for (const id of goneRowIds) goneDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      for (const email of [goneEmail, bulkEmail, offEmail]) mockXui.clients.delete(email);
+      goneDb.close();
     }
 
     const v1Bad = await request('GET', '/api/v1/me', { headers: { 'x-api-key': 'sc_invalid' } });
