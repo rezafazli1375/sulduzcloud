@@ -186,6 +186,18 @@ router.post('/configs/:id/extend', asyncH(async (req, res) => {
   res.json({ ok: true, data: { config } });
 }));
 
+// The renewal dialog shows the price before the reseller applies it. It answers
+// whether or not wallet billing is switched on — the reseller is entitled to know
+// the amount of a renewal he is about to confirm.
+router.post('/configs/:id/extend/quote', (req, res) => {
+  const data = configsService.quoteRenewalPrice(
+    num(req.params.id),
+    { gb: num(req.body?.gb), days: num(req.body?.days) },
+    req.user
+  );
+  res.json({ ok: true, data });
+});
+
 router.post('/configs/:id/toggle', asyncH(async (req, res) => {
   const config = await configsService.toggleConfig(num(req.params.id), Boolean(req.body?.enabled), req, req.user);
   res.json({ ok: true, data: { config } });

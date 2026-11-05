@@ -421,6 +421,17 @@ router.post('/configs/:id/extend', auth.requirePerm('configs'), asyncH(async (re
   res.json({ ok: true, data: { config } });
 }));
 
+// Same read-only renewal price the reseller drawer gets, so an admin renewing on
+// behalf of a reseller sees the amount the panel will charge before confirming.
+router.post('/configs/:id/extend/quote', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const data = configsService.quoteRenewalPrice(
+    num(req.params.id),
+    { gb: num(req.body?.gb), days: num(req.body?.days) },
+    { role: 'admin' }
+  );
+  res.json({ ok: true, data });
+}));
+
 router.post('/configs/:id/quota', auth.requirePerm('configs'), asyncH(async (req, res) => {
   const config = await configsService.setQuota(num(req.params.id), req.body || {}, req, { role: 'admin' });
   res.json({ ok: true, data: { config } });

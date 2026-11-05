@@ -108,6 +108,10 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const [sheet, setSheet] = useState(null); // extend | quota | edit | identity | addInbound
   const [qr, setQr] = useState(null);
   const [extendForm, setExtendForm] = useState({ gb: 10, days: 30, resetUsage: false });
+  // Bumped every time the renew dialog opens, so its price request is a fresh key
+  // and must go to the server — a wallet or tariff that changed in the meantime
+  // cannot be hidden behind a cached preview.
+  const [extendQuoteKey, setExtendQuoteKey] = useState(0);
   const [quotaForm, setQuotaForm] = useState({ gb: 0, days: 0, enabled: true });
   const [editForm, setEditForm] = useState({ label: '', customerName: '', customerPhone: '', note: '' });
   const [identityForm, setIdentityForm] = useState({ uuid: '', subId: '' });
@@ -149,32 +153,37 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   });
 
   const billingOn = Boolean(meta?.billing?.enabled);
-  const groupInboundIds = group.length
-    ? group.map((item) => item.inboundId)
-    : config
-      ? [config.inboundId]
-      : [];
+  const extendAmountGb = Number(extendForm.gb || 0);
+  const extendDays = Number(extendForm.days || 0);
+  // Since v1.4.23 the renewal drawer prices the renewal itself. It asks the panel
+  // for the amount of THIS package — the very code path extendConfig charges — and
+  // shows it whether or not wallet billing is switched on, so the reseller confirms
+  // a price he has actually seen instead of an invisible deduction. The package is
+  // resolved server-side, so the preview cannot be steered by the client.
   const extendQuote = useQuery({
-    queryKey: [
-      'extend-quote',
-      isAdmin ? 'admin' : 'reseller',
-      isAdmin ? String(config?.userId || '') : 'self',
-      [...groupInboundIds].sort((a, b) => a - b).join(','),
-      Number(extendForm.gb || 0),
-      Number(extendForm.days || 0),
-    ],
-    queryFn: () => api.post(isAdmin ? '/admin/pricing/quote' : '/reseller/configs/quote', {
-      userId: isAdmin ? Number(config?.userId) : undefined,
-      inboundIds: groupInboundIds,
-      gb: Number(extendForm.gb || 0),
-      days: Number(extendForm.days || 0),
+    queryKey: ['extend-quote', configId, extendAmountGb, extendDays, extendQuoteKey],
+    queryFn: () => api.post(`${base}/${configId}/extend/quote`, {
+      gb: extendAmountGb,
+      days: extendDays,
     }),
-    enabled: open && sheet === 'extend' && billingOn && groupInboundIds.length > 0,
-    staleTime: 15000,
+    enabled: open && sheet === 'extend' && Boolean(configId) && (extendAmountGb > 0 || extendDays > 0),
+    staleTime: 0,
+    refetchOnMount: 'always',
     retry: false,
   });
-  const extendBasis = (extendQuote.data?.items || []).find((item) => item.basis);
-  const extendInsufficient = billingOn && extendQuote.data?.sufficient === false;
+  const extendPrice = extendQuote.data || null;
+  const extendBasis = extendPrice?.basis || null;
+  const extendTotal = Number(extendPrice?.total || 0);
+  const extendBalance = Number(extendPrice?.balance || 0);
+  const extendInsufficient = billingOn && extendPrice?.sufficient === false;
+
+  // Opens the renew dialog on a clean slate AND on a brand-new preview key, so the
+  // amount it shows was priced against the wallet and tariff of this very moment.
+  const openExtendDialog = () => {
+    setExtendForm({ gb: 10, days: 30, resetUsage: false });
+    setExtendQuoteKey((n) => n + 1);
+    setSheet('extend');
+  };
 
   useEffect(() => {
     if (!config) return;
@@ -368,7 +377,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                 <Button variant="secondary" size="sm" icon={Power} onClick={() => toggle.mutate(!config.enabled)} loading={toggle.isPending}>
                   {config.enabled ? t('configs.actions.disable') : t('configs.actions.enable')}
                 </Button>
-                <Button size="sm" icon={Zap} onClick={() => { setExtendForm({ gb: 10, days: 30, resetUsage: false }); setSheet('extend'); }}>
+                <Button size="sm" icon={Zap} onClick={openExtendDialog}>
                   {t('configs.actions.extend')}
                 </Button>
               </div>
@@ -676,21 +685,46 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
             <span>{t('configs.extend.groupNote')} ({formatNumber(group.length, lang)})</span>
           </p>
         ) : null}
-        {billingOn ? (
-          <div className="mt-3 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.06] px-3 py-2.5">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[10.5px] text-emerald-200/80">{t('configs.extend.price')}</span>
-              <span className="text-[13px] font-bold text-emerald-300">{formatMoney(extendQuote.data?.total ?? 0, lang, currency)}</span>
-            </div>
-            {extendBasis ? (
-              <p className="mt-1 text-[9.5px] text-slate-500">
-                {t('configs.extend.basis')}: {extendBasis.remark || `#${extendBasis.inboundId}`} · {formatMoney(extendBasis.total, lang, currency)}
-              </p>
-            ) : null}
-            <p className="mt-1 text-[9.5px] text-slate-500">{t('configs.extend.priceHint')}</p>
-            {extendInsufficient ? <p className="mt-1.5 text-[10px] text-rose-300">{t('errors.insufficientBalance')}</p> : null}
+        <div className="mt-3 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.06] px-3 py-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10.5px] text-emerald-200/80">{t('configs.extend.price')}</span>
+            <span className="text-[13px] font-bold text-emerald-300">
+              {extendPrice
+                ? formatMoney(extendTotal, lang, currency)
+                : (extendAmountGb > 0 || extendDays > 0
+                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  : t('configs.extend.enterAmount'))}
+            </span>
           </div>
-        ) : null}
+          {extendBasis ? (
+            <p className="mt-1 text-[9.5px] text-slate-500">
+              {t('configs.extend.basis')}: {extendBasis.remark || `#${extendBasis.inboundId}`} · {formatMoney(extendBasis.total, lang, currency)}
+              {Number(extendBasis.discountPercent || 0) > 0 ? (
+                <span className="text-emerald-300/90">
+                  {' '}— {t('configs.extend.discount')} {formatNumber(extendBasis.discountPercent, lang, 0)}٪
+                  {' '}(−{formatMoney(Math.max(0, Number(extendBasis.base || 0) - extendBasis.total), lang, currency)})
+                </span>
+              ) : null}
+            </p>
+          ) : null}
+          {billingOn ? (
+            <p className="mt-1 flex items-center justify-between gap-2 text-[9.5px] text-slate-500">
+              <span>{t('configs.extend.balanceAfter')}</span>
+              <span className={cx('font-semibold', extendInsufficient ? 'text-rose-300' : 'text-slate-300')}>
+                {formatMoney(extendBalance - extendTotal, lang, currency)}
+              </span>
+            </p>
+          ) : null}
+          <p className="mt-1 text-[9.5px] text-slate-500">
+            {extendInsufficient
+              ? t('errors.insufficientBalance')
+              : (!billingOn
+                ? t('configs.form.billingOff')
+                : (extendTotal === 0 && (extendAmountGb > 0 || extendDays > 0)
+                  ? t('configs.extend.zeroTariff')
+                  : t('configs.extend.priceHint')))}
+          </p>
+        </div>
       </Modal>
 
       <Modal

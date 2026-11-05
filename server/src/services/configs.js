@@ -931,6 +931,56 @@ async function applyToXui(row, patch) {
   return updated;
 }
 
+/**
+ * What a renewal of this package costs, computed exactly the way extendConfig
+ * charges it: ONE charge for the whole package, at the highest tariff among the
+ * rows the package actually holds (never the sum of tariffs, and never a channel
+ * the package does not have).
+ *
+ * This lives in one place because the drawer now shows the reseller the amount
+ * BEFORE he confirms. A preview that re-implements the rule would be a number he
+ * is never charged, so both paths share this helper — including the reseller's
+ * per-inbound discount, which pricing.priceFor already applies.
+ */
+function packageRenewalPrice(row, { gb = 0, days = 0, price = 0 } = {}) {
+  const targets = packageRows(row);
+  const reseller = getResellerRow(row?.user_id);
+  const addDays = Math.max(0, Math.round(Number(days || 0)));
+  // An explicit price (admin only) is the amount, full stop — same as extendConfig.
+  let amount = Math.round(Number(price || 0));
+  let basis = null;
+  if (!amount && reseller) {
+    for (const target of targets) {
+      const inbound = getInboundRow(target.inbound_id);
+      if (!inbound) continue;
+      const total = pricing.priceFor(inbound, gb, addDays, reseller.id);
+      if (total > amount) {
+        amount = total;
+        basis = {
+          inboundId: Number(inbound.id),
+          remark: inbound.remark || `#${inbound.id}`,
+          base: pricing.basePrice(inbound, gb, addDays),
+          discountPercent: pricing.discountPercent(reseller.id, inbound.id),
+          total,
+        };
+      }
+    }
+  }
+  const billing = pricing.billingInfo();
+  const balance = reseller ? Number(reseller.balance || 0) : 0;
+  return {
+    targets,
+    reseller,
+    gb: Number(gb || 0),
+    days: addDays,
+    amount,
+    basis,
+    billing,
+    // Nothing is taken when billing is off, and a free renewal can never be short.
+    sufficient: !billing.enabled || amount <= 0 || balance >= amount,
+  };
+}
+
 async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = false } = {}, req, viewer) {
   const { row } = configDetail(id, viewer);
   const addBytes = gbToBytes(Math.max(0, Number(gb || 0)));
@@ -940,16 +990,10 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
   // A customer with several inbounds is one package: renewing from any of its
   // configs applies to the whole group and is charged once, at the highest
   // inbound tariff of the group (not the sum of tariffs).
-  const targets = packageRows(row);
-  const reseller = getResellerRow(row.user_id);
-  let amount = Math.round(Number(price || 0));
-  if (!amount && reseller) {
-    for (const target of targets) {
-      const inbound = getInboundRow(target.inbound_id);
-      if (!inbound) continue;
-      amount = Math.max(amount, pricing.priceFor(inbound, gb, addDays, reseller.id));
-    }
-  }
+  const priced = packageRenewalPrice(row, { gb, days, price });
+  const targets = priced.targets;
+  const reseller = priced.reseller;
+  const amount = priced.amount;
   if (billingEnabled() && amount > 0 && reseller && Number(reseller.balance || 0) < amount) {
     throw new ApiError(402, 'insufficient_balance', 'موجودی کیف پول کافی نیست / Insufficient wallet balance');
   }
@@ -1055,6 +1099,28 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
     });
   }
   return packageView(getConfigRow(row.id));
+}
+
+/**
+ * Read-only renewal price for the drawer: the same numbers extendConfig will use,
+ * returned even while wallet billing is switched off, so the reseller can see the
+ * amount and confirm it instead of being charged blind. A client-supplied price is
+ * never accepted here — the preview always shows the panel's own tariff.
+ */
+function quoteRenewalPrice(id, { gb = 0, days = 0 } = {}, viewer) {
+  const { row } = configDetail(id, viewer);
+  const priced = packageRenewalPrice(row, { gb: Math.max(0, Number(gb || 0)), days });
+  return {
+    gb: priced.gb,
+    days: priced.days,
+    groupSize: priced.targets.length,
+    total: priced.amount,
+    basis: priced.basis,
+    billing: priced.billing,
+    currency: priced.billing.currency,
+    balance: priced.reseller ? Number(priced.reseller.balance || 0) : 0,
+    sufficient: priced.sufficient,
+  };
 }
 
 function db() {
@@ -2256,6 +2322,7 @@ module.exports = {
   recreatePackageClient,
   recreateMissingPackages,
   extendConfig,
+  quoteRenewalPrice,
   setQuota,
   toggleConfig,
   resetUsage,

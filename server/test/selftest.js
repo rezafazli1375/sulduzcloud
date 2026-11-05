@@ -1022,6 +1022,122 @@ function startMockXui(inboundRows) {
     const afterPoor = await request('GET', '/api/auth/me', { cookies: shopCookies });
     check('rejected renewal leaves the wallet untouched', Number(afterPoor.json?.data?.user?.balance) === 0, `balance=${afterPoor.json?.data?.user?.balance}`);
 
+    // ------------------------------------- v1.4.23: the renewal drawer shows a price
+    // The extend dialog now quotes the renewal itself, so the number it shows must
+    // be exactly what extendConfig charges: the package's own rows, one charge at
+    // its highest tariff, the reseller discount applied, and an answer even while
+    // wallet billing is switched off (that is the case the owner complained about).
+    const shopRenewQuote = await request('POST', `/api/reseller/configs/${bought.id}/extend/quote`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5, price: 1 },
+    });
+    const shopPrice = shopRenewQuote.json?.data || {};
+    check(
+      'renewal preview prices the tariff and ignores a client-supplied price',
+      shopRenewQuote.status === 200
+        && shopPrice.total === 150
+        && Number(shopPrice.basis?.inboundId) === 901
+        && Number(shopPrice.basis?.base) === 150
+        && shopPrice.groupSize === 1
+        && shopPrice.billing?.enabled === true
+        && shopPrice.sufficient === false,
+      `status=${shopRenewQuote.status} total=${shopPrice.total} basis=${shopPrice.basis?.inboundId} sufficient=${shopPrice.sufficient}`
+    );
+    const otherRenewQuote = await request('POST', `/api/reseller/configs/${bought.id}/extend/quote`, {
+      cookies: tgCookies, csrf: tgCsrf, body: { gb: 5, days: 5 },
+    });
+    const ghostRenewQuote = await request('POST', '/api/reseller/configs/999999/extend/quote', {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5 },
+    });
+    check(
+      'a renewal preview only answers for the reseller’s own package',
+      otherRenewQuote.status === 403 && ghostRenewQuote.status === 404,
+      `other=${otherRenewQuote.status} ghost=${ghostRenewQuote.status}`
+    );
+
+    const renewDiscount = await request('PUT', `/api/admin/users/${shopId}/discounts`, {
+      cookies, csrf, body: { discounts: [{ inboundId: 901, percent: 20 }] },
+    });
+    const discountedQuote = await request('POST', `/api/reseller/configs/${bought.id}/extend/quote`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5 },
+    });
+    const discounted = discountedQuote.json?.data || {};
+    check(
+      'renewal preview applies the reseller discount to the tariff',
+      renewDiscount.status === 200
+        && discountedQuote.status === 200
+        && discounted.total === 120
+        && Number(discounted.basis?.base) === 150
+        && Number(discounted.basis?.discountPercent) === 20,
+      `total=${discounted.total} base=${discounted.basis?.base} percent=${discounted.basis?.discountPercent}`
+    );
+
+    // Top up, renew, and prove the wallet lost exactly the amount that was shown.
+    const quoteTopup = await request('POST', `/api/admin/users/${shopId}/balance`, {
+      cookies, csrf, body: { amount: 1000, description: 'شارژ تست قیمت تمدید' },
+    });
+    const shownRenew = await request('POST', `/api/reseller/configs/${bought.id}/extend`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5 },
+    });
+    const afterShown = await request('GET', '/api/auth/me', { cookies: shopCookies });
+    check(
+      'the renewal charge equals the amount the dialog showed',
+      quoteTopup.status === 200
+        && shownRenew.status === 200
+        && Number(afterShown.json?.data?.user?.balance) === 880,
+      `status=${shownRenew.status} balance=${afterShown.json?.data?.user?.balance}`
+    );
+
+    // Billing off: the dialog must still show 120, say the wallet is not touched,
+    // and the renewal must go through without spending anything.
+    const billingOffSave = await request('PATCH', '/api/admin/settings/billing', {
+      cookies, csrf, body: { enabled: false, currency: 'تومان' },
+    });
+    const freeQuote = await request('POST', `/api/reseller/configs/${bought.id}/extend/quote`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5 },
+    });
+    const freePrice = freeQuote.json?.data || {};
+    const freeRenew = await request('POST', `/api/reseller/configs/${bought.id}/extend`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5 },
+    });
+    const afterFree = await request('GET', '/api/auth/me', { cookies: shopCookies });
+    check(
+      'with billing off the dialog still shows the price and charges nothing',
+      billingOffSave.status === 200
+        && freeQuote.status === 200
+        && freeRenew.status === 200
+        && freePrice.total === 120
+        && freePrice.billing?.enabled === false
+        && freePrice.sufficient === true
+        && Number(afterFree.json?.data?.user?.balance) === 880,
+      `status=${freeQuote.status} total=${freePrice.total} enabled=${freePrice.billing?.enabled} balance=${afterFree.json?.data?.user?.balance}`
+    );
+    const zeroDaysQuote = await request('POST', `/api/reseller/configs/${bought.id}/extend/quote`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 0, days: 0 },
+    });
+    check(
+      'a renewal preview with nothing entered still shows the inbound fixed price (discounted)',
+      zeroDaysQuote.status === 200 && Number(zeroDaysQuote.json?.data?.total) === 80,
+      `status=${zeroDaysQuote.status} total=${zeroDaysQuote.json?.data?.total}`
+    );
+
+    // Restore what the following sections assume: billing on, no discount, wallet 0.
+    const clearDiscount = await request('PUT', `/api/admin/users/${shopId}/discounts`, { cookies, csrf, body: { discounts: [] } });
+    const billingBackOn = await request('PATCH', '/api/admin/settings/billing', {
+      cookies, csrf, body: { enabled: true, currency: 'تومان' },
+    });
+    const drainAgain = await request('POST', `/api/admin/users/${shopId}/balance`, {
+      cookies, csrf, body: { amount: -880, description: 'تخلیه پس از تست قیمت تمدید' },
+    });
+    const restoredMe = await request('GET', '/api/auth/me', { cookies: shopCookies });
+    check(
+      'the renewal price checks leave billing and the wallet as they found them',
+      clearDiscount.status === 200
+        && billingBackOn.status === 200
+        && drainAgain.status === 200
+        && Number(restoredMe.json?.data?.user?.balance) === 0,
+      `balance=${restoredMe.json?.data?.user?.balance}`
+    );
+
     // ------------------------------------------- multi-inbound package (v1.4.0)
     // The mock rejects a subId shared by two clients exactly like x-ui 3.2.5+
     // does, so this order is the regression test for "subId already in use".
@@ -1050,6 +1166,25 @@ function startMockXui(inboundRows) {
       'the package keeps one customer-facing subscription token',
       Boolean(groupToken) && multiConfigs.every((config) => config.subId === groupToken),
       `tokens=${multiConfigs.map((config) => config.subId).join(',')}`
+    );
+    // The package rule the dialog has to honour: 901 = 150, 902 = 250 and 903 = 325
+    // for +5GB/+5d, and a renewal is ONE charge at the highest of them — not 725.
+    const groupQuote = await request('POST', `/api/reseller/configs/${multiConfigs[1]?.id}/extend/quote`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5 },
+    });
+    const groupPrice = groupQuote.json?.data || {};
+    const adminGroupQuote = await request('POST', `/api/admin/configs/${multiConfigs[0]?.id}/extend/quote`, {
+      cookies, csrf, body: { gb: 5, days: 5 },
+    });
+    check(
+      'a package renewal is quoted once at its highest inbound, from any member',
+      groupQuote.status === 200
+        && Number(groupPrice.total) === 325
+        && Number(groupPrice.basis?.inboundId) === 903
+        && groupPrice.groupSize === 3
+        && adminGroupQuote.status === 200
+        && Number(adminGroupQuote.json?.data?.total) === 325,
+      `reseller=${groupPrice.total} admin=${adminGroupQuote.json?.data?.total} basis=${groupPrice.basis?.inboundId}`
     );
     // v1.4.18: the whole order is ONE x-ui client attached to every inbound it
     // bought — the same shape a subscription adopted from another panel has. One

@@ -308,6 +308,10 @@ const fa = {
       price: 'مبلغ تمدید',
       priceHint: 'بر اساس گران‌ترین اینباند مشتری و فقط یک‌بار محاسبه می‌شود',
       basis: 'مبنای محاسبه',
+      discount: 'تخفیف نماینده',
+      balanceAfter: 'موجودی پس از تمدید',
+      enterAmount: 'حجم یا روز اضافه کنید',
+      zeroTariff: 'مبلغ صفر است؛ تعرفهٔ اینباند (قیمت ثابت / هر گیگ / هر روز) هنوز در پنل وارد نشده است.',
     },
     quota: {
       title: 'ویرایش سهمیه',
@@ -1202,6 +1206,10 @@ const en = {
       price: 'Renewal amount',
       priceHint: 'Based on the customer’s most expensive inbound and charged only once',
       basis: 'Price basis',
+      discount: 'Reseller discount',
+      balanceAfter: 'Balance after renewal',
+      enterAmount: 'Enter traffic or days',
+      zeroTariff: 'The amount is zero: this inbound’s tariff (fixed / per GB / per day) has not been filled in on the panel yet.',
     },
     quota: {
       title: 'Edit quota',
