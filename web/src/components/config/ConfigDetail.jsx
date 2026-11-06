@@ -22,6 +22,7 @@ import {
   Ticket,
   Trash2,
   UserRound,
+  UserRoundX,
   Wifi,
   WifiOff,
   Zap,
@@ -217,7 +218,10 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
 
   const extend = useMutation({
     mutationFn: (payload) => api.post(`${base}/${configId}/extend`, payload),
-    onSuccess: () => { toast.success(t('common.saved')); setSheet(null); refresh(); },
+    // v1.4.24: the renewal gets its own wording instead of the generic "saved", so
+    // the reseller sees the action that actually happened. The money and the new
+    // expiry are in the notification the panel writes for him.
+    onSuccess: () => { toast.success(t('configs.extend.done')); setSheet(null); refresh(); },
     onError,
   });
 
@@ -248,6 +252,23 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const remove = useMutation({
     mutationFn: () => api.del(`${base}/${configId}`),
     onSuccess: () => { toast.success(t('common.deleted')); onClose?.(); refresh(); },
+    onError,
+  });
+
+  // Panel v1.4.24: the whole customer goes — every channel of the package and his
+  // x-ui client, which is the one case the fixed-inbound lock allows. The server
+  // answers how much of it actually left the node, and the toast says exactly that
+  // instead of a generic "deleted".
+  const removePackage = useMutation({
+    mutationFn: () => api.del(`${base}/${configId}/package`),
+    onSuccess: (data) => {
+      const removed = Number(data?.xuiDeleted?.length || 0);
+      toast.success(removed > 0
+        ? t('configs.group.packageDeletedRemote', { n: formatNumber(Number(data?.rows || 0), lang) })
+        : t('configs.group.packageDeletedLocal', { n: formatNumber(Number(data?.rows || 0), lang) }));
+      onClose?.();
+      refresh();
+    },
     onError,
   });
 
@@ -322,6 +343,25 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     if (ok) remove.mutate();
   };
 
+  // v1.4.24: the action the fixed-inbound lock points at. It names how many
+  // channels go, and — when some of them were adopted from another panel — says
+  // plainly that those subscriptions stay live over there, because this panel
+  // never writes to another operator's x-ui.
+  const askDeletePackage = async () => {
+    const channels = group.length || 1;
+    const adopted = group.filter((item) => item?.origin === 'external').length;
+    const ok = await confirm({
+      title: t('configs.group.packageDeleteConfirm'),
+      body: `${t('configs.group.packageDeleteBody', { n: formatNumber(channels, lang) })}`
+        + (adopted
+          ? `\n${t('configs.group.packageDeleteAdopted', { n: formatNumber(adopted, lang) })}`
+          : `\n${t('configs.group.packageDeleteNode')}`),
+      danger: true,
+      confirmText: t('configs.group.deletePackage'),
+    });
+    if (ok) removePackage.mutate();
+  };
+
   const askReset = async () => {
     const body = group.length > 1
       ? `${t('common.irreversible')}\n${t('configs.group.resetNote', { n: formatNumber(group.length, lang) })}`
@@ -357,6 +397,13 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     return true;
   });
   const fixedInboundId = Number(config?.reseller?.fixedInbound || 0);
+  // The row this drawer was opened on IS the guaranteed base of a package that
+  // still holds other channels. The server refuses to take it off — 409
+  // fixed_inbound_locked, the owner's own rule — so since v1.4.24 the button shows
+  // that up front instead of looking live and failing after the click.
+  const fixedBaseLocked = fixedInboundId > 0
+    && Number(config?.inboundId) === fixedInboundId
+    && group.length > 1;
 
   return (
     <>
@@ -369,9 +416,39 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
         footer={
           config ? (
             <div className="flex w-full flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <Button variant="danger" size="sm" icon={Trash2} onClick={askDelete} loading={remove.isPending}>{t('common.delete')}</Button>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="danger"
+                  size="sm"
+                  icon={Trash2}
+                  onClick={askDelete}
+                  loading={remove.isPending}
+                  disabled={fixedBaseLocked || removePackage.isPending}
+                  title={fixedBaseLocked ? t('configs.group.fixedLocked') : undefined}
+                >
+                  {t('common.delete')}
+                </Button>
+                {group.length > 1 ? (
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    icon={UserRoundX}
+                    onClick={askDeletePackage}
+                    loading={removePackage.isPending}
+                    disabled={remove.isPending}
+                    title={t('configs.group.deletePackageHint')}
+                  >
+                    {t('configs.group.deletePackage')}
+                  </Button>
+                ) : null}
                 <Button variant="ghost" size="sm" icon={RotateCcw} onClick={askReset} loading={reset.isPending}>{t('configs.actions.reset')}</Button>
+                {/* A disabled button cannot show its tooltip, so the reason the
+                    server would refuse this delete is spelled out next to it. */}
+                {fixedBaseLocked ? (
+                  <p className="w-full text-[10px] leading-5 text-amber-300/85">
+                    {t('configs.group.fixedLocked')} · {t('configs.group.deletePackageHint')}
+                  </p>
+                ) : null}
               </div>
               <div className="flex items-center gap-2">
                 <Button variant="secondary" size="sm" icon={Power} onClick={() => toggle.mutate(!config.enabled)} loading={toggle.isPending}>

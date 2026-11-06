@@ -1011,6 +1011,25 @@ function startMockXui(inboundRows) {
       `balance=${afterRenew.json?.data?.user?.balance}`
     );
 
+    // v1.4.24, at the owner's request: the reseller must be TOLD about a renewal,
+    // and the message has to read like a receipt — what was added, what it cost and
+    // until when the package is valid. Persian digits are normalised so the check
+    // does not depend on the ICU build of the runner.
+    const renewNotes = await request('GET', '/api/notifications', { cookies: shopCookies });
+    const faDigits = (value) => String(value || '').replace(/[۰-۹]/g, (d) => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d) + 0);
+    const renewNote = (renewNotes.json?.data?.rows || []).find((item) => item.title === 'تمدید انجام شد') || {};
+    check(
+      'the reseller inbox carries a renewal confirmation naming the amount taken',
+      renewNote.title === 'تمدید انجام شد'
+        && String(faDigits(renewNote.body)).includes('150') && String(renewNote.body || '').includes('کسر شد'),
+      `title=${renewNote.title} body=${renewNote.body}`
+    );
+    check(
+      'and it says which package it is about, so the message is not a bare notice',
+      String(renewNote.body || '').includes(String(bought.email || '')) && String(renewNote.body || '').includes('روز'),
+      `email=${bought.email} body=${renewNote.body}`
+    );
+
     // An unpaid renewal must fail before x-ui is touched and leave the wallet as is.
     const zeroOut = await request('POST', `/api/admin/users/${shopId}/balance`, {
       cookies, csrf, body: { amount: -99650, description: 'تخلیه تست' },
@@ -1859,6 +1878,73 @@ function startMockXui(inboundRows) {
         secondHeal.status === 200 && Number(secondHeal.json?.data?.needFix) === 0
         && Number(secondHeal.json?.data?.already) === 2 && Number(secondHeal.json?.data?.healed) === 0,
         `needFix=${secondHeal.json?.data?.needFix} already=${secondHeal.json?.data?.already}`);
+
+
+      // -------------------------------------------------- v1.4.24: whole-subscription delete
+      // The owner's complaint about that 409 was there being no way to finish the job:
+      // he had to peel the channels off one by one and delete the last row to make the
+      // client go. deletePackage is the case his own rule allows — the base goes only
+      // when the whole subscription does. And for an adopted customer it must still
+      // never write to the other operator's panel.
+      const pkgCallsBefore = mockXui.calls.length;
+      const dropAdoptedPackage = await request('DELETE', `/api/admin/configs/${fixedMember.id}/package`, { cookies, csrf });
+      const pkgCalls = mockXui.calls.slice(pkgCallsBefore);
+      const adoptedLeft = fixedDb.prepare('SELECT COUNT(*) AS c FROM configs WHERE id IN (?, ?) AND deleted_at = 0')
+        .get(legacyA, Number(fixedMember.id)).c;
+      const pkgData = dropAdoptedPackage.json?.data || {};
+      check('the whole subscription can be deleted even though its base is locked',
+        dropAdoptedPackage.status === 200 && Number(pkgData.rows) === 2,
+        `status=${dropAdoptedPackage.status} rows=${pkgData.rows} code=${dropAdoptedPackage.json?.error?.code}`);
+      check('and every row of that package is gone, the fixed inbound included',
+        adoptedLeft === 0, `rows left=${adoptedLeft}`);
+      check('deleting an adopted customer deletes nothing on the seller panel',
+        mockXui.clients.has(legacyAEmail) === true
+        && pkgCalls.every((call) => !String(call.route || '').includes('/clients/del'))
+        && (pkgData.xuiDeleted || []).length === 0,
+        `client=${mockXui.clients.has(legacyAEmail)} calls=${pkgCalls.map((call) => call.route).join(',')}`);
+      check('the answer says which half did NOT happen, so the UI can tell the reseller',
+        pkgData.remoteDeleted === false && (pkgData.localOnly || []).length >= 1,
+        JSON.stringify(pkgData).slice(0, 200));
+
+      // A customer this panel made himself is the other case: his client really goes.
+      const ownPackage = await request('POST', '/api/reseller/configs', {
+        cookies: fixedCookies, csrf: fixedCsrf,
+        body: { inboundIds: [903, 904], gb: 3, days: 7, customerName: 'مشتری حذف کامل' },
+      });
+      const ownConfigs = ownPackage.json?.data?.configs || [];
+      const ownEmail = String(ownConfigs[0]?.email || '');
+      const ownSubId = String(ownConfigs[0]?.subId || '');
+      check('a three-channel package of our own is still one x-ui client',
+        ownPackage.status === 201 && ownConfigs.length === 3
+        && new Set(ownConfigs.map((item) => String(item.email))).size === 1,
+        `rows=${ownConfigs.length} emails=${new Set(ownConfigs.map((item) => String(item.email))).size}`);
+      const dropOwnPackage = await request('DELETE', `/api/reseller/configs/${ownConfigs[0].id}/package`, {
+        cookies: fixedCookies, csrf: fixedCsrf,
+      });
+      const ownData = dropOwnPackage.json?.data || {};
+      const ownLeft = fixedDb.prepare('SELECT COUNT(*) AS c FROM configs WHERE sub_id = ? AND deleted_at = 0').get(ownSubId).c;
+      check('deleting the whole subscription removes the rows and his x-ui client together',
+        dropOwnPackage.status === 200 && Number(ownData.rows) === 3 && ownLeft === 0
+        && (ownData.xuiDeleted || []).includes(ownEmail) && mockXui.clients.has(ownEmail) === false,
+        `status=${dropOwnPackage.status} rows=${ownData.rows} left=${ownLeft} client=${mockXui.clients.has(ownEmail)}`);
+      check('and that delete is the one remote write of the whole block',
+        ownData.remoteDeleted === true
+        && mockXui.calls.slice(pkgCallsBefore).filter((call) => String(call.route || '').includes('/clients/del')).length === 1,
+        `del=${mockXui.calls.slice(pkgCallsBefore).filter((call) => String(call.route || '').includes('/clients/del')).length}`);
+      const ownNotes = await request('GET', '/api/notifications', { cookies: fixedCookies });
+      check('the reseller is told his customer was removed',
+        (ownNotes.json?.data?.rows || []).some((item) => item.title === 'اشتراک حذف شد'),
+        `titles=${(ownNotes.json?.data?.rows || []).slice(0, 4).map((item) => item.title).join('|')}`);
+
+      const foreignRow = fixedDb.prepare('SELECT id FROM configs WHERE user_id <> ? AND deleted_at = 0 LIMIT 1').get(fixedShopId);
+      const foreignDelete = await request('DELETE', `/api/reseller/configs/${foreignRow.id}/package`, {
+        cookies: fixedCookies, csrf: fixedCsrf,
+      });
+      check('a reseller cannot delete another reseller’s customer this way',
+        foreignDelete.status === 403, `status=${foreignDelete.status} code=${foreignDelete.json?.error?.code}`);
+      const foreignLeft = fixedDb.prepare('SELECT deleted_at FROM configs WHERE id = ?').get(foreignRow.id).deleted_at;
+      check('and the refusal happens before anything is touched',
+        Number(foreignLeft) === 0, `deleted_at=${foreignLeft}`);
 
       // New configs must get the base automatically, even when the reseller only
       // ticks one other inbound, and the allow list must always keep the base.

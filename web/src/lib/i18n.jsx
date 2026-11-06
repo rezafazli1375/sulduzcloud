@@ -312,6 +312,7 @@ const fa = {
       balanceAfter: 'موجودی پس از تمدید',
       enterAmount: 'حجم یا روز اضافه کنید',
       zeroTariff: 'مبلغ صفر است؛ تعرفهٔ اینباند (قیمت ثابت / هر گیگ / هر روز) هنوز در پنل وارد نشده است.',
+      done: 'تمدید انجام شد',
     },
     quota: {
       title: 'ویرایش سهمیه',
@@ -366,6 +367,17 @@ const fa = {
       channelDetached: 'این کانال از کلاینت خودِ مشتری جدا شد؛ او با {n} کانال دیگرش همچنان متصل است و لینک اشتراکش همان آدرس نود است.',
       channelDetachNote: 'کلاینت x-ui این مشتری روی سرور نود می‌ماند و فقط همین اینباند از او جدا می‌شود؛ بقیهٔ کانال‌هایش و لینک اشتراکش دست‌نخورده می‌مانند و مشتری قطع نمی‌شود.',
       addFixedHint: 'اینباند ثابت این نمایندگی («{inbound}») هنوز در این بسته نیست. با افزودنش، این مشتری هم آن اینباند را با همان حجم و لینک مشترک می‌گیرد.',
+      // v1.4.24: the whole-subscription action, the only case the fixed-inbound
+      // lock allows. The wording must make clear what leaves the node and what
+      // does not, because adopted channels belong to another panel.
+      deletePackage: 'حذف کل اشتراک',
+      deletePackageHint: 'همهٔ کانال‌های این مشتری با هم برداشته می‌شود؛ اینباند ثابت هم همراه آن می‌رود',
+      packageDeleteConfirm: 'کل اشتراک این مشتری حذف شود؟',
+      packageDeleteBody: 'هر {n} کانال این بسته برداشته می‌شود و اشتراک مشتری پایان می‌یابد.',
+      packageDeleteNode: 'کلاینت x‑ui او روی سرور نود هم پاک می‌شود و لینک اشتراکش از کار می‌افتد.',
+      packageDeleteAdopted: '{n} کانال از این بسته از پنل دیگری دریافت شده است: فقط از این پنل برداشته می‌شود و اشتراک او روی آن پنل دست‌نخورده و فعال می‌ماند.',
+      packageDeletedRemote: 'کل اشتراک حذف شد ({n} کانال و کلاینت x‑ui آن)',
+      packageDeletedLocal: 'هر {n} ردیف از این پنل حذف شد؛ اشتراک مشتری روی پنل دیگر دست‌نخورده ماند',
     },
     detail: {
       title: 'جزئیات کانفیگ',
@@ -1210,6 +1222,7 @@ const en = {
       balanceAfter: 'Balance after renewal',
       enterAmount: 'Enter traffic or days',
       zeroTariff: 'The amount is zero: this inbound’s tariff (fixed / per GB / per day) has not been filled in on the panel yet.',
+      done: 'Renewal applied',
     },
     quota: {
       title: 'Edit quota',
@@ -1264,6 +1277,14 @@ const en = {
       channelDetached: 'That channel was taken off the customer’s own client; he stays connected through his {n} other channel(s) and his subscription link is still the node address.',
       channelDetachNote: 'The customer’s x-ui client stays on the node and only this inbound is taken off it; his other channels and his subscription link stay as they are, so he is not cut off.',
       addFixedHint: 'This reseller’s fixed inbound (“{inbound}”) is not in this package yet. Adding it gives this customer that inbound too, on the same shared quota and link.',
+      deletePackage: 'Delete whole subscription',
+      deletePackageHint: 'Takes every channel of this customer at once; the fixed inbound goes with them',
+      packageDeleteConfirm: 'Delete this customer’s whole subscription?',
+      packageDeleteBody: 'All {n} channels of the package are removed and the customer’s subscription ends.',
+      packageDeleteNode: 'His x‑ui client is deleted on the node too and his subscription link stops working.',
+      packageDeleteAdopted: '{n} of these channels were adopted from another panel: they are only removed from this panel and stay live and untouched over there.',
+      packageDeletedRemote: 'Subscription deleted ({n} channels and their x‑ui client)',
+      packageDeletedLocal: 'All {n} rows were removed from this panel; the subscription on the other panel was left untouched',
     },
     detail: {
       title: 'Config details',

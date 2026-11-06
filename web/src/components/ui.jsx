@@ -47,7 +47,16 @@ export const Button = forwardRef(function Button(
     <button
       ref={ref}
       type={type}
-      className={cx('btn', VARIANTS[variant] || VARIANTS.primary, SIZES[size] || '', className)}
+      className={cx(
+        'btn',
+        VARIANTS[variant] || VARIANTS.primary,
+        SIZES[size] || '',
+        // A button that cannot be used has to look like it: before this, a
+        // disabled action (e.g. a renewal the wallet cannot pay for) was painted
+        // exactly like a live one and only the click revealed it did nothing.
+        (rest.disabled || loading) && 'opacity-45 saturate-[.7] cursor-not-allowed shadow-none',
+        className
+      )}
       disabled={rest.disabled || loading}
       {...rest}
     >

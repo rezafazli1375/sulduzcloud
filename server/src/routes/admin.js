@@ -485,6 +485,16 @@ router.delete('/configs/:id', auth.requirePerm('configs'), asyncH(async (req, re
   });
 }));
 
+// Panel v1.4.24: remove the customer's WHOLE subscription. The single delete above
+// refuses to drop the reseller's fixed inbound while the package has other channels
+// (that lock is the owner's own rule); this is the case the rule allows — the
+// customer goes away entirely. Adopted rows are still only forgotten locally, so
+// nothing is ever written to another operator's panel from here.
+router.delete('/configs/:id/package', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const result = await configsService.deletePackage(num(req.params.id), req, { role: 'admin' });
+  res.json({ ok: true, data: result });
+}));
+
 // ---------------------------------------------------------------- inbounds
 
 router.get('/inbounds', auth.requirePerm('inbounds'), (req, res) => {

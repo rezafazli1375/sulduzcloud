@@ -250,6 +250,16 @@ router.delete('/configs/:id', asyncH(async (req, res) => {
   });
 }));
 
+// Panel v1.4.24: the reseller's own way to end a customer's subscription. Taking
+// the fixed inbound off a package that still has other channels is refused by
+// design (that is the guaranteed base of the package), so the drawer needs the one
+// action the rule allows: remove everything at once. A reseller can only ever
+// reach his own customers — configDetail() checks the owner before anything runs.
+router.delete('/configs/:id/package', asyncH(async (req, res) => {
+  const result = await configsService.deletePackage(num(req.params.id), req, req.user);
+  res.json({ ok: true, data: result });
+}));
+
 router.get('/stats', (req, res) => {
   const days = Math.min(90, Math.max(1, num(req.query.days, 30)));
   res.json({

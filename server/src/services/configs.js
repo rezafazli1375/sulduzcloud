@@ -1090,10 +1090,22 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
     applied: applied.reduce((sum, batch) => sum + batch.length, 0),
   });
   if (reseller) {
+    // The reseller's confirmation of a renewal: what was added, what it cost and
+    // until when the package is now valid. With the wallet switched off the amount
+    // is still named but plainly marked as not deducted, so the message can never
+    // read like a charge that did not happen.
+    const currency = String(settings.getSetting('billing').currency || '').trim();
+    const money = amount > 0
+      ? ` · ${amount.toLocaleString('fa-IR')}${currency ? ` ${currency}` : ''}${billingEnabled() ? ' کسر شد' : ' (بدون کسر — کیف پول خاموش)'}`
+      : '';
+    const until = sharedExpiry > 0
+      ? ` · معتبر تا ${new Intl.DateTimeFormat('fa-IR', { dateStyle: 'medium' }).format(new Date(sharedExpiry))}`
+      : '';
     notifyUser(reseller.id, {
       type: 'success',
-      title: 'کانفیگ تمدید شد',
+      title: 'تمدید انجام شد',
       body: `${row.email} — ${gb ? `+${gb}GB ` : ''}${addDays ? `+${addDays} روز` : ''}`.trim()
+        + money + until
         + (targets.length > 1 ? ` (${targets.length} اینباند، حجم مشترک)` : ''),
       link: '/reseller/configs',
     });
@@ -1340,6 +1352,94 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
   });
   return {
     ok: true, detachedOnly: isExternal, inboundDetached: sharedClient, keptInbounds: keepIds.length,
+  };
+}
+
+/**
+ * Take the whole customer away: every inbound row of the package and, for a
+ * customer this panel created, his x-ui client with them.
+ *
+ * This is the action the fixed-inbound lock exists for. removeConfig refuses to
+ * drop the base while the customer keeps other channels — that rule is the owner's
+ * («Status2 ثابت و غیرقابل حذف بمونه، مگر هنگام حذف کل کلاینت و مشتری») and today it
+ * leaves the operator with no way to finish the job: he had to peel the channels off
+ * one by one and delete the last row to make the client go. Here the whole
+ * subscription ends at once, which is exactly the case the rule allows.
+ *
+ * The remote side is deliberately one-sided. A client that any adopted
+ * (origin='external') row of the package stands for belongs to ANOTHER operator's
+ * panel — in practice پنل ثنایی, which the owner has placed out of bounds — so it is
+ * never deleted, not even when our own healed channel shares it: those rows are only
+ * forgotten here, the same way a single adopted row is. Only clients built purely out
+ * of rows this panel created get `clients/del`. Every x-ui call happens before any
+ * row is touched, so a node that refuses leaves the package exactly as it was.
+ */
+async function deletePackage(id, req, viewer) {
+  const { row } = configDetail(id, viewer);
+  const db = getDb();
+  const members = packageRows(row);
+  const clients = distinctClients(members);
+  const adoptedEmails = new Set(
+    members.filter((item) => String(item.origin || 'panel') === 'external').map((item) => clientKeyOf(item))
+  );
+
+  const xuiDeleted = [];
+  const forgotten = [];
+  const alreadyGone = [];
+  for (const client of clients) {
+    const email = String(client[0].email || '');
+    // One adopted row on this client is enough: the client itself is the other
+    // panel's, and deleting it would cut off a customer over there.
+    if (!email || adoptedEmails.has(clientKeyOf(client[0]))) {
+      forgotten.push(email);
+      continue;
+    }
+    try {
+      await xui.deleteClient(email, false, serverOfConfig(client[0]));
+      xuiDeleted.push(email);
+    } catch (err) {
+      // The client is already off the node — the row here is the leftover, and the
+      // operator is trying to clean it up. Anything else aborts before any write.
+      if (err?.code === 'xui_client_missing') {
+        alreadyGone.push(email);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  const now = Date.now();
+  const softDelete = db.prepare('UPDATE configs SET deleted_at = ?, enabled = 0, updated_at = ? WHERE id = ?');
+  for (const member of members) softDelete.run(now, now, Number(member.id));
+
+  const resellerId = Number(row.user_id || 0);
+  if (resellerId) {
+    notifyUser(resellerId, {
+      type: 'info',
+      title: 'اشتراک حذف شد',
+      body: `${row.email} — ${members.length} کانال${xuiDeleted.length ? `، ${xuiDeleted.length} کلاینت x-ui پاک شد` : '، فقط از این پنل حذف شد'}`,
+      link: '/reseller/configs',
+    });
+  }
+  audit(req, 'config.package_delete', 'config', row.id, {
+    email: row.email,
+    rows: members.length,
+    configs: members.map((item) => Number(item.id)),
+    xuiDeleted,
+    forgotten,
+    alreadyGone,
+  });
+  return {
+    ok: true,
+    rows: members.length,
+    configs: members.map((item) => Number(item.id)),
+    clients: clients.length,
+    xuiDeleted,
+    localOnly: forgotten,
+    alreadyGone,
+    // What the drawer has to say about it: nothing remotely was deleted exactly
+    // when every client of the package belonged to another panel.
+    remoteDeleted: xuiDeleted.length > 0,
   };
 }
 
@@ -2328,6 +2428,7 @@ module.exports = {
   resetUsage,
   updateMeta,
   removeConfig,
+  deletePackage,
   groupFor,
   updateIdentity,
   addInbound,
