@@ -54,6 +54,24 @@ async function sendMessage(text) {
   });
 }
 
+/**
+ * Send to one specific chat — a reseller's own numeric Telegram id, taken from
+ * his settings row and NOT from the panel chat. `chatId` is always caller-supplied
+ * and never read back out of the token, and a chat that was never started shows up
+ * here as Telegram's own error ("bot can't initiate conversation with a user"),
+ * which is exactly what the caller needs to tell the owner why nothing arrived.
+ */
+async function sendMessageTo(chatId, text) {
+  const target = String(chatId || '').trim();
+  if (!/^-?\d+$/.test(target)) throw new ApiError(422, 'telegram_chat_id', 'آیدی عددی تلگرام معتبر نیست');
+  return call('sendMessage', {
+    chat_id: target,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+  });
+}
+
 async function sendDocument(filePath, caption) {
   const cfg = config();
   if (!cfg.botToken) throw new ApiError(422, 'telegram_not_configured', 'توکن ربات تلگرام تنظیم نشده است');
@@ -115,4 +133,4 @@ async function sendBackup(filePath, name, reason = 'auto') {
   return { sent: true, name };
 }
 
-module.exports = { config, ready, call, sendMessage, sendDocument, test, sendBackup };
+module.exports = { config, ready, call, sendMessage, sendMessageTo, sendDocument, test, sendBackup };

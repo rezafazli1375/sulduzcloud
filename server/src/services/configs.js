@@ -20,6 +20,7 @@ const {
   escapeLike,
   safeJsonParse,
   pageParams,
+  spreadAcrossDays,
   CONFIG_GROUP_KEY_SQL,
   CONFIG_GROUP_USED_SQL,
 } = require('../utils');
@@ -27,6 +28,36 @@ const { audit } = require('../audit');
 const { notifyUser } = require('../notify');
 
 const DAY_MS = 86400000;
+
+// A traffic gap is only ever spread over this many days. x-ui counters are
+// cumulative, so when the panel comes back after days of downtime — or after a
+// reseller's rows were hidden and returned — it sees one big delta and cannot
+// know which hour of that window each byte moved in. The old code booked the
+// whole thing on the day it woke up, which made the reseller dashboard show a
+// day three times the truth and holes in the days around it. Spreading by
+// elapsed time keeps the TOTAL exact and puts the bytes on the days they
+// actually belong; the cap stops an ancient row from writing hundreds of rows.
+const MAX_SPREAD_DAYS = 7;
+
+/**
+ * Book one x-ui client's traffic delta into usage_daily, across the panel-timezone
+ * days its window covers. `fromMs` is when the panel last read this client.
+ * Returns how many day rows were written.
+ */
+function accrueUsage(upsertUsage, row, fromMs, toMs, deltaUp, deltaDown) {
+  const now = Number(toMs) || Date.now();
+  const raw = Number(fromMs) || now;
+  const from = Math.min(Math.max(raw, now - MAX_SPREAD_DAYS * DAY_MS), now);
+  if (now - from < 1) {
+    // Clock gave us nothing to spread over (never synced in this run, or the
+    // stored time is in the future). Book it on today rather than lose bytes.
+    upsertUsage.run(row.id, row.user_id, dayKey(now), deltaUp, deltaDown);
+    return 1;
+  }
+  const slices = spreadAcrossDays(from, now, deltaUp, deltaDown);
+  for (const slice of slices) upsertUsage.run(row.id, row.user_id, slice.day, slice.up, slice.down);
+  return slices.length;
+}
 
 function getInboundRow(id) {
   return getDb()
@@ -1503,7 +1534,6 @@ async function refreshPackage(id, req, viewer) {
   const clients = distinctClients(targets);
   const byRowId = new Map(targets.map((target) => [Number(target.id), target]));
   const now = Date.now();
-  const today = dayKey();
   const apply = db().prepare(
     `UPDATE configs SET up_bytes = ?, down_bytes = ?, last_up = ?, last_down = ?, last_online_at = ?,
        enabled = ?, uuid = ?, xui_sub_id = ?, sync_status = ?, last_synced_at = ?, updated_at = ?
@@ -1551,8 +1581,8 @@ async function refreshPackage(id, req, viewer) {
     const down = Number(live.down || 0);
     const deltaUp = Math.max(0, up - Number(first.last_up || 0));
     const deltaDown = Math.max(0, down - Number(first.last_down || 0));
-    if ((deltaUp > 0 || deltaDown > 0) && dayKey() === today) {
-      upsertUsage.run(first.id, first.user_id, today, deltaUp, deltaDown);
+    if (deltaUp > 0 || deltaDown > 0) {
+      accrueUsage(upsertUsage, first, Number(first.last_synced_at || first.created_at || 0), now, deltaUp, deltaDown);
     }
     for (const target of client) {
       apply.run(up, down, up, down, Number(live.lastOnlineAt || 0),
@@ -2527,7 +2557,6 @@ async function syncConfigs({ pruneUsageDays } = {}) {
     for (const client of clients) map.set(`${server.id}:${String(client.email).toLowerCase()}`, client);
   }
   const rows = db.prepare('SELECT * FROM configs WHERE deleted_at = 0').all();
-  const today = dayKey();
   const upsertUsage = db.prepare(
     `INSERT INTO usage_daily (config_id, user_id, day, up_bytes, down_bytes) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(config_id, day) DO UPDATE SET
@@ -2565,8 +2594,11 @@ async function syncConfigs({ pruneUsageDays } = {}) {
       let deltaDown = down - Number(row.last_down || 0);
       if (deltaUp < 0) deltaUp = 0;
       if (deltaDown < 0) deltaDown = 0;
-      if ((deltaUp > 0 || deltaDown > 0) && dayKey() === today && firstOfClient) {
-        upsertUsage.run(row.id, row.user_id, today, deltaUp, deltaDown);
+      if ((deltaUp > 0 || deltaDown > 0) && firstOfClient) {
+        // The window this delta covers is [last read, now] — not "today". A sync
+        // that crosses midnight, a restart, or rows that came back after being
+        // hidden all produce a delta that does not belong to one day.
+        accrueUsage(upsertUsage, row, Number(row.last_synced_at || row.created_at || 0), Date.now(), deltaUp, deltaDown);
       }
       updateConfig.run(up, down, up, down, client.lastOnlineAt || 0,
         client.enabled ? 1 : 0, client.uuid || row.uuid, client.subId || row.xui_sub_id,
@@ -2719,6 +2751,7 @@ module.exports = {
   hydrate,
   groupRows,
   packageRows,
+  packageKeyOf,
   getConfigRow,
   linksFor,
   subUrlFor,

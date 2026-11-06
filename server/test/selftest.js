@@ -484,6 +484,25 @@ function startMockXui(inboundRows) {
     const tgSendNoConfig = await request('POST', `/api/admin/backups/${backupName}/telegram`, { cookies, csrf, body: {} });
     check('manual telegram send needs configuration', tgSendNoConfig.status === 422 && tgSendNoConfig.json.error.code === 'telegram_not_configured');
 
+    // v1.4.27: switching the nightly report on is a promise that something will
+    // arrive at the chosen hour, so it is refused while there is no bot to send
+    // with instead of quietly doing nothing at 23:00.
+    const reportNoToken = await request('PATCH', '/api/admin/settings/telegram', { cookies, csrf, body: { dailyReportEnabled: true } });
+    check(
+      'the nightly report cannot be switched on without a bot token',
+      reportNoToken.status === 422 && reportNoToken.json?.error?.code === 'telegram_not_configured',
+      `status=${reportNoToken.status} code=${reportNoToken.json?.error?.code}`
+    );
+    const reportDefaults = await request('GET', '/api/admin/settings', { cookies });
+    const tgDefaultView = reportDefaults.json?.data?.settings?.telegram || {};
+    check(
+      'the report schedule ships with the defaults the settings card shows',
+      tgDefaultView.dailyReportEnabled === false && tgDefaultView.dailyReportHour === 23
+        && tgDefaultView.dailyReportMinute === 0 && tgDefaultView.dailyReportDaysAhead === 3
+        && tgDefaultView.dailyReportResellers === true && tgDefaultView.dailyReportOwner === true,
+      `tg=${JSON.stringify(tgDefaultView)}`
+    );
+
     const tgSave = await request('PATCH', '/api/admin/settings/telegram', {
       cookies, csrf,
       body: { enabled: true, botToken: '123456:selftest-token', chatId: '-1001234567890', sendOnAuto: true },
@@ -2859,6 +2878,387 @@ function startMockXui(inboundRows) {
       for (const id of goneRowIds) goneDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
       for (const email of [goneEmail, bulkEmail, offEmail]) mockXui.clients.delete(email);
       goneDb.close();
+    }
+
+    // ------------------------- v1.4.27: the daily traffic of the reseller home
+    // The reseller's report was real and the cause is in the accrual: x-ui only
+    // gives a CUMULATIVE counter, so whatever the panel could not read — because
+    // it was restarting, because a sync crossed midnight, or because the rows of
+    // that reseller were hidden for a few days — landed as one delta on the day it
+    // woke up. His dashboard then showed a day three times the truth next to
+    // empty days. The fix books a delta over the window it actually covers.
+    process.env.DATA_DIR = DATA_DIR;
+    process.env.BACKUP_DIR = path.join(DATA_DIR, 'backups');
+    // eslint-disable-next-line global-require
+    const { daySlices, spreadAcrossDays, zonedDayStartMs, zonedDayEndMs } = require('../src/utils');
+    const TZ27 = 'Asia/Tehran';
+    const U27 = 1024 ** 3;
+    const DAY27 = 86400000;
+
+    // (1) the day arithmetic itself, on fixed instants so it cannot drift with
+    // the wall clock: Tehran is UTC+3:30 and has no DST, so its midnights land
+    // on 20:30 UTC.
+    const noon27 = Date.UTC(2026, 10, 2, 8, 0, 0); // 2026-11-02 11:30 Tehran
+    check(
+      'v1.4.27 a zoned day starts at 00:00 of its own calendar day in the panel timezone',
+      zonedDayStartMs(noon27, TZ27) === Date.UTC(2026, 10, 1, 20, 30, 0)
+        && zonedDayEndMs(noon27, TZ27) === Date.UTC(2026, 10, 2, 20, 30, 0),
+      `start=${new Date(zonedDayStartMs(noon27, TZ27)).toISOString()} end=${new Date(zonedDayEndMs(noon27, TZ27)).toISOString()}`
+    );
+    const gapFrom27 = Date.UTC(2026, 10, 1, 18, 0, 0); // 21:30 Tehran on 11-01
+    const gapTo27 = Date.UTC(2026, 10, 2, 6, 0, 0); // 09:30 Tehran on 11-02 — 2h30 + 9h30
+    const slices27 = daySlices(gapFrom27, gapTo27, TZ27);
+    check(
+      'a window that crosses midnight is split at the zoned midnight, not at 00:00 UTC',
+      slices27.map((slice) => slice.day).join(',') === '2026-11-01,2026-11-02'
+        && slices27.map((slice) => slice.ms).join(',') === String(2.5 * 3600 * 1000) + ',' + String(9.5 * 3600 * 1000)
+        && slices27[0].from === gapFrom27 && slices27[1].to === gapTo27,
+      `slices=${JSON.stringify(slices27)}`
+    );
+    const spread27 = spreadAcrossDays(gapFrom27, gapTo27, 43200000, 43200000, TZ27);
+    check(
+      'and the bytes follow the time they had: 2.5h of a 12h window is a fifth of the traffic',
+      spread27.length === 2
+        && spread27[0].day === '2026-11-01' && spread27[0].up === 9000000 && spread27[0].down === 9000000
+        && spread27[1].day === '2026-11-02' && spread27[1].up === 34200000 && spread27[1].down === 34200000,
+      `spread=${JSON.stringify(spread27)}`
+    );
+    const threeDay = spreadAcrossDays(Date.UTC(2026, 10, 1), Date.UTC(2026, 10, 4), 259200, 7, TZ27);
+    check(
+      'a three-day window writes four day rows and never loses or invents a byte',
+      threeDay.map((row) => row.day).join(',') === '2026-11-01,2026-11-02,2026-11-03,2026-11-04'
+        && threeDay.reduce((sum, row) => sum + row.up, 0) === 259200
+        && threeDay.reduce((sum, row) => sum + row.down, 0) === 7
+        && threeDay[0].up === 73800 && threeDay[1].up === 86400 && threeDay[3].up === 12600,
+      `rows=${JSON.stringify(threeDay)}`
+    );
+    check(
+      'a window inside one day still books exactly one day, and nothing is booked for no traffic',
+      spreadAcrossDays(gapTo27, gapTo27 + 60000, 1000, 1000, TZ27).length === 1
+        && spreadAcrossDays(gapFrom27, gapTo27, 0, 0, TZ27).length === 0
+        && spreadAcrossDays(gapTo27, gapFrom27, 1000, 1000, TZ27).length === 0,
+      `sameDay=${spreadAcrossDays(gapTo27, gapTo27 + 60000, 1000, 1000, TZ27).length}`
+    );
+
+    // (2) the accrual itself, through the two paths that write it: the monitor
+    // sync and the manual per-package refresh. The timer is parked first, or an
+    // automatic cycle would reset the window between the rewind and the sync.
+    const dayKeyLocal = (ts) => new Intl.DateTimeFormat('en-CA', {
+      timeZone: TZ27, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date(ts));
+    const usageDb27 = new Database(path.join(DATA_DIR, 'panel.db'));
+    const usageRows27 = (id) => usageDb27
+      .prepare('SELECT day, up_bytes, down_bytes FROM usage_daily WHERE config_id = ? ORDER BY day')
+      .all(id);
+    const sumRows27 = (rows, column) => rows.reduce((sum, row) => sum + Number(row[column] || 0), 0);
+    const recentDays27 = [];
+    for (let back = 0; back < 10; back += 1) recentDays27.push(dayKeyLocal(Date.now() - back * DAY27));
+    let id27 = 0;
+    let email27 = '';
+    let intervalParked = false;
+    try {
+      const park = await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } });
+      intervalParked = park.status === 200;
+      check('the accrual test parks the monitor timer so a rewound window stays rewound',
+        intervalParked, `status=${park.status}`);
+
+      const build27 = await request('POST', '/api/admin/configs', {
+        cookies, csrf,
+        body: { userId: shopId, inboundIds: [901], gb: 30, days: 30, customerName: 'مشتری آمار روزانه' },
+      });
+      const cfg27 = (build27.json?.data?.configs || [])[0] || {};
+      id27 = Number(cfg27.id || 0);
+      email27 = String(cfg27.email || '');
+      const client27 = mockXui.clients.get(email27);
+      check('the accrual fixture is one package with one node client',
+        build27.status === 201 && id27 > 0 && Boolean(client27),
+        `status=${build27.status} id=${id27} email=${email27}`);
+
+      // Baseline: the panel has read this client once, so every later delta is known.
+      client27.up = 0;
+      client27.down = 0;
+      await request('POST', '/api/admin/sync', { cookies, csrf });
+      usageDb27.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id27);
+      const today27 = dayKeyLocal(Date.now());
+      const nodeTotal = { up: 0, down: 0 };
+      const moveTo = (upGb, downGb) => {
+        const delta = { up: (upGb - nodeTotal.up) * U27, down: (downGb - nodeTotal.down) * U27 };
+        nodeTotal.up = upGb;
+        nodeTotal.down = downGb;
+        client27.up = upGb * U27;
+        client27.down = downGb * U27;
+        return delta;
+      };
+
+      // ---- a two-day hole closed by the monitor sync: 0 → 4GB up / 2GB down
+      const rewindA = Date.now() - 2 * DAY27;
+      usageDb27.prepare('UPDATE configs SET last_synced_at = ? WHERE id = ?').run(rewindA, id27);
+      const deltaA = moveTo(4, 2);
+      const gapSync27 = await request('POST', '/api/admin/sync', { cookies, csrf });
+      const gapRows27 = usageRows27(id27);
+      const gapDays27 = gapRows27.map((row) => row.day);
+      const todayUpA = sumRows27(gapRows27.filter((row) => row.day === today27), 'up_bytes');
+      check('a two-day traffic gap is booked on the days it happened, with every byte kept',
+        gapSync27.status === 200 && gapDays27.length >= 2
+          && new Set(gapDays27).size === gapDays27.length
+          && gapDays27.every((day) => recentDays27.includes(day))
+          && sumRows27(gapRows27, 'up_bytes') === deltaA.up
+          && sumRows27(gapRows27, 'down_bytes') === deltaA.down,
+        `rows=${JSON.stringify(gapRows27.map((row) => `${row.day}:${row.up_bytes / U27}GB/${row.down_bytes / U27}GB`))}`);
+      check('and the day the panel woke up no longer swallows the whole gap',
+        todayUpA > 0 && todayUpA < deltaA.up,
+        `today=${(todayUpA / U27).toFixed(2)}GB of ${(deltaA.up / U27).toFixed(0)}GB`);
+
+      // ---- the same hole closed by the refresh button: 4/2 → 7/5 GB
+      usageDb27.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id27);
+      usageDb27.prepare('UPDATE configs SET last_synced_at = ? WHERE id = ?')
+        .run(Date.now() - 2 * DAY27, id27);
+      const deltaB = moveTo(7, 5);
+      const doRefresh27 = await request('POST', `/api/reseller/configs/${id27}/refresh`, {
+        cookies: shopCookies, csrf: shopCsrf,
+      });
+      const refreshRows27 = usageRows27(id27);
+      const refreshTodayB = sumRows27(refreshRows27.filter((row) => row.day === today27), 'up_bytes');
+      check('the manual refresh of a package spreads its gap the same way',
+        doRefresh27.status === 200 && refreshRows27.length >= 2
+          && refreshRows27.every((row) => recentDays27.includes(row.day))
+          && sumRows27(refreshRows27, 'up_bytes') === deltaB.up
+          && sumRows27(refreshRows27, 'down_bytes') === deltaB.down,
+        `status=${doRefresh27.status} rows=${JSON.stringify(refreshRows27.map((row) => `${row.day}:${row.up_bytes / U27}GB/${row.down_bytes / U27}GB`))}`);
+      check('so a refresh after a quiet weekend cannot fake a busy today',
+        refreshTodayB > 0 && refreshTodayB < deltaB.up,
+        `today=${(refreshTodayB / U27).toFixed(2)}GB of ${(deltaB.up / U27).toFixed(0)}GB`);
+
+      // ---- an ordinary gap of a few seconds must still land on one day
+      usageDb27.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id27);
+      const deltaC = moveTo(8, 6);
+      await request('POST', '/api/admin/sync', { cookies, csrf });
+      const normalRows27 = usageRows27(id27);
+      check('a normal sync books everything on today, exactly as before',
+        normalRows27.length === 1 && normalRows27[0].day === today27
+          && Number(normalRows27[0].up_bytes) === deltaC.up
+          && Number(normalRows27[0].down_bytes) === deltaC.down,
+        `rows=${JSON.stringify(normalRows27.map((row) => `${row.day}:${row.up_bytes}`))}`);
+
+      // ---- the cap: an ancient window must not write a row per day of silence
+      usageDb27.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id27);
+      usageDb27.prepare('UPDATE configs SET last_synced_at = ? WHERE id = ?')
+        .run(Date.now() - 40 * DAY27, id27);
+      const deltaD = moveTo(12, 8);
+      await request('POST', '/api/admin/sync', { cookies, csrf });
+      const cappedRows27 = usageRows27(id27);
+      const oldestAllowed27 = dayKeyLocal(Date.now() - 7 * DAY27);
+      check('a month of silence is capped at a week of day rows and still books every byte',
+        cappedRows27.length >= 2 && cappedRows27.length <= 8
+          && cappedRows27.every((row) => row.day >= oldestAllowed27)
+          && sumRows27(cappedRows27, 'up_bytes') === deltaD.up
+          && sumRows27(cappedRows27, 'down_bytes') === deltaD.down,
+        `rows=${cappedRows27.length} oldest=${cappedRows27[0]?.day} sumUp=${sumRows27(cappedRows27, 'up_bytes') / U27}GB`);
+
+      // ---- what the reseller actually sees on his home page
+      usageDb27.prepare('DELETE FROM usage_daily WHERE user_id = ?').run(shopId);
+      usageDb27.prepare('UPDATE configs SET last_synced_at = ? WHERE id = ?')
+        .run(Date.now() - 2 * DAY27, id27);
+      const deltaE = moveTo(16, 10);
+      await request('POST', '/api/admin/sync', { cookies, csrf });
+      const ledger27 = usageDb27.prepare(
+        'SELECT day, up_bytes + down_bytes AS total FROM usage_daily WHERE user_id = ?'
+      ).all(shopId);
+      const ledgerToday27 = ledger27.filter((row) => row.day === today27).reduce((sum, row) => sum + Number(row.total), 0);
+      const ledgerAll27 = ledger27.reduce((sum, row) => sum + Number(row.total), 0);
+      const overview27 = await request('GET', '/api/reseller/overview', { cookies: shopCookies });
+      const seenToday27 = Number(overview27.json?.data?.today?.total || 0);
+      const seenMonth27 = Number(overview27.json?.data?.month?.total || 0);
+      check('the home page of the reseller reads exactly what the day ledger holds',
+        overview27.status === 200 && seenToday27 === ledgerToday27 && seenMonth27 === ledgerAll27
+          && ledgerAll27 >= deltaE.up + deltaE.down,
+        `today=${seenToday27} ledgerToday=${ledgerToday27} month=${seenMonth27} ledgerAll=${ledgerAll27}`);
+      check('and today is a share of the gap, not the whole two days of it',
+        ledgerToday27 > 0 && ledgerToday27 < deltaE.up + deltaE.down
+          && ledger27.length >= 2,
+        `days=${ledger27.length} today=${(ledgerToday27 / U27).toFixed(2)}GB of ${((deltaE.up + deltaE.down) / U27).toFixed(0)}GB`);
+    } finally {
+      if (id27) {
+        for (const row of usageDb27.prepare('SELECT id FROM configs WHERE email = ?').all(email27)) {
+          usageDb27.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(Number(row.id));
+        }
+        usageDb27.prepare('DELETE FROM configs WHERE id = ?').run(id27);
+      }
+      usageDb27.close();
+      if (email27) mockXui.clients.delete(email27);
+      if (intervalParked) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
+    }
+
+    // --------------------------- v1.4.27: the nightly telegram report
+    // The owner asked for one message per reseller per day, built from the rows
+    // the panel already keeps: what he bought today and what is left in his
+    // wallet, what ended today, what is about to end. Nothing below talks to
+    // Telegram — every send is either switched off or already marked as delivered
+    // for the day, which is exactly the bookkeeping that makes a restart after the
+    // scheduled hour harmless instead of a second message.
+    const DAYR = 86400000;
+    const GIR = 1024 ** 3;
+    const rptDb = new Database(path.join(DATA_DIR, 'panel.db'));
+    let rptShopId = 0;
+    const rptEmails = [];
+    let rptDay = '';
+    let rptTimerParked = false;
+    try {
+      const parkR = await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } });
+      rptTimerParked = parkR.status === 200;
+      check('the report test parks the monitor so the fixtures keep the numbers written for them',
+        rptTimerParked, `status=${parkR.status}`);
+
+      const buildR = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'rptshop', password: 'password123', role: 'reseller', telegram_id: '777000222', balance: 4321000 },
+      });
+      rptShopId = Number(buildR.json?.data?.user?.id || 0);
+      check('the report reseller is created with his numeric telegram id',
+        buildR.status === 201 && rptShopId > 0 && buildR.json?.data?.user?.telegramId === '777000222',
+        `status=${buildR.status} id=${rptShopId}`);
+
+      const madeR = [];
+      for (const name of ['RPT-active', 'RPT-ended', 'RPT-soon', 'RPT-full']) {
+        const one = await request('POST', '/api/admin/configs', {
+          cookies, csrf,
+          body: { userId: rptShopId, inboundIds: [901], gb: 10, days: 30, customerName: name },
+        });
+        const cfgOne = (one.json?.data?.configs || [])[0] || {};
+        if (Number(cfgOne.id)) {
+          madeR.push({ id: Number(cfgOne.id), name, email: String(cfgOne.email || '') });
+          if (cfgOne.email) rptEmails.push(cfgOne.email);
+        }
+      }
+      check('four packages of one customer each are ready for the report',
+        madeR.length === 4, `made=${JSON.stringify(madeR.map((row) => row.name))}`);
+
+      // The three cases the message is about, written the way the panel would
+      // have them at the end of a day: ended this morning, two days left, and one
+      // whose shared quota is used up while its expiry is still far away.
+      const nowR = Date.now();
+      const byName = new Map(madeR.map((row) => [row.name, row.id]));
+      rptDb.prepare('UPDATE configs SET expiry_at = ? WHERE id = ?').run(nowR - 3600000, byName.get('RPT-ended'));
+      rptDb.prepare('UPDATE configs SET expiry_at = ? WHERE id = ?').run(nowR + 2 * DAYR, byName.get('RPT-soon'));
+      rptDb.prepare(
+        'UPDATE configs SET total_bytes = ?, up_bytes = ?, down_bytes = 0, expiry_at = ?, updated_at = ? WHERE id = ?'
+      ).run(GIR, GIR, nowR + 30 * DAYR, nowR, byName.get('RPT-full'));
+
+      const prevR = await request('GET', `/api/admin/reports/daily/${rptShopId}/preview`, { cookies, csrf });
+      const prevBody = prevR.json?.data || {};
+      const prevText = String(prevBody.text || '');
+      check('the preview is built for that reseller and mentions his id',
+        prevR.status === 200 && prevBody.username === 'rptshop' && prevBody.telegramId === '777000222'
+          && prevText.includes('گزارش روزانه') && prevText.includes('rptshop'),
+        `status=${prevR.status} len=${prevText.length}`);
+      check('and it carries the three sections the owner asked for',
+        prevText.includes('خرید امروز و موجودی') && prevText.includes('امروز تمام شد')
+          && prevText.includes('نزدیک اتمام') && prevText.includes('موجودی کیف پول'),
+        `blocks=${prevText.split('\n\n').length}`);
+      const statsR = prevBody.stats || {};
+      check('the counts come out of the rows themselves, not out of the inbound list',
+        statsR.packages === 4 && statsR.created === 4 && statsR.ended === 1
+          && statsR.depleted === 1 && statsR.endingSoon === 1 && statsR.balance === 4321000,
+        `stats=${JSON.stringify(statsR)}`);
+      check('the names of the packages that ended and are about to end are in the message',
+        prevText.includes('RPT-ended') && prevText.includes('RPT-soon') && prevText.includes('RPT-full'),
+        `hasEnded=${prevText.includes('RPT-ended')} hasSoon=${prevText.includes('RPT-soon')}`);
+      check('and the message never grows past what Telegram accepts',
+        prevText.length <= 4096, `length=${prevText.length}`);
+
+      const metaR = await request('GET', '/api/admin/reports/daily', { cookies, csrf });
+      const metaBody = metaR.json?.data || {};
+      rptDay = String(prevBody.day || '');
+      check('the report card lists the recipients by their stored telegram id',
+        metaR.status === 200 && (metaBody.recipients || []).some((row) => row.userId === rptShopId)
+          && Number(metaBody.withoutTelegramId) >= 1 && metaBody.botConfigured === true
+          && metaBody.telegramEnabled === true,
+        `recipients=${JSON.stringify(metaBody.recipients)} without=${metaBody.withoutTelegramId}`);
+
+      const wildR = await request('PATCH', '/api/admin/settings/telegram', {
+        cookies, csrf, body: { dailyReportHour: 71, dailyReportMinute: -5, dailyReportDaysAhead: 999 },
+      });
+      const wildSaved = wildR.json?.data?.saved || {};
+      check('an impossible hour, minute or days-ahead is clamped, not stored',
+        wildR.status === 200 && wildSaved.dailyReportHour === 23 && wildSaved.dailyReportMinute === 0
+          && wildSaved.dailyReportDaysAhead === 30,
+        `saved=${JSON.stringify(wildSaved)}`);
+
+      const offR = await request('PATCH', '/api/admin/settings/telegram', {
+        cookies, csrf, body: { dailyReportResellers: false, dailyReportOwner: false },
+      });
+      check('both delivery switches persist',
+        offR.status === 200 && offR.json?.data?.saved?.dailyReportResellers === false
+          && offR.json?.data?.saved?.dailyReportOwner === false,
+        `status=${offR.status}`);
+      const offSend = await request('POST', '/api/admin/reports/daily/send', { cookies, csrf, body: {} });
+      const offSummary = offSend.json?.data || {};
+      check('with both switches off nothing is attempted and the reason is written down',
+        offSend.status === 200 && offSummary.attempted === 0 && offSummary.sent === 0 && offSummary.failed === 0
+          && (offSummary.results || []).length >= 1
+          && (offSummary.results || []).every((row) => row.sent === false && String(row.reason).includes('خاموش'))
+          && offSummary.owner && offSummary.owner.sent === false,
+        `summary=${JSON.stringify({ attempted: offSummary.attempted, first: (offSummary.results || [])[0], owner: offSummary.owner })}`);
+
+      // One attempt per recipient per day: the rows below say "already delivered",
+      // so the run must skip every one of them rather than send a second message.
+      const markSent = rptDb.prepare(
+        `INSERT INTO daily_reports (user_id, kind, day, chat_id, ok, error, stats, sent_at)
+         VALUES (?, 'reseller', ?, ?, 1, '', '{}', ?)
+         ON CONFLICT(user_id, kind, day) DO UPDATE SET ok = 1, sent_at = excluded.sent_at`
+      );
+      for (const row of metaBody.recipients || []) markSent.run(row.userId, rptDay, row.telegramId, Date.now());
+      await request('PATCH', '/api/admin/settings/telegram', { cookies, csrf, body: { dailyReportResellers: true } });
+      const skipSend = await request('POST', '/api/admin/reports/daily/send', { cookies, csrf, body: {} });
+      const skipSummary = skipSend.json?.data || {};
+      check('a second run the same day skips everyone already delivered to, and sends nothing again',
+        skipSend.status === 200 && skipSummary.attempted === 0 && skipSummary.sent === 0
+          && skipSummary.skipped === (skipSummary.results || []).length
+          && skipSummary.skipped >= 1
+          && (skipSummary.results || []).every((row) => String(row.reason).includes('امروز ارسال شده بود')),
+        `skipped=${skipSummary.skipped} of ${(skipSummary.results || []).length}`);
+
+      const histR = await request('GET', '/api/admin/reports/daily', { cookies, csrf });
+      const histRows = histR.json?.data?.history || [];
+      check('the delivery history shows the day each report belongs to',
+        histRows.length >= 1 && histRows.every((row) => row.day === rptDay)
+          && histRows.some((row) => row.ok === true && row.kind === 'reseller'),
+        `rows=${histRows.length} day=${rptDay}`);
+      const resetR = await request('POST', '/api/admin/reports/daily/reset', { cookies, csrf, body: { day: rptDay } });
+      const histAfter = await request('GET', '/api/admin/reports/daily', { cookies, csrf });
+      check('the reset clears exactly the day it is given, so a re-run is possible',
+        resetR.status === 200 && !(histAfter.json?.data?.history || []).some((row) => row.day === rptDay),
+        `left=${(histAfter.json?.data?.history || []).length}`);
+
+      const noIdR = await request('POST', '/api/admin/reports/daily/send', { cookies, csrf, body: { userId: shopId } });
+      check('sending to a reseller who never gave a telegram id is refused before anything is built',
+        noIdR.status === 422 && noIdR.json?.error?.code === 'telegram_id_required',
+        `status=${noIdR.status} code=${noIdR.json?.error?.code}`);
+      const ghostR = await request('GET', '/api/admin/reports/daily/987654/preview', { cookies, csrf });
+      check('a preview of a reseller who does not exist says so', ghostR.status === 404, `status=${ghostR.status}`);
+      const shopReport = await request('GET', '/api/admin/reports/daily', { cookies: shopCookies, csrf: shopCsrf });
+      check('a reseller cannot read the fleet report', shopReport.status === 403, `status=${shopReport.status}`);
+    } finally {
+      if (rptShopId) {
+        for (const row of rptDb.prepare('SELECT id FROM configs WHERE user_id = ?').all(rptShopId)) {
+          rptDb.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(Number(row.id));
+        }
+        rptDb.prepare('DELETE FROM usage_daily WHERE user_id = ?').run(rptShopId);
+        rptDb.prepare('DELETE FROM daily_reports WHERE user_id = ?').run(rptShopId);
+        rptDb.prepare('DELETE FROM configs WHERE user_id = ?').run(rptShopId);
+        rptDb.prepare('DELETE FROM users WHERE id = ?').run(rptShopId);
+      }
+      if (rptDay) rptDb.prepare('DELETE FROM daily_reports WHERE day = ?').run(rptDay);
+      rptDb.close();
+      for (const email of rptEmails) mockXui.clients.delete(email);
+      await request('PATCH', '/api/admin/settings/telegram', {
+        cookies, csrf,
+        body: {
+          dailyReportEnabled: false, dailyReportHour: 23, dailyReportMinute: 0, dailyReportDaysAhead: 3,
+          dailyReportResellers: true, dailyReportOwner: true,
+        },
+      });
+      if (rptTimerParked) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
     }
 
     const v1Bad = await request('GET', '/api/v1/me', { headers: { 'x-api-key': 'sc_invalid' } });

@@ -16,6 +16,7 @@ const pricing = require('../services/pricing');
 const statsService = require('../services/stats');
 const backupService = require('../services/backup');
 const telegram = require('../services/telegram');
+const reports = require('../services/reports');
 const monitor = require('../services/monitor');
 const ticketsService = require('../services/tickets');
 const notify = require('../notify');
@@ -795,6 +796,19 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     if (clean.minute !== undefined) clean.minute = Math.min(59, Math.max(0, num(clean.minute, 30)));
     if (clean.keep !== undefined) clean.keep = Math.min(60, Math.max(1, num(clean.keep, 14)));
   }
+  if (section === 'telegram') {
+    // The nightly report schedule lives in this section, and the same rule that
+    // protects the backup hour applies to it: a partial save may not zero it.
+    if (clean.dailyReportHour !== undefined) clean.dailyReportHour = Math.min(23, Math.max(0, num(clean.dailyReportHour, 23)));
+    if (clean.dailyReportMinute !== undefined) clean.dailyReportMinute = Math.min(59, Math.max(0, num(clean.dailyReportMinute, 0)));
+    if (clean.dailyReportDaysAhead !== undefined) clean.dailyReportDaysAhead = Math.min(30, Math.max(1, num(clean.dailyReportDaysAhead, 3)));
+    for (const key of ['dailyReportEnabled', 'dailyReportResellers', 'dailyReportOwner']) {
+      if (clean[key] !== undefined) clean[key] = Boolean(clean[key]);
+    }
+    if (clean.dailyReportEnabled === true && !String(clean.botToken || telegram.config().botToken || '').trim()) {
+      throw new ApiError(422, 'telegram_not_configured', 'برای گزارش شبانه ابتدا توکن ربات را ذخیره کنید / Save the bot token before switching the nightly report on');
+    }
+  }
   if (section === 'security') {
     if (clean.sessionDays !== undefined) clean.sessionDays = Math.min(90, Math.max(1, num(clean.sessionDays, 7)));
     if (clean.loginRateLimit !== undefined) clean.loginRateLimit = Math.min(100, Math.max(3, num(clean.loginRateLimit, 10)));
@@ -855,6 +869,63 @@ router.post('/settings/test-telegram', auth.requirePerm('settings'), asyncH(asyn
   const result = await telegram.test();
   res.json({ ok: true, data: result });
 }));
+
+// --------------------------------------------------- nightly telegram report
+
+router.get('/reports/daily', auth.requirePerm('settings'), (req, res) => {
+  const cfg = reports.reportConfig();
+  const tg = telegram.config();
+  res.json({
+    ok: true,
+    data: {
+      schedule: cfg,
+      botConfigured: Boolean(cfg.botToken),
+      panelChatConfigured: Boolean(cfg.panelChatId),
+      telegramEnabled: tg.enabled,
+      recipients: reports.recipients().map((row) => ({
+        userId: Number(row.id),
+        username: row.username,
+        name: row.name || '',
+        telegramId: String(row.telegram_id || ''),
+      })),
+      withoutTelegramId: getDb().prepare(
+        "SELECT COUNT(*) AS c FROM users WHERE role = 'reseller' AND status = 'active' AND deleted_at = 0 AND telegram_id = ''"
+      ).get().c,
+      history: reports.history(30),
+    },
+  });
+});
+
+// The preview is the honest way to read the message before anything is sent: it
+// runs the same code the nightly timer runs, and writes nothing.
+router.get('/reports/daily/:userId/preview', auth.requirePerm('settings'), (req, res) => {
+  res.json({ ok: true, data: reports.preview(Number(req.params.userId)) });
+});
+
+router.post('/reports/daily/send', auth.requirePerm('settings'), asyncH(async (req, res) => {
+  const body = req.body || {};
+  const userId = Number(body.userId || 0);
+  if (userId) {
+    const built = reports.preview(userId);
+    if (!built.telegramId) throw new ApiError(422, 'telegram_id_required', 'ابتدا شناسه عددی تلگرام این نماینده را ثبت کنید / No Telegram ID is saved for this reseller');
+    await telegram.sendMessageTo(built.telegramId, built.text);
+    reports.recordSend(userId, 'reseller', built.day, built.telegramId, true, '', built.stats);
+    audit(req, 'report.daily_send', 'user', userId, { day: built.day, chatId: built.telegramId });
+    return res.json({ ok: true, data: { sent: 1, failed: 0, results: [{ userId, username: built.username, chatId: built.telegramId, sent: true }] } });
+  }
+  const summary = await reports.sendDaily({ force: Boolean(body.force) });
+  audit(req, 'report.daily_send_all', 'settings', 'daily_report', {
+    day: summary.day, sent: summary.sent, failed: summary.failed, skipped: summary.skipped,
+  });
+  return res.json({ ok: true, data: summary });
+}));
+
+router.post('/reports/daily/reset', auth.requirePerm('settings'), (req, res) => {
+  const day = String(req.body?.day || '');
+  getDb().prepare('DELETE FROM daily_reports WHERE day = ?').run(day);
+  audit(req, 'report.daily_reset', 'settings', 'daily_report', { day });
+  res.json({ ok: true, data: { day } });
+});
 
 // ---------------------------------------------------------------- backups
 

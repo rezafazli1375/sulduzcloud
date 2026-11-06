@@ -2,9 +2,11 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   BellRing,
+  CalendarClock,
   CheckCircle2,
   CreditCard,
   DatabaseBackup,
+  Eye,
   Globe2,
   KeyRound,
   Lock,
@@ -21,10 +23,12 @@ import { useAuth } from '../../lib/auth.jsx';
 import { useI18n, translateError } from '../../lib/i18n.jsx';
 import { api } from '../../lib/api.js';
 import {
+  Badge,
   Button,
   ErrorState,
   Field,
   Input,
+  Modal,
   PageHeader,
   SectionCard,
   Select,
@@ -152,6 +156,40 @@ export default function Settings() {
     onError: (err) => toast.error(err?.message || t('errors.generic')),
   });
 
+  // ---- the nightly report -------------------------------------------------
+  // `daily` is the read model the schedule card, the recipient list and the
+  // delivery history all come from; it only runs on the Telegram tab.
+  const daily = useQuery({
+    queryKey: ['daily-report'],
+    queryFn: () => api.get('/admin/reports/daily'),
+    enabled: tab === 'telegram',
+  });
+  const [reportPreview, setReportPreview] = useState(null);
+
+  // Preview runs the exact same builder the nightly timer runs and writes
+  // nothing, so the owner can read tonight's message before it exists.
+  const previewReport = useMutation({
+    mutationFn: (userId) => api.get(`/admin/reports/daily/${userId}/preview`),
+    onSuccess: (result) => setReportPreview(result || null),
+    onError: (err) => toast.error(translateError(err, t)),
+  });
+
+  const sendReport = useMutation({
+    mutationFn: (body) => api.post('/admin/reports/daily/send', body),
+    onSuccess: (result) => {
+      const sent = Number(result?.sent ?? 0);
+      const failed = Number(result?.failed ?? 0);
+      const skipped = Number(result?.skipped ?? 0);
+      toast.success(
+        `${t('settings.telegram.sentTo')} · ${t('settings.telegram.historyOk')} ${sent}`
+        + ` · ${t('settings.telegram.historyFail')} ${failed}`
+        + (skipped ? ` · ${skipped}` : '')
+      );
+      daily.refetch();
+    },
+    onError: (err) => toast.error(translateError(err, t)),
+  });
+
   const patch = (section, field, value) => {
     setLocal((prev) => ({ ...prev, [section]: { ...prev[section], [field]: value } }));
   };
@@ -196,6 +234,10 @@ export default function Settings() {
   const backup = local.backup || {};
   const telegram = local.telegram || {};
   const security = local.security || {};
+  // Read model of the nightly report: schedule, recipients and delivery history.
+  const rep = daily.data || {};
+  const repRows = rep.recipients || [];
+  const repHistory = rep.history || [];
   const savingSection = save.isPending ? save.variables?.section : null;
 
   return (
@@ -579,6 +621,7 @@ export default function Settings() {
       ) : null}
 
       {tab === 'telegram' ? (
+        <>
         <SectionCard
           icon={Send}
           title={t('settings.tabs.telegram')}
@@ -625,6 +668,64 @@ export default function Settings() {
               <Send className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300/80" />
               <p>{t('settings.telegram.createHint')}</p>
             </div>
+
+            {/* ---- nightly report: schedule ---- */}
+            <div className={cx('space-y-4 border-t border-white/[0.06] pt-4', !telegram.dailyReportEnabled && 'opacity-45')}>
+              <SwitchRow
+                label={t('settings.telegram.dailyEnabled')}
+                hint={t('settings.telegram.dailyEnabledHint')}
+                checked={telegram.dailyReportEnabled}
+                onChange={(value) => patch('telegram', 'dailyReportEnabled', value)}
+              />
+              <div className="grid gap-4 sm:grid-cols-3">
+                <Field label={t('settings.telegram.dailyHour')} hint="0 – 23">
+                  <Input
+                    type="number"
+                    min="0"
+                    max="23"
+                    dir="ltr"
+                    value={telegram.dailyReportHour ?? 23}
+                    onChange={(e) => patch('telegram', 'dailyReportHour', e.target.value)}
+                  />
+                </Field>
+                <Field label={t('settings.telegram.dailyMinute')} hint="0 – 59">
+                  <Input
+                    type="number"
+                    min="0"
+                    max="59"
+                    dir="ltr"
+                    value={telegram.dailyReportMinute ?? 0}
+                    onChange={(e) => patch('telegram', 'dailyReportMinute', e.target.value)}
+                  />
+                </Field>
+                <Field label={t('settings.telegram.dailyAhead')} hint={t('settings.telegram.dailyAheadHint')}>
+                  <Input
+                    type="number"
+                    min="1"
+                    max="30"
+                    dir="ltr"
+                    value={telegram.dailyReportDaysAhead ?? 3}
+                    onChange={(e) => patch('telegram', 'dailyReportDaysAhead', e.target.value)}
+                  />
+                </Field>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <SwitchRow
+                  label={t('settings.telegram.dailyResellers')}
+                  hint={t('settings.telegram.dailyResellersHint')}
+                  checked={telegram.dailyReportResellers !== false}
+                  onChange={(value) => patch('telegram', 'dailyReportResellers', value)}
+                />
+                <SwitchRow
+                  label={t('settings.telegram.dailyOwner')}
+                  hint={t('settings.telegram.dailyOwnerHint')}
+                  checked={telegram.dailyReportOwner !== false}
+                  onChange={(value) => patch('telegram', 'dailyReportOwner', value)}
+                />
+              </div>
+              <p className="text-[10.5px] leading-5 text-slate-500">{t('settings.telegram.dailyContent')}</p>
+            </div>
+
             <SaveBar
               saving={savingSection === 'telegram'}
               onSave={() => save.mutate({ section: 'telegram', payload: telegram })}
@@ -637,6 +738,136 @@ export default function Settings() {
             />
           </div>
         </SectionCard>
+
+        {/* ---- nightly report: who gets it, what it said, did it arrive ---- */}
+        <SectionCard
+          icon={CalendarClock}
+          title={t('settings.telegram.dailyTitle')}
+          subtitle={telegram.dailyReportEnabled
+            ? `${String(telegram.dailyReportHour ?? 23).padStart(2, '0')}:${String(telegram.dailyReportMinute ?? 0).padStart(2, '0')} · ${repRows.length}`
+            : t('settings.telegram.dailyOffHint')}
+          actions={(
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="ghost" icon={RefreshCw} loading={daily.isFetching} onClick={() => daily.refetch()}>
+                {t('common.refresh')}
+              </Button>
+              <Button
+                size="sm"
+                icon={Send}
+                loading={sendReport.isPending && !sendReport.variables?.userId}
+                disabled={!repRows.length}
+                onClick={() => sendReport.mutate({ force: true })}
+              >
+                {t('settings.telegram.sendAll')}
+              </Button>
+            </div>
+          )}
+        >
+          <div className="space-y-4">
+            {daily.isLoading ? <Skeleton className="h-48" /> : null}
+            {daily.isError ? <ErrorState message={daily.error?.message} onRetry={daily.refetch} /> : null}
+            {!daily.isLoading && !daily.isError ? (
+              <>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone={rep.botConfigured ? 'emerald' : 'rose'} dot>{t('settings.telegram.botToken')}</Badge>
+                  <Badge tone={rep.panelChatConfigured ? 'emerald' : 'rose'} dot>{t('settings.telegram.chatId')}</Badge>
+                  <Badge tone="slate">{`${t('settings.telegram.withoutTelegramId')}: ${rep.withoutTelegramId ?? 0}`}</Badge>
+                </div>
+                {!rep.botConfigured ? <p className="text-[10.5px] leading-5 text-amber-200/80">{t('settings.telegram.botMissing')}</p> : null}
+                {!rep.panelChatConfigured && telegram.dailyReportOwner !== false
+                  ? <p className="text-[10.5px] leading-5 text-amber-200/80">{t('settings.telegram.chatMissing')}</p>
+                  : null}
+
+                <div className="divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.07]">
+                  {repRows.length ? repRows.map((row) => (
+                    <div key={row.userId} className="flex flex-wrap items-center justify-between gap-3 px-3.5 py-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-[12.5px] font-medium text-slate-200">
+                          {row.username}{row.name && row.name !== row.username ? ` · ${row.name}` : ''}
+                        </p>
+                        <p className="mt-0.5 truncate font-mono text-[10.5px] text-slate-500" dir="ltr">{row.telegramId || '—'}</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          icon={Eye}
+                          loading={previewReport.isPending && previewReport.variables === row.userId}
+                          onClick={() => previewReport.mutate(row.userId)}
+                        >
+                          {t('settings.telegram.preview')}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          icon={Send}
+                          disabled={!/^-?\d+$/.test(String(row.telegramId || ''))}
+                          loading={sendReport.isPending && Number(sendReport.variables?.userId || 0) === Number(row.userId)}
+                          onClick={() => sendReport.mutate({ userId: row.userId })}
+                        >
+                          {t('settings.telegram.sendNow')}
+                        </Button>
+                      </div>
+                    </div>
+                  )) : <p className="px-3.5 py-4 text-[11.5px] leading-5 text-slate-500">{t('settings.telegram.noRecipients')}</p>}
+                </div>
+
+                <div>
+                  <p className="mb-2 text-[11px] font-medium text-slate-400">{t('settings.telegram.history')}</p>
+                  {repHistory.length ? (
+                    <div className="space-y-1">
+                      {repHistory.slice(0, 14).map((item) => {
+                        const who = item.kind === 'owner'
+                          ? t('settings.telegram.historyKindOwner')
+                          : (repRows.find((row) => Number(row.userId) === Number(item.userId))?.username || `#${item.userId}`);
+                        return (
+                          <div
+                            key={item.id}
+                            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/[0.05] bg-white/[0.02] px-3 py-2 text-[10.5px]"
+                          >
+                            <span className="font-mono text-slate-400" dir="ltr">{`${item.day} · ${who}`}</span>
+                            <span className={cx('min-w-0 truncate', item.ok ? 'text-emerald-300/80' : 'text-rose-300/80')}>
+                              {item.ok ? t('settings.telegram.historyOk') : `${t('settings.telegram.historyFail')} · ${item.error || '—'}`}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : <p className="text-[10.5px] leading-5 text-slate-500">{t('settings.telegram.noHistory')}</p>}
+                </div>
+              </>
+            ) : null}
+          </div>
+        </SectionCard>
+
+        <Modal
+          open={Boolean(reportPreview)}
+          onClose={() => setReportPreview(null)}
+          title={t('settings.telegram.previewTitle')}
+          subtitle={`${reportPreview?.username || ''} · ${reportPreview?.day || ''}`}
+          footer={(
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-[10.5px] leading-5 text-slate-500">{t('settings.telegram.previewHint')}</p>
+              <Button
+                size="sm"
+                icon={Send}
+                disabled={!/^-?\d+$/.test(String(reportPreview?.telegramId || ''))}
+                loading={sendReport.isPending && Number(sendReport.variables?.userId || 0) === Number(reportPreview?.userId || 0)}
+                onClick={() => sendReport.mutate({ userId: reportPreview?.userId })}
+              >
+                {t('settings.telegram.sendNow')}
+              </Button>
+            </div>
+          )}
+        >
+          <pre
+            dir="rtl"
+            className="max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-xl border border-white/[0.07] bg-black/30 p-3.5 text-[11.5px] leading-6 text-slate-200"
+          >
+            {String(reportPreview?.text || '—').replace(/<\/?(?:b|i|code|u|s|strike|blockquote)>/gi, '')}
+          </pre>
+        </Modal>
+        </>
       ) : null}
 
       {tab === 'security' ? (

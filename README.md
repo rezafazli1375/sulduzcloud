@@ -4,7 +4,7 @@
 
 A bilingual (Persian/English) reseller & config management panel for 3x-ui, with a premium dark UI, per-reseller limits, wallet, tickets, live node status, backups and a reseller REST API.
 
-Version 1.4.26 · Node.js 20+ · SQLite · React 18 · multi-panel
+Version 1.4.27 · Node.js 20+ · SQLite · React 18 · multi-panel
 
 ---
 
@@ -43,6 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/inst
 - پنل‌های x-ui متعدد: افزودن/ویرایش/حذف چند پنل ۳x-ui هم‌زمان؛ هر اینباند و کانفیگ به سرور خودش وصل است، همگام‌سازی و پایش جدا برای هر پنل، نمایش زندهٔ مصرف پردازنده/رم/دیسک هر سرور. حذف تنها سرورِ باقی‌مانده مجاز است و پنل را به همان حالت خام اول برمی‌گرداند؛ سروری که هنوز کانفیگ فعال دارد حذف نمی‌شود تا کلاینت‌های زنده قطع نشوند
 - سرورها و نودها: وضعیت زنده پنل‌ها و نودها، تأخیر، موجودی منابع، بررسی فوری، هشدار قطعی از طریق ایمیل و پیامک (کاوه‌نگار، فراز اس‌ام‌اس یا سرویس سفارشی)
 - آمار و گزارش: روند ترافیک، درآمد، وضعیت کانفیگ‌ها، برترین نمایندگان، تراکنش‌ها
+- گزارش شبانهٔ تلگرام برای نماینده‌ها (سوییچش خاموش است مگر مدیر خودش روشن کند): هر شب در ساعت و دقیقهٔ انتخابی — به وقت پنل — برای هر نماینده که آیدی عددی تلگرامش در تنظیمات همان نماینده ثبت شده سه بخش فرستاده می‌شود: خرید امروز و موجودی باقی‌ماندهٔ کیف پول، اشتراک‌هایی که امروز تمام یا غیرفعال شدند، و اشتراک‌هایی که نزدیک اتمام‌اند (تاریخ یا حجم). یک خلاصهٔ کل نماینده‌ها هم برای مدیر می‌رود. هر ارسال در جدول `daily_reports` ثبت می‌شود تا ریستارت سرویس نتواند همان گزارش را دوباره بفرستد، و در تنظیمات پیش‌نمایش هر نماینده، ارسال دستی و تاریخچهٔ ارسال هست
 - تیکت‌ها، اطلاع‌رسانی گروهی (همه/مدیران/انتخابی)، تاریخچه ارسال
 - بکاپ: بکاپ دستی، بکاپ خودکار روزانه، نگهداری N نسخه، دانلود و بازگردانی
 - گزارش فعالیت (Audit log) برای عملیات حساس
@@ -54,6 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/inst
 - ساخت و تمدید کانفیگ با رعایت سقف‌ها، افزودن حجم/زمان؛ ریست مصرف فقط همراه تمدید و با پرداخت تعرفهٔ حجم جدید (ریست رایگان نماینده حذف شده و جایش دکمهٔ «بروزرسانی مصرف» از نود نشسته است)
 - لینک اشتراک، URI و QR برای هر کانفیگ
 - آمار مصرف، کیف پول و تراکنش‌ها، تیکت، اطلاعیه‌ها، پروفایل و تغییر رمز
+- آمار ترافیک روزانه از دفتر روزانهٔ خود پنل خوانده می‌شود: ۳x-ui فقط یک شمارندهٔ تجمعی می‌دهد، پس اختلاف آن روی روزهایی که مصرف واقعاً در آن‌ها افتاده تقسیم می‌شود (زمان‌بندی بر پایهٔ منطقهٔ زمانی پنل، حداکثر ۷ روز) — سکوت چندروزهٔ پنل دیگر به‌شکل یک روز پرحجم در آمار نمی‌آید
 - کلید API و مستندات REST برای اتصال فروشگاه/ربات
 
 **امنیت**
@@ -238,10 +240,13 @@ curl -H "X-API-Key: sc_xxx" https://panel.example.com/api/v1/me
 
 ```bash
 cd /opt/sulduzcloud/server
-npm run selftest
+npm run selftest        # راه‌اندازی، ورود/خروج، CSRF، بسته‌های چند‌اینباندی، تمدید، کیف پول، تیکت، بکاپ، لاگ فعالیت، کلید API
+npm run telegram-test   # دریافت اشتراک‌های موجود پنل‌ها بر اساس آیدی تلگرام
+npm run sms-test        # متن و پترن پیامک‌ها
+npm run report-test     # گزارش شبانهٔ تلگرام: ساخت متن، گیرنده‌ها، ارسال، دفتر روزانه
 ```
 
-تست خودکار ۴۲ مورد را پوشش می‌دهد: راه‌اندازی اولیه، ورود/خروج، ابطال نشست، CSRF، ساخت/تمدید/حذف کانفیگ، محدودیت‌ها، کیف پول، تیکت، بکاپ، لاگ فعالیت و کلید API. تست‌ها روی دیتابیس موقت اجرا می‌شوند.
+هر چهار تست روی دیتابیس موقت اجرا می‌شوند و تعداد موارد خودشان را در پایان چاپ می‌کنند. تست `report-test` فرستادن به تلگرام را با یک ضبط‌کنندهٔ محلی جایگزین می‌کند و دسترسی شبکه را هم می‌بندد، پس در هیچ اجرا از این چهار تست یک پیام واقعی به هیچ چتی فرستاده نمی‌شود.
 
 ### ساختار پروژه
 
@@ -253,9 +258,11 @@ server/
     db.js             SQLite + مایگریشن
     auth.js           JWT، CSRF، نشست‌ها
     settings.js       تنظیمات پیش‌فرض
-    services/         users, configs, inbounds, xui, stats, monitor, backup, mail, sms
+    services/         users, configs, inbounds, servers, pricing, stats, monitor,
+                      tickets, telegram, reports (گزارش شبانه), backup
     routes/           public, admin, reseller, apiV1
-  test/selftest.js
+    xui.js notify.js restore.js audit.js crypto.js utils.js
+  test/               selftest.js, telegram-import.js, sms-text.js, daily-report.js
 web/
   src/
     pages/            admin/, reseller/, auth/
@@ -279,7 +286,8 @@ Each reseller signs in with their own username/password and, within the limits t
 ### Feature highlights
 
 - **Admin**: dashboard KPIs, resellers with per-module permissions and quotas (configs, GB per config, total GB, IP limit, expiry, balance, API key, numeric Telegram id), configs on any inbound for any reseller (packages are listed as one customer row), multi-inbound packages built as ONE 3x-ui client attached to every inbound the customer bought — so his subscription link stays the node's own subscription address and lists all of his channels there; only a package that genuinely spans several clients (3x-ui rejects a subId shared by two clients) is served through one aggregated link on this panel, and a preview-then-confirm merge puts split packages back onto the customer's own client, renew/extend/toggle, a node-side usage refresh that changes nothing, subscription link + URI + QR, CSV export, client names shaped `<telegramId>-<random>` with automatic adoption of subscriptions that already live on the panels under that id, a per-reseller on/off switch plus a load/refresh button for that adoption (turning it off only hides the adopted rows; nothing is deleted from x-ui), legacy x-ui subscriptions kept separate from panel customers with their own "old" badge and source filter, inbound sync/visibility, multiple x-ui servers (add/edit/delete; deleting the last server returns the panel to its blank first-run state, while a server that still owns configs is protected so live clients are never cut), live per-panel server status with latency plus CPU/RAM/disk usage, and node status, email/SMS outage alarms (Kavenegar, FarazSMS or a custom endpoint), traffic & revenue reports, tickets, broadcast, manual/auto backups with retention and restore, audit log, settings (general, x-ui, monitoring, email, SMS, wallet, backups, security), and the app version + author (Sulduz Server Team) shown in the sidebar, login page and settings.
-- **Reseller**: self-service configs within limits, renew & add traffic, usage stats, wallet & transactions, tickets, notifications, profile/password, API keys with REST docs.
+- **Reseller**: self-service configs within limits, renew & add traffic, usage stats, wallet & transactions, tickets, notifications, profile/password, API keys with REST docs. Daily traffic comes from the panel's own day ledger: 3x-ui only exposes a cumulative counter, so the delta of a sync window is spread over the days it actually covers (panel-timezone midnights, seven days at most) instead of landing in one heap on the day the panel woke up.
+- **Nightly Telegram report (ships switched off)**: at the hour and minute the owner picks, in the panel timezone, every reseller whose numeric Telegram id is saved in his settings receives three sections — what he bought today and what is left in his wallet, the subscriptions that ended or ran out today, and the ones about to end by date or by shared volume — plus a fleet digest for the owner. Each attempt is remembered per recipient per day, so a restart cannot send the same report twice; the settings page has the schedule, both role switches, a preview of every message, a manual send and the delivery history.
 - **Security**: JWT in HttpOnly cookie, CSRF double-submit, bcrypt, session revocation, login rate limit, Helmet, zod validation, audit log, per-key API rate limit.
 - **UI**: full fa/en with RTL/LTR, locally bundled Vazirmatn, premium dark theme, charts, skeletons, toasts, responsive mobile layout.
 
@@ -315,7 +323,16 @@ Environment variables, the systemd unit and the nginx sample are documented in t
 cd server && npm run selftest
 ```
 
-The self-test suite reports its own check count on every run (v1.4.21 covers setup, auth, session revocation, CSRF, multi-panel management, one-client packages — create, add a channel, take one off, rotate the subscription id, merge a package that was split over two clients (the client that holds only the reseller's fixed inbound is the copy that goes, the customer's own client survives and receives that channel), and refuse to delete a duplicate when the node refused the attach — quota pooling, renewal and the subscription address (a customer is always handed the node's own link for his x-ui client — the panel only falls back to its aggregated `/api/sub/<token>` address when the server has no subscription base, and keeps serving that route for customers who already hold it), plus rebuilding a customer whose x-ui client was deleted on the node (one client back, same email/uuid/subscription id, every channel of the package on it) all against a mock 3x-ui that enforces the real subId uniqueness rule and the real attachment rule (a channel only moves with `clients/bulkAttach` / `clients/<email>/detach`; `clients/update` rewrites the client where it already lives and ignores a channel it is not in yet, and a client that is not on the panel answers "record not found"), plus wallet charges, quotas, tickets, backups, audit log and API keys) on a temporary database.
+`selftest` covers setup, auth, session revocation, CSRF and multi-panel management; one-client packages (create, add a channel, take one off, rotate the subscription id, merge a package that was split over two clients — the client that holds only the reseller's fixed inbound is the copy that goes, the customer's own client survives and receives that channel — and refuse to delete a duplicate when the node refused the attach); quota pooling; renewal and the subscription address (a customer is always handed the node's own link for his x-ui client, and the panel only falls back to its aggregated `/api/sub/<token>` address when the server has no subscription base); rebuilding a customer whose x-ui client was deleted on the node; the renewal-charging policy and the replacement reset that a reseller can no longer get for free; wallet charges, quotas, tickets, backups, the audit log and API keys. It runs against a mock 3x-ui that enforces the real subId uniqueness rule and the real attachment rule (a channel only moves with `clients/bulkAttach` / `clients/<email>/detach`; `clients/update` rewrites the client where it already lives and ignores a channel it is not in yet, and a client that is not on the panel answers "record not found").
+
+```bash
+cd server
+npm run telegram-test   # adopting the subscriptions that already live on the panels, by Telegram id
+npm run sms-test        # SMS text and pattern rendering
+npm run report-test     # the nightly report: its three sections, its recipients, its delivery ledger
+```
+
+Every suite runs on a temporary database and reports its own check count when it finishes. `report-test` replaces the Telegram transport with an in-process recorder and refuses every network call, so no test run can ever put a real message into a real chat.
 
 ### License
 

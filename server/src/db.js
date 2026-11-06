@@ -189,6 +189,22 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read_at, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(dedupe_key) WHERE dedupe_key IS NOT NULL;
 
+-- One row per nightly report actually attempted, so a panel that restarts
+-- minutes before the scheduled hour cannot send the same report twice.
+CREATE TABLE IF NOT EXISTS daily_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL DEFAULT 'reseller',
+  day TEXT NOT NULL,
+  chat_id TEXT NOT NULL DEFAULT '',
+  ok INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT '',
+  stats TEXT NOT NULL DEFAULT '{}',
+  sent_at INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(user_id, kind, day)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_reports_day ON daily_reports(day, kind);
+
 CREATE TABLE IF NOT EXISTS broadcasts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,

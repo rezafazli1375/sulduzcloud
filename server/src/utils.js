@@ -16,21 +16,191 @@ function nowMs() {
   return Date.now();
 }
 
-function dayKey(ts = Date.now()) {
-  try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: config.timezone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(new Date(ts));
-  } catch (_) {
-    return new Date(ts).toISOString().slice(0, 10);
-  }
+function dayKey(ts = Date.now(), timeZone = config.timezone) {
+  return zonedDayLabel(Number(ts) || Date.now(), timeZone)
+    || new Date(ts).toISOString().slice(0, 10);
 }
 
 function addDaysMs(baseMs, days) {
   return Number(baseMs || 0) + Math.round(Number(days || 0) * 86400000);
+}
+
+const DAY_MS = 86400000;
+const HOUR_MS = 3600000;
+
+// Building an Intl.DateTimeFormat costs ~0.6 ms on the live box while using one
+// costs ~0.014 ms, and the day arithmetic below runs on every x-ui client the
+// sync cycle touches. So the formatters are built once per timezone and reused.
+const formatCache = new Map();
+
+function cachedFormat(kind, timeZone) {
+  const key = `${kind}|${timeZone}`;
+  let fmt = formatCache.get(key);
+  if (fmt) return fmt;
+  const base = { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit' };
+  const options = kind === 'day'
+    ? base
+    : { ...base, hour: '2-digit', minute: '2-digit', second: '2-digit' };
+  fmt = new Intl.DateTimeFormat(kind === 'day' ? 'en-CA' : 'en-US', { ...options, timeZone });
+  if (formatCache.size > 64) formatCache.clear();
+  formatCache.set(key, fmt);
+  return fmt;
+}
+
+function zonedParts(ts, timeZone = config.timezone) {
+  try {
+    const parts = cachedFormat('day', timeZone).formatToParts(new Date(ts));
+    const pick = (type) => Number(parts.find((p) => p.type === type)?.value);
+    const year = pick('year');
+    const month = pick('month');
+    const day = pick('day');
+    if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+    return { year, month, day };
+  } catch (_) {
+    return null;
+  }
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+// 'YYYY-MM-DD' from a zonedParts() reading, or '' when the reading failed.
+function zonedDayLabelFromParts(parts) {
+  if (!parts) return '';
+  return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)}`;
+}
+
+// 'YYYY-MM-DD' of the zoned calendar day holding `ts`, or '' for a zone the
+// runtime does not know. This is the same label dayKey() stores in the ledger.
+function zonedDayLabel(ts, timeZone = config.timezone) {
+  return zonedDayLabelFromParts(zonedParts(ts, timeZone));
+}
+
+// How far ahead of UTC the wall clock reads at instant `ts` (ms), for a timezone.
+// A zone's offset is constant inside an hour everywhere this panel runs (Iran
+// dropped DST in 2022 and Tehran is the default), so it is memoised per hour.
+const offsetCache = new Map();
+
+function zonedOffsetMs(ts, timeZone = config.timezone) {
+  const at = Number(ts);
+  if (!Number.isFinite(at)) return 0;
+  const key = `${timeZone}|${Math.floor(at / HOUR_MS)}`;
+  const hit = offsetCache.get(key);
+  if (hit !== undefined) return hit;
+  let offset = 0;
+  try {
+    const parts = cachedFormat('full', timeZone).formatToParts(new Date(at));
+    const get = (type) => Number(parts.find((p) => p.type === type)?.value);
+    const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second'));
+    offset = asUtc - Math.floor(at / 1000) * 1000;
+  } catch (_) {
+    offset = 0;
+  }
+  if (offsetCache.size > 4096) offsetCache.clear();
+  offsetCache.set(key, offset);
+  return offset;
+}
+
+// UTC instant of wall-clock midnight that opens the given zoned calendar day.
+// Solved against the guess so a zone that observes DST still gets its real
+// 23/24/25-hour day instead of a flat 86400000 ms bucket. A calendar day has
+// exactly one midnight, so the answer is worth remembering: the sync cycle asks
+// for the same handful of days once per client.
+const dayStartCache = new Map();
+
+function utcOfZonedDay(year, month, day, timeZone = config.timezone) {
+  const key = `${timeZone}|${year}-${pad2(month)}-${pad2(day)}`;
+  const hit = dayStartCache.get(key);
+  if (hit !== undefined) return hit;
+  const naive = Date.UTC(year, month - 1, day);
+  let guess = naive;
+  for (let i = 0; i < 4; i += 1) {
+    const next = naive - zonedOffsetMs(guess, timeZone);
+    if (next === guess) break;
+    guess = next;
+  }
+  if (dayStartCache.size > 4096) dayStartCache.clear();
+  dayStartCache.set(key, guess);
+  return guess;
+}
+
+function nextZonedDay(parts) {
+  const next = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + 1));
+  return { year: next.getUTCFullYear(), month: next.getUTCMonth() + 1, day: next.getUTCDate() };
+}
+
+function zonedDayStartMs(ts = Date.now(), timeZone = config.timezone) {
+  const at = Number(ts);
+  if (!Number.isFinite(at)) return NaN;
+  const parts = zonedParts(at, timeZone);
+  if (!parts) return Math.floor(at / DAY_MS) * DAY_MS;
+  return utcOfZonedDay(parts.year, parts.month, parts.day, timeZone);
+}
+
+// Wall-clock midnight that CLOSES the zoned day containing `ts`, i.e. the first
+// midnight strictly after it.
+function zonedDayEndMs(ts = Date.now(), timeZone = config.timezone) {
+  const at = Number(ts);
+  if (!Number.isFinite(at)) return NaN;
+  const parts = zonedParts(at, timeZone);
+  if (!parts) return Math.floor(at / DAY_MS) * DAY_MS + DAY_MS;
+  const next = nextZonedDay(parts);
+  return utcOfZonedDay(next.year, next.month, next.day, timeZone);
+}
+
+/**
+ * Split [fromMs, toMs) into the zoned calendar days it touches.
+ * Returns [{ day: 'YYYY-MM-DD', from, to, ms }] oldest first, contiguous, and
+ * covering exactly the window handed in. An empty or inverted window gives [].
+ */
+function daySlices(fromMs, toMs, timeZone = config.timezone) {
+  const from = Math.floor(Number(fromMs) || 0);
+  const to = Math.floor(Number(toMs) || 0);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return [];
+  const slices = [];
+  let cursor = from;
+  while (cursor < to && slices.length < 400) {
+    // One read of the clock for both the day's label and the midnight that
+    // closes it, in the zone we were asked for (not the panel default).
+    const parts = zonedParts(cursor, timeZone);
+    if (!parts) return [];
+    const next = nextZonedDay(parts);
+    let end = utcOfZonedDay(next.year, next.month, next.day, timeZone);
+    // A broken/unknown zone must never spin: fall back to a UTC-day boundary.
+    if (!Number.isFinite(end) || end <= cursor) end = Math.floor(cursor / DAY_MS) * DAY_MS + DAY_MS;
+    const stop = Math.min(to, end);
+    slices.push({ day: zonedDayLabelFromParts(parts), from: cursor, to: stop, ms: stop - cursor });
+    cursor = stop;
+  }
+  return slices;
+}
+
+/**
+ * Spread bytes that were only noticed NOW over the days they were actually
+ * transferred in. x-ui gives a cumulative counter, so the panel can only know
+ * the total moved between two reads, not when inside that window each byte went;
+ * the honest reading is to share it by elapsed time and keep the total exact.
+ * Everything is booked: the slices always add up to `up` and `down`.
+ * Returns [{ day, up, down }] with zero-bytes slices dropped.
+ */
+function spreadAcrossDays(fromMs, toMs, up, down, timeZone = config.timezone) {
+  const totalUp = Math.max(0, Math.round(Number(up) || 0));
+  const totalDown = Math.max(0, Math.round(Number(down) || 0));
+  if (totalUp === 0 && totalDown === 0) return [];
+  const slices = daySlices(fromMs, toMs, timeZone);
+  if (!slices.length) return [];
+  const span = slices.reduce((sum, slice) => sum + slice.ms, 0) || 1;
+  const out = [];
+  let putUp = 0;
+  let putDown = 0;
+  for (let i = 0; i < slices.length; i += 1) {
+    const last = i === slices.length - 1;
+    const sliceUp = last ? totalUp - putUp : Math.floor((totalUp * slices[i].ms) / span);
+    const sliceDown = last ? totalDown - putDown : Math.floor((totalDown * slices[i].ms) / span);
+    putUp += sliceUp;
+    putDown += sliceDown;
+    if (sliceUp > 0 || sliceDown > 0) out.push({ day: slices[i].day, up: sliceUp, down: sliceDown });
+  }
+  return out;
 }
 
 function gbToBytes(gb) {
@@ -330,6 +500,14 @@ module.exports = {
   nowMs,
   dayKey,
   addDaysMs,
+  zonedParts,
+  zonedDayLabel,
+  zonedOffsetMs,
+  nextZonedDay,
+  zonedDayStartMs,
+  zonedDayEndMs,
+  daySlices,
+  spreadAcrossDays,
   gbToBytes,
   bytesToGb,
   randomToken,

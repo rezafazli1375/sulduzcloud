@@ -92,6 +92,16 @@ const DEFAULTS = {
     botToken: '',
     chatId: '',
     sendOnAuto: true,
+    // Nightly report. The hour/minute are wall-clock times in the timezone the
+    // traffic ledger itself is bucketed by (PANEL_TZ, Asia/Tehran by default), so
+    // "today" in the message is the same day the dashboard chart calls today.
+    dailyReportEnabled: false,
+    dailyReportHour: 23,
+    dailyReportMinute: 0,
+    dailyReportResellers: true,
+    dailyReportOwner: true,
+    // How far ahead "نزدیک به اتمام" looks, in days.
+    dailyReportDaysAhead: 3,
   },
   security: {
     sessionDays: 7,

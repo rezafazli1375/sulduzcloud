@@ -18,6 +18,7 @@ const auth = require('./auth');
 const monitor = require('./services/monitor');
 const backupService = require('./services/backup');
 const telegram = require('./services/telegram');
+const reports = require('./services/reports');
 const usersService = require('./services/users');
 const { ApiError, dayKey, log, logError } = require('./utils');
 
@@ -164,6 +165,35 @@ function startAutoBackupTimer() {
   }, 60000).unref();
 }
 
+function startDailyReportTimer() {
+  // One attempt per day per process; the daily_reports table is what makes the
+  // same true across a restart.
+  let attemptedDay = '';
+  setInterval(async () => {
+    try {
+      const cfg = reports.reportConfig();
+      if (!cfg.enabled) return;
+      // The report is about the traffic ledger, so it is triggered on the same
+      // wall clock usage_daily is bucketed by (PANEL_TZ), not the server clock.
+      const clock = zonedClock(config.timezone);
+      if (clock.hour !== cfg.hour || clock.minute !== cfg.minute) return;
+      if (attemptedDay === clock.day) return;
+      attemptedDay = clock.day;
+      if (!cfg.botToken) {
+        log('[reports] daily report skipped: no Telegram bot token is configured');
+        return;
+      }
+      const summary = await reports.sendDaily({ at: Date.now() });
+      log(`[reports] daily report: sent ${summary.sent}/${summary.attempted}, failed ${summary.failed}, skipped ${summary.skipped}${summary.owner?.sent ? ', owner digest sent' : ''}`);
+      for (const item of summary.results.filter((one) => !one.sent && one.reason && one.stats)) {
+        log(`[reports] reseller ${item.username}: ${item.reason}`);
+      }
+    } catch (err) {
+      logError('[reports] daily report failed:', err.message);
+    }
+  }, 60000).unref();
+}
+
 function start() {
   getDb();
   settings.ensureDefaults();
@@ -172,6 +202,7 @@ function start() {
     log(`Sulduz Cloud ${config.version} listening on http://${config.host}:${config.port}`);
     monitor.start();
     startAutoBackupTimer();
+    startDailyReportTimer();
   });
   server.requestTimeout = 120000;
   server.headersTimeout = 130000;
