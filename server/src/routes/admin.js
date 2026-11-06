@@ -315,6 +315,9 @@ router.post('/pricing/quote', auth.requirePerm('configs'), (req, res) => {
     gb: num(body.gb),
     days: num(body.days),
     unlimited: Boolean(body.unlimited),
+    // v1.4.25: the build form shows the admin the tariff of a free order, so the
+    // quote must say plainly that this money is not going to be taken.
+    charge: Boolean(body.charge),
   });
   res.json({ ok: true, data: result });
 });
@@ -383,6 +386,9 @@ router.post('/configs', auth.requirePerm('configs'), asyncH(async (req, res) => 
       customerPhone: body.customerPhone,
       note: body.note,
       unlimited: Boolean(body.unlimited),
+      // v1.4.25: an admin building a package for a reseller does not spend the
+      // reseller's wallet unless he ticks the switch.
+      charge: Boolean(body.charge),
     },
     req
   );
@@ -414,6 +420,10 @@ router.post('/configs/:id/extend', auth.requirePerm('configs'), asyncH(async (re
       days: num(req.body?.days),
       price: num(req.body?.price),
       resetUsage: Boolean(req.body?.resetUsage),
+      // v1.4.25: the admin's own tick decides whether the reseller pays. Absent
+      // or false means the renewal is free — this route is the only place the
+      // flag is ever read, and the reseller route has no equivalent.
+      charge: Boolean(req.body?.charge),
     },
     req,
     { role: 'admin' }
@@ -423,11 +433,22 @@ router.post('/configs/:id/extend', auth.requirePerm('configs'), asyncH(async (re
 
 // Same read-only renewal price the reseller drawer gets, so an admin renewing on
 // behalf of a reseller sees the amount the panel will charge before confirming.
+// It answers `charged` for the tick the drawer is showing, so the money on screen
+// is the money the wallet will actually see move — and since v1.4.26 the
+// `resetUsage` tick is forwarded too, because with it the typed numbers are the
+// package's new size and expiry rather than a delta, and the preview has to show
+// the same outcome the renewal will write.
 router.post('/configs/:id/extend/quote', auth.requirePerm('configs'), asyncH(async (req, res) => {
   const data = configsService.quoteRenewalPrice(
     num(req.params.id),
-    { gb: num(req.body?.gb), days: num(req.body?.days) },
-    { role: 'admin' }
+    {
+      gb: num(req.body?.gb),
+      days: num(req.body?.days),
+      charge: Boolean(req.body?.charge),
+      resetUsage: Boolean(req.body?.resetUsage),
+    },
+    { role: 'admin' },
+    req
   );
   res.json({ ok: true, data });
 }));
@@ -455,13 +476,28 @@ router.post('/configs/:id/identity', auth.requirePerm('configs'), asyncH(async (
 }));
 
 router.post('/configs/:id/inbounds', auth.requirePerm('configs'), asyncH(async (req, res) => {
-  const config = await configsService.addInbound(num(req.params.id), num(req.body?.inboundId), req, { role: 'admin' });
+  const config = await configsService.addInbound(
+    num(req.params.id),
+    num(req.body?.inboundId),
+    req,
+    { role: 'admin' },
+    // v1.4.25: adding a channel is free for the reseller unless the admin ticks
+    // the charge switch; the heal pass has always been free for its own reason.
+    { charge: Boolean(req.body?.charge) }
+  );
   res.status(201).json({ ok: true, data: { config } });
 }));
 
 router.post('/configs/:id/reset', auth.requirePerm('configs'), asyncH(async (req, res) => {
   const config = await configsService.resetUsage(num(req.params.id), req, { role: 'admin' });
   res.json({ ok: true, data: { config } });
+}));
+
+// v1.4.26: the same «رفرش» the reseller drawer got — read the customer back off
+// his node and make the panel's copy current. Read-only against x-ui.
+router.post('/configs/:id/refresh', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const data = await configsService.refreshPackage(num(req.params.id), req, { role: 'admin' });
+  res.json({ ok: true, data });
 }));
 
 // Panel v1.4.21: put ONE x-ui client back for a customer whose client was

@@ -108,11 +108,16 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
 
   const [sheet, setSheet] = useState(null); // extend | quota | edit | identity | addInbound
   const [qr, setQr] = useState(null);
-  const [extendForm, setExtendForm] = useState({ gb: 10, days: 30, resetUsage: false });
+  // `charge` is v1.4.25 and admin-only: an admin renewing on a reseller's behalf
+  // does not spend the reseller's wallet unless he ticks it. The field is not
+  // rendered for a reseller and the server ignores it for him anyway.
+  const [extendForm, setExtendForm] = useState({ gb: 10, days: 30, resetUsage: false, charge: false });
   // Bumped every time the renew dialog opens, so its price request is a fresh key
   // and must go to the server — a wallet or tariff that changed in the meantime
   // cannot be hidden behind a cached preview.
   const [extendQuoteKey, setExtendQuoteKey] = useState(0);
+  // v1.4.25: same admin-only rule for «افزودن اینباند» — free unless ticked.
+  const [addInboundCharge, setAddInboundCharge] = useState(false);
   const [quotaForm, setQuotaForm] = useState({ gb: 0, days: 0, enabled: true });
   const [editForm, setEditForm] = useState({ label: '', customerName: '', customerPhone: '', note: '' });
   const [identityForm, setIdentityForm] = useState({ uuid: '', subId: '' });
@@ -161,13 +166,28 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   // shows it whether or not wallet billing is switched on, so the reseller confirms
   // a price he has actually seen instead of an invisible deduction. The package is
   // resolved server-side, so the preview cannot be steered by the client.
+  const extendCharge = isAdmin && Boolean(extendForm.charge);
+  const extendHasInput = extendAmountGb > 0 || extendDays > 0;
+  // v1.4.26: the tick is no longer a free way to zero the meter. With it on, the
+  // GB and days the reseller types REPLACE what the customer has — the server
+  // prices those numbers and answers what the package will actually be, and the
+  // dialog shows that outcome instead of a «+» the reseller would have to do in
+  // his head. A reset with nothing typed is refused by the server, so the button
+  // is refused here first.
+  const extendReplace = Boolean(extendForm.resetUsage);
+  const extendResetNeedsInput = extendReplace && !extendHasInput;
   const extendQuote = useQuery({
-    queryKey: ['extend-quote', configId, extendAmountGb, extendDays, extendQuoteKey],
+    queryKey: ['extend-quote', configId, extendAmountGb, extendDays, extendCharge, Boolean(extendForm.resetUsage), extendQuoteKey],
     queryFn: () => api.post(`${base}/${configId}/extend/quote`, {
       gb: extendAmountGb,
       days: extendDays,
+      charge: extendCharge,
+      // v1.4.26: the preview has to price the SAME renewal the submit will send,
+      // including whether it is a replace. The server recomputes it on apply, so
+      // this can only ever change what is shown, never what is charged.
+      resetUsage: Boolean(extendForm.resetUsage),
     }),
-    enabled: open && sheet === 'extend' && Boolean(configId) && (extendAmountGb > 0 || extendDays > 0),
+    enabled: open && sheet === 'extend' && Boolean(configId) && extendHasInput,
     staleTime: 0,
     refetchOnMount: 'always',
     retry: false,
@@ -176,12 +196,20 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const extendBasis = extendPrice?.basis || null;
   const extendTotal = Number(extendPrice?.total || 0);
   const extendBalance = Number(extendPrice?.balance || 0);
-  const extendInsufficient = billingOn && extendPrice?.sufficient === false;
+  // The server answers whether the wallet will really move (`charged`). Trusting
+  // that answer instead of recomputing it here is the point: a free renewal is
+  // priced, shown and NEVER blocked by a balance the admin is not touching.
+  const extendCharged = Boolean(extendPrice?.charged);
+  const extendInsufficient = extendCharged && extendPrice?.sufficient === false;
+  // Outcome of the renewal the preview just priced: what the package will really
+  // be after the submit, and what it is now. `null` until the quote answers.
+  const extendResult = extendPrice?.result || null;
+  const extendCurrent = extendPrice?.current || null;
 
   // Opens the renew dialog on a clean slate AND on a brand-new preview key, so the
   // amount it shows was priced against the wallet and tariff of this very moment.
   const openExtendDialog = () => {
-    setExtendForm({ gb: 10, days: 30, resetUsage: false });
+    setExtendForm({ gb: 10, days: 30, resetUsage: false, charge: false });
     setExtendQuoteKey((n) => n + 1);
     setSheet('extend');
   };
@@ -243,6 +271,27 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     onError,
   });
 
+  // v1.4.26: the reseller's answer to "the numbers look wrong" is a READ. The
+  // panel asks the node for this customer's counters and stores what it is told;
+  // it never writes to x-ui, so the button cannot touch a plan, a quota or the
+  // ثنایی panel — it can only make the screen agree with the node. The server
+  // answers how many rows agreed, how many it could not find, and whether a
+  // sibling client errored, so the toast can say that instead of a bare "done".
+  const nodeRefresh = useMutation({
+    mutationFn: () => api.post(`${base}/${configId}/refresh`),
+    onSuccess: (data) => {
+      // The server counts both the x-ui clients it read and the inbound rows it
+      // wrote; the sentence on screen is about inbounds, so it uses that number.
+      const refreshed = Number(data?.refreshedRows ?? data?.refreshed ?? 0);
+      const missing = Number(data?.missingRows ?? data?.missing ?? 0);
+      if (missing > 0) toast.warning(t('configs.detail.refreshMissing', { n: formatNumber(missing, lang) }));
+      else toast.success(t('configs.detail.refreshed', { n: formatNumber(refreshed, lang) }));
+      refresh();
+      detail.refetch();
+    },
+    onError,
+  });
+
   const saveMeta = useMutation({
     mutationFn: (payload) => api.patch(`${base}/${configId}`, payload),
     onSuccess: () => { toast.success(t('common.saved')); setSheet(null); refresh(); },
@@ -279,7 +328,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   });
 
   const addInbound = useMutation({
-    mutationFn: (inboundId) => api.post(`${base}/${configId}/inbounds`, { inboundId }),
+    mutationFn: (payload) => api.post(`${base}/${configId}/inbounds`, payload),
     onSuccess: () => { toast.success(t('configs.group.added')); setSheet(null); refresh(); },
     onError,
   });
@@ -441,7 +490,25 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                     {t('configs.group.deletePackage')}
                   </Button>
                 ) : null}
-                <Button variant="ghost" size="sm" icon={RotateCcw} onClick={askReset} loading={reset.isPending}>{t('configs.actions.reset')}</Button>
+                {/* v1.4.26: the reseller's free «ریست مصرف» is gone — it zeroed the
+                    meter without the panel ever charging a tariff, so the money the
+                    customer already spent simply vanished. What replaces it is a READ
+                    of the node: same-looking button, no write to x-ui, and the only way
+                    left to zero usage is to renew and pay for the new size. The admin
+                    keeps the reset because he sets his own prices. */}
+                {isAdmin ? (
+                  <Button variant="ghost" size="sm" icon={RotateCcw} onClick={askReset} loading={reset.isPending}>{t('configs.actions.reset')}</Button>
+                ) : null}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon={RefreshCw}
+                  onClick={() => nodeRefresh.mutate()}
+                  loading={nodeRefresh.isPending}
+                  title={t('configs.detail.refreshHint')}
+                >
+                  {t('configs.actions.refresh')}
+                </Button>
                 {/* A disabled button cannot show its tooltip, so the reason the
                     server would refuse this delete is spelled out next to it. */}
                 {fixedBaseLocked ? (
@@ -734,32 +801,60 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
         open={sheet === 'extend'}
         onClose={() => setSheet(null)}
         title={t('configs.extend.title')}
-        subtitle={t('configs.extend.hint')}
+        subtitle={extendReplace ? t('configs.extend.hintReplace') : t('configs.extend.hint')}
         size="sm"
         footer={
           <>
             <Button variant="ghost" onClick={() => setSheet(null)}>{t('common.cancel')}</Button>
-            <Button loading={extend.isPending} disabled={extendInsufficient || extend.isPending} onClick={() => extend.mutate({ gb: Number(extendForm.gb || 0), days: Number(extendForm.days || 0), resetUsage: extendForm.resetUsage })}>
+            <Button
+              loading={extend.isPending}
+              disabled={extendInsufficient || extendResetNeedsInput || extend.isPending}
+              title={extendResetNeedsInput ? t('configs.extend.resetNeedsInput') : undefined}
+              onClick={() => extend.mutate({ gb: Number(extendForm.gb || 0), days: Number(extendForm.days || 0), resetUsage: extendForm.resetUsage, charge: extendCharge })}
+            >
               {t('configs.extend.submit')}
             </Button>
           </>
         }
       >
         <div className="grid grid-cols-2 gap-3">
-          <Field label={t('configs.extend.gb')}>
+          {/* In replace mode the inputs are not a top-up any more, and calling them
+              «حجم اضافه» would be a lie about what the panel is about to write. */}
+          <Field label={extendReplace ? t('configs.extend.gbNew') : t('configs.extend.gb')}>
             <Input type="number" min={0} value={extendForm.gb} onChange={(e) => setExtendForm((prev) => ({ ...prev, gb: e.target.value }))} />
           </Field>
-          <Field label={t('configs.extend.days')}>
+          <Field label={extendReplace ? t('configs.extend.daysNew') : t('configs.extend.days')}>
             <Input type="number" min={0} value={extendForm.days} onChange={(e) => setExtendForm((prev) => ({ ...prev, days: e.target.value }))} />
           </Field>
         </div>
         <div className="mt-3">
           <Checkbox checked={extendForm.resetUsage} onChange={(value) => setExtendForm((prev) => ({ ...prev, resetUsage: value }))} label={t('configs.extend.resetUsage')} />
+          {/* The tick changed meaning in v1.4.26, so the dialog says so instead of
+              letting the reseller read it the old way: with it on the numbers above
+              are the customer's NEW plan, not a top-up, and that is what the panel
+              charges for. */}
+          <p className="mt-1 text-[9.5px] leading-4 text-slate-500">
+            {extendReplace ? t('configs.extend.resetHintOn') : t('configs.extend.resetHint')}
+          </p>
+          {extendResetNeedsInput ? (
+            <p className="mt-1 text-[9.5px] leading-4 text-amber-300/90">{t('configs.extend.resetNeedsInput')}</p>
+          ) : null}
         </div>
+        {isAdmin ? (
+          // v1.4.25 — the owner's rule: an admin renewal costs the reseller
+          // nothing unless the admin says otherwise. The switch is the admin's
+          // only way to charge, and it is off by default.
+          <div className="mt-2 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2">
+            <Checkbox checked={Boolean(extendForm.charge)} onChange={(value) => { setExtendForm((prev) => ({ ...prev, charge: value })); setExtendQuoteKey((n) => n + 1); }} label={t('configs.extend.chargeReseller')} />
+            <p className="mt-1 text-[9.5px] leading-4 text-slate-500">
+              {extendCharge ? t('configs.extend.chargeOnHint') : t('configs.extend.adminFreeHint')}
+            </p>
+          </div>
+        ) : null}
         {group.length > 1 ? (
           <p className="mt-3 flex items-start gap-2 rounded-xl border border-cyan-400/20 bg-cyan-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-cyan-100/80">
             <Layers className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>{t('configs.extend.groupNote')} ({formatNumber(group.length, lang)})</span>
+            <span>{extendReplace ? t('configs.extend.groupNoteReplace') : t('configs.extend.groupNote')} ({formatNumber(group.length, lang)})</span>
           </p>
         ) : null}
         <div className="mt-3 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.06] px-3 py-2.5">
@@ -784,7 +879,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
               ) : null}
             </p>
           ) : null}
-          {billingOn ? (
+          {billingOn && extendCharged ? (
             <p className="mt-1 flex items-center justify-between gap-2 text-[9.5px] text-slate-500">
               <span>{t('configs.extend.balanceAfter')}</span>
               <span className={cx('font-semibold', extendInsufficient ? 'text-rose-300' : 'text-slate-300')}>
@@ -792,14 +887,44 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
               </span>
             </p>
           ) : null}
+          {/* v1.4.26: the panel answers what the package WILL be, so the reseller
+              reads the result instead of doing the arithmetic — and in replace mode
+              he also sees the usage he is about to throw away. Both numbers come from
+              the server, from the same rows extendConfig is going to write. */}
+          {extendResult && extendHasInput ? (
+            <>
+              <p className="mt-1.5 flex items-center justify-between gap-2 border-t border-emerald-400/15 pt-1.5 text-[9.5px] text-slate-400">
+                <span>{extendReplace ? t('configs.extend.becomesReplace') : t('configs.extend.becomesAdd')}</span>
+                <span className="font-semibold text-slate-200">
+                  {formatNumber(extendResult.changedTotal ? extendResult.gb : (extendCurrent?.gb || 0), lang, 0)}
+                  {' '}
+                  {t('configs.extend.gbUnit')}
+                  {' · '}
+                  {formatDate(extendResult.changedExpiry ? extendResult.expiryAt : (extendCurrent?.expiryAt || 0), lang, true)}
+                </span>
+              </p>
+              {extendReplace ? (
+                <p className="mt-1 flex items-start gap-1.5 text-[9.5px] leading-4 text-amber-300/85">
+                  <RotateCcw className="mt-0.5 h-3 w-3 shrink-0" />
+                  <span>
+                    {t('configs.extend.usageCleared', { gb: formatNumber(extendCurrent?.usedGb || 0, lang, 1) })}
+                  </span>
+                </p>
+              ) : null}
+            </>
+          ) : null}
           <p className="mt-1 text-[9.5px] text-slate-500">
             {extendInsufficient
               ? t('errors.insufficientBalance')
-              : (!billingOn
-                ? t('configs.form.billingOff')
-                : (extendTotal === 0 && (extendAmountGb > 0 || extendDays > 0)
-                  ? t('configs.extend.zeroTariff')
-                  : t('configs.extend.priceHint')))}
+              : (isAdmin && !extendCharge
+                // A free admin renewal still names the tariff — the line below has
+                // to say why that money is not leaving anyone's wallet.
+                ? t('configs.extend.adminFree')
+                : (!billingOn
+                  ? t('configs.form.billingOff')
+                  : (extendTotal === 0 && (extendAmountGb > 0 || extendDays > 0)
+                    ? t('configs.extend.zeroTariff')
+                    : t('configs.extend.priceHint'))))}
           </p>
         </div>
       </Modal>
@@ -930,6 +1055,14 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                 </span>
               </p>
             ) : null}
+            {isAdmin ? (
+              <div className="mb-2 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2">
+                <Checkbox checked={addInboundCharge} onChange={setAddInboundCharge} label={t('configs.extend.chargeReseller')} />
+                <p className="mt-1 text-[9.5px] leading-4 text-slate-500">
+                  {addInboundCharge ? t('configs.extend.chargeOnHint') : t('configs.extend.adminFreeHint')}
+                </p>
+              </div>
+            ) : null}
             <div className="max-h-[380px] space-y-2 overflow-y-auto pe-1">
               {addable.map((row) => {
                 const addGb = Number(config?.totalGb || 0);
@@ -942,7 +1075,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                     key={row.id}
                     type="button"
                     disabled={addInbound.isPending}
-                    onClick={() => addInbound.mutate(row.id)}
+                    onClick={() => addInbound.mutate({ inboundId: row.id, charge: isAdmin ? addInboundCharge : true })}
                     className={cx(
                       'flex w-full items-center justify-between gap-3 rounded-xl border px-3 py-2.5 text-start transition disabled:opacity-60',
                       isFixed
@@ -961,7 +1094,10 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                         {row.protocol}{row.network ? ` · ${row.network}` : ''}{row.nodeName ? ` · ${row.nodeName}` : ''}
                       </p>
                     </div>
-                    <span className="shrink-0 text-[11.5px] font-semibold text-emerald-300/90">{formatMoney(rowPrice, lang, currency)}</span>
+                    <span className={cx('shrink-0 text-[11.5px] font-semibold', isAdmin && !addInboundCharge ? 'text-slate-500' : 'text-emerald-300/90')}>
+                      {formatMoney(rowPrice, lang, currency)}
+                      {isAdmin && !addInboundCharge ? <span className="ms-1 text-[9px] font-normal">{t('configs.extend.noCharge')}</span> : null}
+                    </span>
                   </button>
                 );
               })}

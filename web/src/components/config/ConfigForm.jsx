@@ -112,6 +112,7 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
     gb: 30,
     days: 30,
     unlimited: false,
+    charge: false,
     label: '',
     customerName: '',
     customerPhone: '',
@@ -119,6 +120,9 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
   });
   // Unlimited is an admin-only option; resellers always get a metered quota.
   const isUnlimited = isAdmin && form.unlimited;
+  // v1.4.25: an admin builds a package for a reseller without touching the
+  // reseller's wallet unless he ticks the box. A reseller is always charged.
+  const willCharge = !isAdmin || Boolean(form.charge);
 
   useEffect(() => {
     if (!open) return;
@@ -146,6 +150,7 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
       [...form.inboundIds].sort((a, b) => a - b).join(','),
       isUnlimited ? 0 : Number(form.gb || 0),
       Number(form.days || 0),
+      willCharge,
     ],
     queryFn: () => api.post(isAdmin ? '/admin/pricing/quote' : '/reseller/configs/quote', {
       userId: isAdmin ? Number(form.userId) : undefined,
@@ -153,6 +158,7 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
       gb: isUnlimited ? 0 : Number(form.gb || 0),
       days: Number(form.days || 0),
       unlimited: isUnlimited,
+      charge: willCharge,
     }),
     enabled: quoteReady,
     staleTime: 15000,
@@ -206,7 +212,8 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
   const totalPrice = quote ? Number(quote.total || 0) : fallbackPrice;
   const currency = meta?.billing?.currency || quote?.currency || '';
   const balance = Number(quote?.balance ?? (isAdmin ? selectedUser?.balance ?? 0 : user?.balance ?? 0));
-  const insufficient = quote ? quote.sufficient === false : billing && totalPrice > 0 && balance < totalPrice;
+  const charged = quote ? Boolean(quote.charged) : billing && willCharge && totalPrice > 0;
+  const insufficient = quote ? quote.sufficient === false : billing && willCharge && totalPrice > 0 && balance < totalPrice;
 
   const create = useMutation({
     mutationFn: (payload) => api.post(isAdmin ? '/admin/configs' : '/reseller/configs', payload),
@@ -260,6 +267,7 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
       gb: isUnlimited ? 0 : Number(form.gb),
       days: Number(form.days),
       unlimited: isUnlimited,
+      charge: willCharge,
       label: form.label.trim(),
       customerName: form.customerName.trim(),
       customerPhone: form.customerPhone.trim(),
@@ -360,8 +368,16 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
             </Field>
           )}
           {isAdmin ? (
-            <div className="flex items-end pb-2.5">
+            <div className="flex flex-col items-start justify-end gap-2.5 pb-1">
               <Checkbox checked={form.unlimited} onChange={(value) => setForm((prev) => ({ ...prev, unlimited: value }))} label={t('common.unlimited')} />
+              {/* v1.4.25 — an admin builds on top of the reseller's wallet only when
+                  he ticks this; unticked the package is created for free. */}
+              <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2">
+                <Checkbox checked={Boolean(form.charge)} onChange={(value) => setForm((prev) => ({ ...prev, charge: value }))} label={t('configs.extend.chargeReseller')} />
+                <p className="mt-1 text-[9.5px] leading-4 text-slate-500">
+                  {willCharge ? t('configs.extend.chargeOnHint') : t('configs.extend.adminFreeHint')}
+                </p>
+              </div>
             </div>
           ) : null}
         </div>
@@ -433,13 +449,18 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
               </p>
             ) : null}
             <p className="text-[9.5px] text-slate-600">
-              {!billing ? t('configs.form.billingOff') : discountTotal > 0 ? t('configs.form.discountApplied') : t('configs.form.priceHint')}
+              {!billing
+                ? t('configs.form.billingOff')
+                : (isAdmin && !willCharge
+                  // The price stays on screen; this line says where the money goes.
+                  ? t('configs.extend.adminFree')
+                  : (discountTotal > 0 ? t('configs.form.discountApplied') : t('configs.form.priceHint')))}
             </p>
           </div>
           <div className="text-end">
-            <p className="text-[10px] text-slate-500">{billing ? t('configs.form.balanceAfter') : t('common.balance')}</p>
+            <p className="text-[10px] text-slate-500">{billing && charged ? t('configs.form.balanceAfter') : t('common.balance')}</p>
             <p className={cx('text-[12.5px] font-semibold', insufficient ? 'text-rose-300' : 'text-slate-200')}>
-              {formatMoney(billing ? balance - totalPrice : balance, lang, currency)}
+              {formatMoney(billing && charged ? balance - totalPrice : balance, lang, currency)}
             </p>
             <p className="text-[9.5px] text-slate-600">
               {isAdmin && selectedUser ? selectedUser.name || `@${selectedUser.username}` : t('wallet.balance')}

@@ -226,7 +226,18 @@ function startMockXui(inboundRows) {
           const attached = clients.get(email)?.inboundIds?.length ? clients.get(email).inboundIds : [1000];
           return send(attached.map((id) => `vless://mock-${email}@127.0.0.1:${1000 + Number(id)}?type=tcp#${encodeURIComponent(email)}-${id}`));
         }
-        if (route.startsWith('/clients/resetTraffic/')) return send(true);
+        if (route.startsWith('/clients/resetTraffic/')) {
+          // The real x-ui zeroes the client's OWN up/down here. Before v1.4.26 the
+          // double answered `true` and left the counters alone, so a test could
+          // never tell a reset that really reached the node from one that only
+          // cleared the panel's copy — which the next sync would have undone.
+          const target = clients.get(emailOf('/clients/resetTraffic/'));
+          if (target) {
+            target.up = 0;
+            target.down = 0;
+          }
+          return send(true);
+        }
         if (route === '/clients/onlines') return send([]);
         if (route === '/clients/bulkAdjust') return send((body.emails || []).map((email) => ({ email, ok: true })));
         if (route.startsWith('/clients/subLinks/')) {
@@ -1157,6 +1168,374 @@ function startMockXui(inboundRows) {
       `balance=${restoredMe.json?.data?.user?.balance}`
     );
 
+    // ------------------------------------------- v1.4.25: who pays for a renewal
+    // The owner's rule: when the MAIN ADMIN renews or builds on a reseller's
+    // customer, the reseller's wallet is NOT touched unless the admin explicitly
+    // opts in. The wallet sits at zero here on purpose — a broke reseller must
+    // neither be charged for an admin's favour nor block it.
+    const walletState = async () => Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+    const renewLedgerCount = async () => {
+      const ledger = await request('GET', '/api/reseller/transactions?pageSize=100', { cookies: shopCookies, csrf: shopCsrf });
+      return (ledger.json?.data?.rows || []).filter((row) => row.type === 'renew').length;
+    };
+    const purchaseLedgerCount = async () => {
+      const ledger = await request('GET', '/api/reseller/transactions?pageSize=100', { cookies: shopCookies, csrf: shopCsrf });
+      return (ledger.json?.data?.rows || []).filter((row) => row.type === 'purchase').length;
+    };
+    const newestNote = async (title) => {
+      const notes = await request('GET', '/api/notifications?pageSize=50', { cookies: shopCookies });
+      return (notes.json?.data?.rows || [])
+        .filter((item) => item.title === title)
+        .sort((a, b) => Number(b.id) - Number(a.id))[0] || {};
+    };
+
+    const adminFreeQuote = await request('POST', `/api/admin/configs/${bought.id}/extend/quote`, {
+      cookies, csrf, body: { gb: 5, days: 5 },
+    });
+    const adminFreePrice = adminFreeQuote.json?.data || {};
+    check(
+      'v1.4.25 an admin renewal is quoted as free by default, even on an empty wallet',
+      adminFreeQuote.status === 200
+        && Number(adminFreePrice.total) === 150
+        && adminFreePrice.charge === false
+        && adminFreePrice.charged === false
+        && adminFreePrice.sufficient === true
+        && adminFreePrice.actor === 'admin',
+      `total=${adminFreePrice.total} charge=${adminFreePrice.charge} charged=${adminFreePrice.charged} sufficient=${adminFreePrice.sufficient} actor=${adminFreePrice.actor}`
+    );
+    const adminChargedQuote = await request('POST', `/api/admin/configs/${bought.id}/extend/quote`, {
+      cookies, csrf, body: { gb: 5, days: 5, charge: true },
+    });
+    const adminChargedPrice = adminChargedQuote.json?.data || {};
+    check(
+      'v1.4.25 the same preview with the switch on puts the wallet back in the picture',
+      adminChargedQuote.status === 200
+        && Number(adminChargedPrice.total) === 150
+        && adminChargedPrice.charged === true
+        && adminChargedPrice.sufficient === false,
+      `charged=${adminChargedPrice.charged} sufficient=${adminChargedPrice.sufficient}`
+    );
+
+    const renewBeforeFree = await renewLedgerCount();
+    const beforeFreeDetail = await request('GET', `/api/admin/configs/${bought.id}`, { cookies });
+    const expiryBeforeFree = Number(beforeFreeDetail.json?.data?.config?.expiryAt || 0);
+    const adminFreeRenew = await request('POST', `/api/admin/configs/${bought.id}/extend`, {
+      cookies, csrf, body: { gb: 5, days: 5 },
+    });
+    const freeRenewDetail = await request('GET', `/api/admin/configs/${bought.id}`, { cookies });
+    const freeRenewNote = await newestNote('تمدید انجام شد');
+    check(
+      'v1.4.25 a free admin renewal succeeds on a zero wallet, renews the customer and takes nothing',
+      adminFreeRenew.status === 200
+        && Number(freeRenewDetail.json?.data?.config?.expiryAt) > expiryBeforeFree
+        && (await walletState()) === 0
+        && await renewLedgerCount() === renewBeforeFree,
+      `status=${adminFreeRenew.status} expiry=${expiryBeforeFree}→${Number(freeRenewDetail.json?.data?.config?.expiryAt)} balance=${await walletState()}`
+    );
+    check(
+      'and the reseller is TOLD it was free, instead of a charge that never happened',
+      String(freeRenewNote.body || '').includes('رایگان')
+        && String(freeRenewNote.body || '').includes('بدون کسر')
+        && !String(freeRenewNote.body || '').includes('کسر شد')
+        && String(freeRenewNote.body || '').includes('توسط مدیر'),
+      `body=${freeRenewNote.body}`
+    );
+
+    const quotaBeforePaid = `${Number(adminFreeRenew.json?.data?.config?.totalGb || 0)}|${Number(adminFreeRenew.json?.data?.config?.expiryAt || 0)}`;
+    const adminPoorRenew = await request('POST', `/api/admin/configs/${bought.id}/extend`, {
+      cookies, csrf, body: { gb: 5, days: 5, charge: true },
+    });
+    const stillFreeDetail = await request('GET', `/api/admin/configs/${bought.id}`, { cookies });
+    const stillFreeConfig = stillFreeDetail.json?.data?.config || {};
+    check(
+      'v1.4.25 an opted-in charge is still refused on an empty wallet — and writes nothing',
+      adminPoorRenew.status === 402
+        && adminPoorRenew.json?.error?.code === 'insufficient_balance'
+        && (await walletState()) === 0
+        && `${Number(stillFreeConfig.totalGb || 0)}|${Number(stillFreeConfig.expiryAt || 0)}` === quotaBeforePaid,
+      `status=${adminPoorRenew.status} code=${adminPoorRenew.json?.error?.code}`
+    );
+
+    const adminPayTopup = await request('POST', `/api/admin/users/${shopId}/balance`, {
+      cookies, csrf, body: { amount: 500, description: 'شارژ تست کسر مدیر' },
+    });
+    const renewBeforePaid = await renewLedgerCount();
+    const adminPaidRenew = await request('POST', `/api/admin/configs/${bought.id}/extend`, {
+      cookies, csrf, body: { gb: 5, days: 5, charge: true },
+    });
+    const paidRenewNote = await newestNote('تمدید انجام شد');
+    check(
+      'v1.4.25 ticking the switch makes the very same renewal deduct like before',
+      adminPayTopup.status === 200
+        && adminPaidRenew.status === 200
+        && (await walletState()) === 350
+        && await renewLedgerCount() === renewBeforePaid + 1
+        && String(faDigits(paidRenewNote.body || '')).includes('150')
+        && String(paidRenewNote.body || '').includes('کسر شد')
+        && !String(paidRenewNote.body || '').includes('رایگان'),
+      `status=${adminPaidRenew.status} balance=${await walletState()}`
+    );
+
+    // The rule must not be steerable from the client: the flag is only ever read
+    // for an admin viewer, so a reseller posting {"charge": false} pays anyway.
+    const steeredQuote = await request('POST', `/api/reseller/configs/${bought.id}/extend/quote`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5, charge: false },
+    });
+    const steeredPrice = steeredQuote.json?.data || {};
+    const renewBeforeSteer = await renewLedgerCount();
+    const steeredRenew = await request('POST', `/api/reseller/configs/${bought.id}/extend`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5, charge: false },
+    });
+    check(
+      'a reseller cannot buy his own renewal for free by posting charge:false',
+      steeredQuote.status === 200
+        && steeredPrice.charged === true
+        && steeredPrice.actor === 'reseller'
+        && steeredRenew.status === 200
+        && (await walletState()) === 200
+        && await renewLedgerCount() === renewBeforeSteer + 1,
+      `charged=${steeredPrice.charged} actor=${steeredPrice.actor} status=${steeredRenew.status} balance=${await walletState()}`
+    );
+
+    // The same policy on the other money surface: an admin building a package.
+    const purchaseBeforeAdmin = await purchaseLedgerCount();
+    const adminBuild = await request('POST', '/api/admin/configs', {
+      cookies, csrf, body: { userId: shopId, inboundIds: [901], gb: 5, days: 10, customerName: 'مشتری ساخته‌شده توسط مدیر' },
+    });
+    const builtConfig = (adminBuild.json?.data?.configs || [])[0] || {};
+    const walletAfterBuild = await walletState();
+    const purchaseAfterAdmin = await purchaseLedgerCount();
+    const adminBuildDeleted = await request('DELETE', `/api/admin/configs/${builtConfig.id}`, { cookies, csrf });
+    check(
+      'v1.4.25 an admin building a package for a reseller spends nothing of his wallet',
+      adminBuild.status === 201
+        && Number(adminBuild.json?.data?.configs?.length) === 1
+        && walletAfterBuild === 200
+        && purchaseAfterAdmin === purchaseBeforeAdmin
+        && adminBuildDeleted.status === 200,
+      `status=${adminBuild.status} balance=${walletAfterBuild} purchases=${purchaseBeforeAdmin}→${purchaseAfterAdmin}`
+    );
+
+    const drainAfterChargePolicy = await request('POST', `/api/admin/users/${shopId}/balance`, {
+      cookies, csrf, body: { amount: -200, description: 'تخلیه پس از سیاست کسر هزینه' },
+    });
+    check(
+      'the charge policy tests leave billing on and the wallet as they found it',
+      drainAfterChargePolicy.status === 200 && (await walletState()) === 0,
+      `balance=${await walletState()}`
+    );
+
+    // ------------------------- v1.4.26: what a renewal with «ریست مصرف» really does
+    // The owner's second leak was inside the renewal itself: the tick ADDED the
+    // new traffic and then wiped the usage the customer had already paid for, so
+    // a 30GB/30d plan half consumed became 50GB/90d with the meter back at zero —
+    // the reseller sold the same gigabytes twice. Now the numbers he types BECOME
+    // the package (20GB/60d means 20GB/60d, not 30+20/30+60) and the tariff is
+    // priced for exactly those numbers. A reset with nothing typed is refused,
+    // because that is the old free reset wearing a different hat.
+    const UNIT26 = 1024 ** 3;
+    const DAY26 = 86400000;
+    const resetTrafficCount = () => mockXui.calls.filter((call) => call.route.startsWith('/clients/resetTraffic/')).length;
+    const nodeCallsSince = (from) => mockXui.calls.slice(from).map((call) => call.route);
+    const stage5Topup = await request('POST', `/api/admin/users/${shopId}/balance`, {
+      cookies, csrf, body: { amount: 4000, description: 'شارژ تست جایگزینی تمدید' },
+    });
+    const stage5Buy = await request('POST', '/api/reseller/configs', {
+      cookies: shopCookies, csrf: shopCsrf,
+      body: { inboundIds: [901, 902], gb: 30, days: 30, customerName: 'مشتری جایگزینی تمدید' },
+    });
+    const stage5Configs = stage5Buy.json?.data?.configs || [];
+    const stage5Id = stage5Configs[0]?.id || 0;
+    const stage5Email = String(stage5Configs[0]?.email || '');
+    const setStage5Usage = (up, down) => {
+      const client = mockXui.clients.get(stage5Email);
+      client.up = up;
+      client.down = down;
+    };
+    const stage5View = async () => (await request('GET', `/api/reseller/configs/${stage5Id}`, { cookies: shopCookies })).json?.data?.config || {};
+    setStage5Usage(7 * UNIT26, 8 * UNIT26);
+    const stage5Sync = await request('POST', '/api/admin/sync', { cookies, csrf });
+    const stage5Half = await stage5View();
+    check(
+      'v1.4.26 the fixture is a 30GB/30d package that has used exactly half of it',
+      stage5Topup.status === 200 && stage5Buy.status === 201 && stage5Configs.length === 2
+        && stage5Sync.status === 200
+        && Number(stage5Half.totalGb) === 30 && Number(stage5Half.used) === 15 * UNIT26,
+      `buy=${stage5Buy.status} gb=${stage5Half.totalGb} used=${stage5Half.used / UNIT26}`
+    );
+    const replaceQuote = await request('POST', `/api/reseller/configs/${stage5Id}/extend/quote`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 20, days: 60, resetUsage: true },
+    });
+    const replacePrice = replaceQuote.json?.data || {};
+    check(
+      'v1.4.26 the preview answers a REPLACING renewal: 30GB used 15 becomes 20GB, not 50GB',
+      replaceQuote.status === 200
+        && replacePrice.mode === 'replace'
+        && replacePrice.resetUsage === true
+        && Number(replacePrice.current?.gb) === 30
+        && Number(replacePrice.current?.usedGb) === 15
+        && Number(replacePrice.result?.gb) === 20
+        && replacePrice.result?.changedTotal === true
+        && replacePrice.result?.usageCleared === true
+        && Math.abs(Number(replacePrice.result?.expiryAt) - (Date.now() + 60 * DAY26)) < 5 * 60 * 1000,
+      `mode=${replacePrice.mode} current=${replacePrice.current?.gb}/${replacePrice.current?.usedGb} result=${replacePrice.result?.gb} in ${Math.round((Number(replacePrice.result?.expiryAt) - Date.now()) / DAY26)}d`
+    );
+    // The money follows the same numbers: the tariff of the NEW size, at the
+    // highest inbound of the package (902: 20GB x 50 = 1000, over 901: 300).
+    check(
+      'and it is priced for the renewal it is going to apply, not for a top-up',
+      Number(replacePrice.total) === 1000 && Number(replacePrice.basis?.inboundId) === 902
+        && replacePrice.charged === true && replacePrice.actor === 'reseller',
+      `total=${replacePrice.total} basis=${replacePrice.basis?.inboundId} charged=${replacePrice.charged}`
+    );
+    const addQuote = await request('POST', `/api/reseller/configs/${stage5Id}/extend/quote`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 20, days: 60 },
+    });
+    const addPrice = addQuote.json?.data || {};
+    check(
+      'without the tick the old arithmetic is untouched: 30+20=50GB and the days stack',
+      addQuote.status === 200 && addPrice.mode === 'add'
+        && Number(addPrice.result?.gb) === 50 && addPrice.result?.usageCleared === false
+        && Number(addPrice.result?.expiryAt) > Number(addPrice.current?.expiryAt),
+      `mode=${addPrice.mode} result=${addPrice.result?.gb} usageCleared=${addPrice.result?.usageCleared}`
+    );
+    const balanceBeforeReplace = await walletState();
+    const ledgerBeforeReplace = await renewLedgerCount();
+    const resetCallsBeforeReplace = resetTrafficCount();
+    const nodeCallsBeforeReplace = mockXui.calls.length;
+    const replaceRenew = await request('POST', `/api/reseller/configs/${stage5Id}/extend`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 20, days: 60, resetUsage: true },
+    });
+    const replacedConfig = replaceRenew.json?.data?.config || {};
+    const replacedNote = await newestNote('تمدید انجام شد');
+    check(
+      'v1.4.26 applying it leaves the customer with exactly 20GB/60d and a meter at zero',
+      replaceRenew.status === 200
+        && Number(replacedConfig.totalGb) === 20
+        && Number(replacedConfig.used) === 0
+        && Math.abs(Number(replacedConfig.expiryAt) - (Date.now() + 60 * DAY26)) < 5 * 60 * 1000,
+      `status=${replaceRenew.status} gb=${replacedConfig.totalGb} used=${replacedConfig.used} in ${Math.round((Number(replacedConfig.expiryAt) - Date.now()) / DAY26)}d`
+    );
+    check(
+      'the node agrees: same quota, counters zeroed there, no second client minted',
+      Number(mockXui.clients.get(stage5Email)?.totalGB) === 20 * UNIT26
+        && mockXui.clients.get(stage5Email)?.up === 0
+        && mockXui.clients.get(stage5Email)?.down === 0
+        && resetTrafficCount() === resetCallsBeforeReplace + 1
+        && mockXui.calls.slice(nodeCallsBeforeReplace).filter((call) => call.route === '/clients/add').length === 0,
+      `nodeGb=${mockXui.clients.get(stage5Email)?.totalGB / UNIT26} up=${mockXui.clients.get(stage5Email)?.up} resets=${resetTrafficCount() - resetCallsBeforeReplace}`
+    );
+    check(
+      'and the reseller pays the tariff of the new plan — the reset is no longer free',
+      (await walletState()) === balanceBeforeReplace - 1000
+        && await renewLedgerCount() === ledgerBeforeReplace + 1,
+      `balance=${balanceBeforeReplace}→${await walletState()} ledger=${ledgerBeforeReplace}→${await renewLedgerCount()}`
+    );
+    // The message has to tell the reseller what happened in the words he will
+    // quote to the customer, so both halves are asserted separately: the money
+    // that left his wallet and the meter that went to zero.
+    const replacedText = String(faDigits(replacedNote.body || '')).replace(/[٬,\s]/g, '');
+    check(
+      'and the renewal note says what really changed: the new size, zero usage, the tariff charged',
+      replacedText.includes('1000')
+        && String(replacedNote.body || '').includes('مصرف صفر')
+        && String(replacedNote.body || '').includes('20GB'),
+      `body=${replacedNote.body}`
+    );
+    const emptyReset = await request('POST', `/api/reseller/configs/${stage5Id}/extend`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 0, days: 0, resetUsage: true },
+    });
+    const afterEmptyReset = await stage5View();
+    check(
+      'a reset with nothing typed is refused, because that was the free reset again',
+      emptyReset.status === 422 && emptyReset.json?.error?.code === 'reset_needs_renewal'
+        && Number(afterEmptyReset.totalGb) === 20 && Number(afterEmptyReset.used) === 0
+        && resetTrafficCount() === resetCallsBeforeReplace + 1,
+      `status=${emptyReset.status} code=${emptyReset.json?.error?.code} gb=${afterEmptyReset.totalGb} used=${afterEmptyReset.used}`
+    );
+    setStage5Usage(2 * UNIT26, 1 * UNIT26);
+    // The panel only knows what it read from the node, so let it read the new
+    // 3GB before renewing — otherwise "keeps the usage" proves nothing.
+    await request('POST', '/api/admin/sync', { cookies, csrf });
+    const addRenew = await request('POST', `/api/reseller/configs/${stage5Id}/extend`, {
+      cookies: shopCookies, csrf: shopCsrf, body: { gb: 5, days: 5 },
+    });
+    const addedConfig = addRenew.json?.data?.config || {};
+    check(
+      'a renewal without the tick still adds, and keeps the usage the customer made',
+      addRenew.status === 200 && Number(addedConfig.totalGb) === 25
+        && Number(addedConfig.used) === 3 * UNIT26
+        && Number(addRenew.json?.data?.config?.expiryAt) > Number(replacedConfig.expiryAt),
+      `status=${addRenew.status} gb=${addedConfig.totalGb} used=${addedConfig.used / UNIT26}`
+    );
+    // The button that took the free reset's place: it READS the node and shows
+    // what it says. Nothing may be written, or a "refresh" would become a way to
+    // change a customer on another panel.
+    const client = mockXui.clients.get(stage5Email);
+    client.up = 5 * UNIT26;
+    client.down = 4 * UNIT26;
+    client.totalGB = 999 * UNIT26;
+    const refreshCallsFrom = mockXui.calls.length;
+    const refreshedOnce = await request('POST', `/api/reseller/configs/${stage5Id}/refresh`, {
+      cookies: shopCookies, csrf: shopCsrf,
+    });
+    const refreshData = refreshedOnce.json?.data || {};
+    const refreshRoutes = [...new Set(nodeCallsSince(refreshCallsFrom))];
+    check(
+      'v1.4.26 refresh reads the real usage of every row back from the node',
+      refreshedOnce.status === 200
+        && Number(refreshData.refreshed) === 1
+        && Number(refreshData.clients) === 1
+        && Number(refreshData.config.used) === 9 * UNIT26
+        && refreshData.missing === 0 && refreshData.errors.length === 0,
+      `status=${refreshedOnce.status} refreshed=${refreshData.refreshed} used=${(refreshData.config?.used || 0) / UNIT26} missing=${refreshData.missing}`
+    );
+    // The toast on the reseller's screen counts inbounds, so the payload has to
+    // carry that number too — one client with two channels is two inbounds.
+    check('and it counts what the sentence claims: inbounds, not x-ui clients',
+      Number(refreshData.rows) === 2 && Number(refreshData.refreshedRows) === 2,
+      `rows=${refreshData.rows} refreshedRows=${refreshData.refreshedRows} clients=${refreshData.clients}`);
+    check('and it is a read: the only x-ui endpoint it touched is clients/get',
+      refreshRoutes.length === 1 && refreshRoutes[0].startsWith('/clients/get/'),
+      `routes=${refreshRoutes.join(',')}`);
+    check('refresh never imports the node’s plan over the tariff the panel sold',
+      Number(refreshData.config.totalGb) === 25,
+      `gb=${refreshData.config?.totalGb}`);
+    const refreshedRows = await request('GET', `/api/reseller/configs?search=${encodeURIComponent('مشتری جایگزینی تمدید')}`, { cookies: shopCookies });
+    check('every inbound of the package shows the same refreshed pool',
+      refreshedRows.json?.data?.rows?.[0]?.groupCount === 2
+        && Number(refreshedRows.json?.data?.rows?.[0]?.used) === 9 * UNIT26,
+      `rows=${refreshedRows.json?.data?.rows?.[0]?.groupCount} used=${refreshedRows.json?.data?.rows?.[0]?.used}`);
+    const missingClientEmail = stage5Email;
+    mockXui.clients.delete(missingClientEmail);
+    const refreshMissing = await request('POST', `/api/reseller/configs/${stage5Id}/refresh`, {
+      cookies: shopCookies, csrf: shopCsrf,
+    });
+    check('a customer who is gone from the node is reported, not silently zeroed',
+      refreshMissing.status === 200 && Number(refreshMissing.json?.data?.missing) === 1
+        && Number(refreshMissing.json?.data?.missingRows) === 2
+        && Number(refreshMissing.json?.data?.errorRows) === 0
+        && refreshMissing.json?.data?.refreshed === 0
+        && String(refreshMissing.json?.data?.config?.syncStatus || '') === 'missing',
+      `status=${refreshMissing.status} missing=${refreshMissing.json?.data?.missing}/${refreshMissing.json?.data?.missingRows} sync=${refreshMissing.json?.data?.config?.syncStatus}`);
+    mockXui.clients.set(missingClientEmail, client);
+    const stage5Cleanup = await request('DELETE', `/api/admin/configs/${stage5Id}/package`, { cookies, csrf });
+    // Hand the wallet back exactly as this block found it (0): drain whatever is
+    // left instead of guessing how much the three renewals above cost.
+    const leftAfterStage5 = await walletState();
+    const drainAfterReplacePolicy = leftAfterStage5 === 0
+      ? { status: 200 }
+      : await request('POST', `/api/admin/users/${shopId}/balance`, {
+        cookies, csrf, body: { amount: -leftAfterStage5, description: 'تخلیه پس از تست جایگزینی تمدید' },
+      });
+    const stage5Gone = await request('GET', `/api/reseller/configs/${stage5Id}`, { cookies: shopCookies });
+    check(
+      'the v1.4.26 checks leave no customer behind and hand the wallet back',
+      stage5Cleanup.status === 200 && drainAfterReplacePolicy.status === 200
+        && stage5Gone.status === 404 && (await walletState()) === 0,
+      `cleanup=${stage5Cleanup.status} gone=${stage5Gone.status} drained=${leftAfterStage5} balance=${await walletState()}`
+    );
+
     // ------------------------------------------- multi-inbound package (v1.4.0)
     // The mock rejects a subId shared by two clients exactly like x-ui 3.2.5+
     // does, so this order is the regression test for "subId already in use".
@@ -1291,18 +1670,42 @@ function startMockXui(inboundRows) {
       `used=${drainedRow.used} status=${drainedRow.status}`);
     check('every inbound of the package is disabled once the pool runs out',
       mockXui.clients.get(multiConfigs[0].email)?.enable === false);
-    const resetPool = await request('POST', `/api/reseller/configs/${multiConfigs[0].id}/reset`, {
+    // v1.4.26: this very call used to be the free reset. A depleted customer's
+    // meter went back to zero and the traffic he had already paid for simply
+    // vanished, so the reseller could sell the same gigabytes twice. The endpoint
+    // now refuses him — and refuses him WITHOUT moving anything, node included.
+    const resetTrafficBeforeRefusal = mockXui.calls.filter((call) => call.route.startsWith('/clients/resetTraffic/')).length;
+    const clientCallsBeforeRefusal = mockXui.calls.length;
+    const refusedReset = await request('POST', `/api/reseller/configs/${multiConfigs[0].id}/reset`, {
       cookies: shopCookies, csrf: shopCsrf,
     });
-    for (const config of multiConfigs) bumpClient(config, 0, 0);
+    const refusedList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
+    const refusedRow = refusedList.json?.data?.rows?.[0] || {};
+    check('a reseller reset is refused, and NOTHING about the meter moves',
+      refusedReset.status === 403
+        && refusedReset.json?.error?.code === 'reset_forbidden'
+        && refusedRow.used === 10 * gbUnit
+        && refusedRow.status === 'depleted'
+        && mockXui.clients.get(multiConfigs[0].email)?.enable === false
+        && mockXui.calls.filter((call) => call.route.startsWith('/clients/resetTraffic/')).length === resetTrafficBeforeRefusal
+        && mockXui.calls.length === clientCallsBeforeRefusal,
+      `status=${refusedReset.status} code=${refusedReset.json?.error?.code} used=${refusedRow.used} nodeUp=${mockXui.clients.get(multiConfigs[0].email)?.up}`);
+    // The main admin keeps the button: he sets his own prices, and v1.4.25 already
+    // made him the only actor who may renew for free. The node zeroes with him, so
+    // the next sync cannot undo the reset the way a local-only clear could.
+    const resetPool = await request('POST', `/api/admin/configs/${multiConfigs[0].id}/reset`, {
+      cookies, csrf,
+    });
     const resetList = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
     const resetRow = resetList.json?.data?.rows?.[0] || {};
-    check('resetting usage clears the pool and re-enables every inbound',
+    check('an admin reset clears the pool on the node and re-enables every inbound',
       resetPool.status === 200
-      && resetRow.used === 0
-      && resetRow.status === 'active'
-      && mockXui.clients.get(multiConfigs[0].email)?.enable !== false,
-      `status=${resetRow.status} enabled=${mockXui.clients.get(multiConfigs[0].email)?.enable}`);
+        && mockXui.clients.get(multiConfigs[0].email)?.up === 0
+        && mockXui.clients.get(multiConfigs[0].email)?.down === 0
+        && resetRow.used === 0
+        && resetRow.status === 'active'
+        && mockXui.clients.get(multiConfigs[0].email)?.enable !== false,
+      `status=${resetPool.status} used=${resetRow.used} enabled=${mockXui.clients.get(multiConfigs[0].email)?.enable}`);
     const quotaOnce = await request('POST', `/api/admin/configs/${multiConfigs[1].id}/quota`, {
       cookies, csrf, body: { gb: 20 },
     });
@@ -1441,6 +1844,14 @@ function startMockXui(inboundRows) {
     const v1Filtered = await request('GET', '/api/v1/configs?inboundId=902', { headers: { 'x-api-key': apiKey } });
     check('API v1 inbound filtering stays flat',
       v1Filtered.json?.data?.total === 1 && v1Filtered.json.data.rows[0]?.inboundId === 902);
+    // The API token is another door into the same service, so it has to meet the
+    // same refusal: an automated reseller cannot buy back his meter for free.
+    const v1EmptyReset = await request('POST', `/api/v1/configs/${bought.id}/extend`, {
+      headers: { 'x-api-key': apiKey }, body: { gb: 0, days: 0, resetUsage: true },
+    });
+    check('v1.4.26 the API token cannot reset either — same 422, same untouched meter',
+      v1EmptyReset.status === 422 && v1EmptyReset.json?.error?.code === 'reset_needs_renewal',
+      `status=${v1EmptyReset.status} code=${v1EmptyReset.json?.error?.code}`);
 
     // Reproduce the reported two-inbound order and a second order with the
     // same display name. Only shared subscription identity defines a package.
@@ -1739,16 +2150,36 @@ function startMockXui(inboundRows) {
       // zero-tariff inbound, so the money path is proven on the SECOND adopted
       // package with a priced inbound: exactly one charge, and the free heal
       // below must not touch the wallet at all.
+      //
+      // v1.4.25: an ADMIN add is free unless he ticks «کسر از کیف پول نماینده»,
+      // so the paid case has to ask for it by name — and the paired free add on
+      // the next lines proves the switch is not just decoration.
       const paidAdd = await request('POST', `/api/admin/configs/${legacyB}/inbounds`, {
-        cookies, csrf, body: { inboundId: 903 },
+        cookies, csrf, body: { inboundId: 903, charge: true },
       });
       const walletAfterAdd = Number((await request('GET', '/api/auth/me', { cookies: fixedCookies })).json?.data?.user?.balance || 0);
       const addCharges = fixedDb.prepare(
         "SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND type = 'purchase' AND description LIKE 'افزودن اینباند%'"
       ).get(fixedShopId).c;
-      check('adding a priced inbound to an adopted package charges the reseller wallet once',
+      check('adding a priced inbound with the charge switch on charges the reseller wallet once',
         paidAdd.status === 201 && walletAfterAdd < walletBeforeAdd && Number(addCharges) === 1,
         `status=${paidAdd.status} balance=${walletBeforeAdd}→${walletAfterAdd} charges=${addCharges}`);
+
+      // The same call without the switch: the channel joins the customer's own
+      // client, the wallet does not move and no ledger row is written.
+      const freeAdd = await request('POST', `/api/admin/configs/${legacyB}/inbounds`, {
+        cookies, csrf, body: { inboundId: 902 },
+      });
+      const walletAfterFreeAdd = Number((await request('GET', '/api/auth/me', { cookies: fixedCookies })).json?.data?.user?.balance || 0);
+      const freeAddCharges = fixedDb.prepare(
+        "SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND type = 'purchase' AND description LIKE 'افزودن اینباند%'"
+      ).get(fixedShopId).c;
+      const freeAdded = freeAdd.json?.data?.config || {};
+      check('v1.4.25 the same add without the switch gives the customer the channel for free',
+        freeAdd.status === 201 && Number(freeAdded.inboundId) === 902
+        && String(freeAdded.email || '') === String(paidAdd.json?.data?.config?.email || '')
+        && walletAfterFreeAdd === walletAfterAdd && Number(freeAddCharges) === 1,
+        `status=${freeAdd.status} balance=${walletAfterAdd}→${walletAfterFreeAdd} charges=${freeAddCharges}`);
 
       // An adopted row is not this panel's customer: detaching it must leave the
       // live x-ui client alone, while a panel-created row still deletes it.

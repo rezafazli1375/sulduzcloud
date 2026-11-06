@@ -173,6 +173,12 @@ router.patch('/configs/:id', asyncH(async (req, res) => {
 }));
 
 router.post('/configs/:id/extend', asyncH(async (req, res) => {
+  // No `charge` is forwarded here on purpose (v1.4.25): a reseller is always
+  // charged for his own customer, and the service only ever reads the flag for an
+  // admin viewer — so a reseller session posting {"charge": false} changes nothing.
+  // `resetUsage` IS forwarded: since v1.4.26 it is a renewal MODE (the typed size
+  // and days become the package) and it is charged like any other renewal, so it
+  // is not a way to reach the free reset this route no longer offers.
   const config = await configsService.extendConfig(
     num(req.params.id),
     {
@@ -188,11 +194,13 @@ router.post('/configs/:id/extend', asyncH(async (req, res) => {
 
 // The renewal dialog shows the price before the reseller applies it. It answers
 // whether or not wallet billing is switched on — the reseller is entitled to know
-// the amount of a renewal he is about to confirm.
+// the amount of a renewal he is about to confirm. Since v1.4.26 it also answers
+// the OUTCOME (`current` / `result`), because with the reset tick the numbers he
+// types are not a delta: the drawer must show what the package will BE.
 router.post('/configs/:id/extend/quote', (req, res) => {
   const data = configsService.quoteRenewalPrice(
     num(req.params.id),
-    { gb: num(req.body?.gb), days: num(req.body?.days) },
+    { gb: num(req.body?.gb), days: num(req.body?.days), resetUsage: Boolean(req.body?.resetUsage) },
     req.user
   );
   res.json({ ok: true, data });
@@ -220,9 +228,21 @@ router.post('/configs/:id/inbounds', asyncH(async (req, res) => {
   res.status(201).json({ ok: true, data: { config } });
 }));
 
+// v1.4.26: the free traffic reset is gone from the reseller panel. The route is
+// kept as a door that clearly refuses, instead of a 404 that would make a stale
+// browser tab look like a server fault — the service answers 403 `reset_forbidden`
+// with the way out in the message (renew with the reset tick, which is charged).
 router.post('/configs/:id/reset', asyncH(async (req, res) => {
   const config = await configsService.resetUsage(num(req.params.id), req, req.user);
   res.json({ ok: true, data: { config } });
+}));
+
+// The button that took the reset's place: re-read this customer from his node and
+// put the node's own counters into the panel's copy. x-ui is only READ — no write,
+// no restart, nothing that could hurt the customer.
+router.post('/configs/:id/refresh', asyncH(async (req, res) => {
+  const data = await configsService.refreshPackage(num(req.params.id), req, req.user);
+  res.json({ ok: true, data });
 }));
 
 // Panel v1.4.21: the customer's x-ui client was deleted on the node panel, so

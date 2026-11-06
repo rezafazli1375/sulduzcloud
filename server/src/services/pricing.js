@@ -115,7 +115,7 @@ function describeInbound(inbound, gb, days, userId) {
   };
 }
 
-function quote({ userId = 0, inboundIds = [], gb = 0, days = 0, unlimited = false } = {}) {
+function quote({ userId = 0, inboundIds = [], gb = 0, days = 0, unlimited = false, charge = true } = {}) {
   const amountGb = unlimited ? 0 : Math.max(0, Number(gb || 0));
   const amountDays = Math.max(0, Math.round(Number(days || 0)));
   const ids = (Array.isArray(inboundIds) ? inboundIds : [inboundIds])
@@ -141,6 +141,12 @@ function quote({ userId = 0, inboundIds = [], gb = 0, days = 0, unlimited = fals
   const total = basis ? basis.total : 0;
   const balance = user ? Number(user.balance || 0) : 0;
   const billing = billingInfo();
+  // v1.4.25: an admin building a package for a reseller may do it for free, in
+  // which case the tariff is still named — but `charged` says honestly that this
+  // money is not going to leave the wallet, and a free order can never be
+  // "insufficient balance". Only the admin route ever passes charge:false; the
+  // reseller route does not, so a reseller is always quoted as paying.
+  const charged = Boolean(charge && billing.enabled && total > 0);
   return {
     billing,
     gb: amountGb,
@@ -153,7 +159,9 @@ function quote({ userId = 0, inboundIds = [], gb = 0, days = 0, unlimited = fals
     basisInboundId: basis ? basis.inboundId : 0,
     currency: billing.currency,
     balance,
-    sufficient: !billing.enabled || total <= 0 || balance >= total,
+    charge: Boolean(charge),
+    charged,
+    sufficient: !charged || balance >= total,
     items,
   };
 }

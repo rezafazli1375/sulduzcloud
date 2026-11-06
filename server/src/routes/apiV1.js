@@ -96,6 +96,14 @@ router.get('/configs/:id', asyncH(async (req, res) => {
 }));
 
 router.post('/configs/:id/extend', asyncH(async (req, res) => {
+  // v1.4.25 deliberately forwards no `charge`: this route never opts INTO taking
+  // the reseller's money. An API token owned by a reseller is still always
+  // charged (the service ignores the flag for anyone but an admin), and one
+  // owned by the admin renews for free, which is the admin's own rule.
+  // v1.4.26: `resetUsage` here is the REPLACE mode of a renewal — the typed GB and
+  // days become the package and the meter is zeroed, for the tariff of those
+  // numbers. It is not the free traffic reset the reseller panel lost, and a reset
+  // with nothing to renew is refused (422 reset_needs_renewal).
   const config = await configsService.extendConfig(
     num(req.params.id),
     {

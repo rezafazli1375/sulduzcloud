@@ -231,6 +231,37 @@ function chargeReseller(reseller, amount, description, type, req) {
   return next;
 }
 
+/**
+ * Is this request being made by the main admin? Every route already hands the
+ * service its viewer (the admin routes pass {role:'admin'}, the reseller routes
+ * pass req.user), and createConfigs is the one place that only has req.
+ */
+function actingAsAdmin(req, viewer) {
+  const role = String((viewer && viewer.role) || (req && req.user && req.user.role) || '');
+  return role === 'admin';
+}
+
+/**
+ * v1.4.25 — WHO PAYS when a customer package is renewed, built or extended with
+ * another channel.
+ *
+ * The owner's rule: the main admin acting on a reseller's customer must not
+ * spend that reseller's wallet. An admin action is therefore FREE unless he
+ * explicitly ticks «کسر از کیف پول نماینده», and the tick is what the routes
+ * forward as `charge`. A reseller acting on his own customer is ALWAYS charged —
+ * the flag is only ever read for an admin viewer, and the reseller routes do not
+ * forward it at all, so `{"charge": false}` from a reseller session buys nothing
+ * and this rule cannot be talked around from the client side.
+ *
+ * `amount` is still computed in the free case: the drawer shows the reseller
+ * what the tariff WOULD have been, plainly marked as not deducted, so a free
+ * renewal can never read like a charge that did not happen.
+ */
+function shouldCharge(req, viewer, opts = {}) {
+  if (!actingAsAdmin(req, viewer)) return true;
+  return Boolean(opts && opts.charge);
+}
+
 function slug(value) {
   return String(value || '')
     .toLowerCase()
@@ -569,7 +600,12 @@ async function createConfigs(input, req) {
   });
 
   // Fail fast before touching x-ui when the wallet cannot cover the order.
-  if (billingEnabled() && totalPrice > 0 && Number(user.balance || 0) < totalPrice) {
+  // v1.4.25: an admin order that is not charged cannot be short on money, so the
+  // whole check is skipped with the charge — a broke reseller must not block the
+  // admin from building him a package.
+  const willCharge = shouldCharge(req, null, input);
+  const byAdmin = actingAsAdmin(req, null);
+  if (willCharge && billingEnabled() && totalPrice > 0 && Number(user.balance || 0) < totalPrice) {
     throw new ApiError(402, 'insufficient_balance', 'موجودی کیف پول کافی نیست / Insufficient wallet balance');
   }
 
@@ -642,7 +678,7 @@ async function createConfigs(input, req) {
 
     // Charge only after every client exists in x-ui; the whole order is rolled
     // back below when the wallet or the panel rejects it.
-    if (billingEnabled() && totalPrice > 0) {
+    if (willCharge && billingEnabled() && totalPrice > 0) {
       chargeReseller(user, totalPrice, `ایجاد بسته ${inboundIds.length} اینباندی (${gb} GB مشترک / ${days} روز)`, 'purchase', req);
     }
   } catch (err) {
@@ -659,6 +695,8 @@ async function createConfigs(input, req) {
     days,
     count: created.length,
     price: totalPrice,
+    charged: willCharge && billingEnabled() && totalPrice > 0,
+    free: !willCharge,
   });
   if (req?.user && req.user.role === 'reseller') {
     notifyUser(req.user.id, {
@@ -932,6 +970,61 @@ async function applyToXui(row, patch) {
 }
 
 /**
+ * v1.4.26 — WHAT THE PACKAGE LOOKS LIKE AFTER a renewal, computed in one place so
+ * the price preview, the drawer's wording and extendConfig itself cannot drift
+ * apart (the same reason packageRenewalPrice exists for the money).
+ *
+ * Two modes, and the tick decides which one the reseller asked for:
+ *   add     (tick off)  — the entered GB and days are ADDED to the shared pool and
+ *                         the expiry; the traffic he already used stays counted.
+ *   replace (tick on)   — the entered GB and days BECOME the package's new quota
+ *                         and expiry and the used traffic goes to zero.
+ *
+ * Before this, «ریست مصرف فعلی» added the new size ON TOP and then wiped the
+ * counters, so a 30GB/30d customer who had already burned half of it came out at
+ * 50GB/90d with a zeroed meter — the reseller paid for one renewal and the panel
+ * handed the customer the already-spent traffic back. The owner's own example is
+ * the spec: 30GB/30d half-used, renewed for 20GB/60d with the tick ⇒ 20GB/60d,
+ * used 0. Not 50GB/90d, and not a reset.
+ *
+ * A field left at 0 keeps the current value in BOTH modes, so replacing only the
+ * days can never silently drop a customer's quota to zero — and an unlimited
+ * package (quota 0) or a never-expiring one (expiry 0) stays that way.
+ */
+function renewalOutcome(targets, { gb = 0, days = 0, resetUsage = false } = {}) {
+  const addBytes = gbToBytes(Math.max(0, Number(gb || 0)));
+  const addDays = Math.max(0, Math.round(Number(days || 0)));
+  const groupQuota = targets.reduce((max, target) => Math.max(max, Number(target.total_bytes || 0)), 0);
+  const groupExpiry = targets.reduce((max, target) => Math.max(max, Number(target.expiry_at || 0)), 0);
+  // What the customer has already burned, counted once per x-ui client (every row
+  // of one client carries the same node counters). The drawer needs it because a
+  // replace renewal is exactly the case where this number is about to vanish —
+  // and it must vanish only with the money behind it.
+  const usedBytes = distinctClients(targets)
+    .reduce((sum, client) => sum + Math.max(...client.map((target) => Number(target.up_bytes || 0) + Number(target.down_bytes || 0))), 0);
+  const replace = Boolean(resetUsage);
+  const now = Date.now();
+  return {
+    replace,
+    addBytes,
+    addDays,
+    changeTotal: addBytes > 0,
+    changeExpiry: addDays > 0,
+    groupQuota,
+    groupExpiry,
+    usedBytes,
+    newTotal: addBytes > 0
+      ? (replace ? addBytes : (groupQuota > 0 ? groupQuota + addBytes : addBytes))
+      : groupQuota,
+    newExpiry: addDays > 0
+      ? (replace
+        ? now + addDays * DAY_MS
+        : (groupExpiry > 0 ? Math.max(now, groupExpiry) : now) + addDays * DAY_MS)
+      : groupExpiry,
+  };
+}
+
+/**
  * What a renewal of this package costs, computed exactly the way extendConfig
  * charges it: ONE charge for the whole package, at the highest tariff among the
  * rows the package actually holds (never the sum of tariffs, and never a channel
@@ -940,9 +1033,11 @@ async function applyToXui(row, patch) {
  * This lives in one place because the drawer now shows the reseller the amount
  * BEFORE he confirms. A preview that re-implements the rule would be a number he
  * is never charged, so both paths share this helper — including the reseller's
- * per-inbound discount, which pricing.priceFor already applies.
+ * per-inbound discount, which pricing.priceFor already applies. Since v1.4.26 it
+ * also carries the `outcome` the renewal will produce, for the same reason: the
+ * drawer must be able to say "this makes him 20GB for 60 days", not "+20GB".
  */
-function packageRenewalPrice(row, { gb = 0, days = 0, price = 0 } = {}) {
+function packageRenewalPrice(row, { gb = 0, days = 0, price = 0, charge = true, resetUsage = false } = {}) {
   const targets = packageRows(row);
   const reseller = getResellerRow(row?.user_id);
   const addDays = Math.max(0, Math.round(Number(days || 0)));
@@ -968,6 +1063,11 @@ function packageRenewalPrice(row, { gb = 0, days = 0, price = 0 } = {}) {
   }
   const billing = pricing.billingInfo();
   const balance = reseller ? Number(reseller.balance || 0) : 0;
+  // v1.4.25: the tariff is computed even when the actor is renewing for free, so
+  // the drawer can name the money it is NOT taking. `charged` is the honest
+  // answer to "will the wallet actually move" — false for a free admin renewal,
+  // and false whatever the flag says while the wallet is switched off.
+  const charged = Boolean(charge && billing.enabled && amount > 0);
   return {
     targets,
     reseller,
@@ -976,45 +1076,62 @@ function packageRenewalPrice(row, { gb = 0, days = 0, price = 0 } = {}) {
     amount,
     basis,
     billing,
-    // Nothing is taken when billing is off, and a free renewal can never be short.
-    sufficient: !billing.enabled || amount <= 0 || balance >= amount,
+    outcome: renewalOutcome(targets, { gb, days: addDays, resetUsage }),
+    charge: Boolean(charge),
+    charged,
+    // Nothing is taken when the renewal is free or billing is off, and a free
+    // renewal can never be short — not even for a reseller sitting at zero.
+    sufficient: !charged || balance >= amount,
   };
 }
 
-async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = false } = {}, req, viewer) {
+async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = false, charge } = {}, req, viewer) {
   const { row } = configDetail(id, viewer);
   const addBytes = gbToBytes(Math.max(0, Number(gb || 0)));
   const addDays = Math.max(0, Math.round(Number(days || 0)));
   if (!addBytes && !addDays && !resetUsage) throw new ApiError(422, 'nothing_to_add', 'Enter traffic or days to add');
+  // v1.4.26: the tick is a RENEWAL MODE, not a way to zero the meter. A renewal
+  // with nothing in it would clear the used traffic and change no quota and no
+  // expiry — which is exactly the free reset the owner took away from resellers,
+  // so the door is closed here too, whoever comes through it.
+  if (resetUsage && !addBytes && !addDays) {
+    throw new ApiError(422, 'reset_needs_renewal',
+      'ریست مصرف فقط همراه تمدید انجام می‌شود — حجم یا روز جدید را وارد کنید / A reset only travels with a renewal: enter the new GB or days');
+  }
 
   // A customer with several inbounds is one package: renewing from any of its
   // configs applies to the whole group and is charged once, at the highest
   // inbound tariff of the group (not the sum of tariffs).
-  const priced = packageRenewalPrice(row, { gb, days, price });
+  //
+  // v1.4.25: the main admin renewing on a reseller's behalf does NOT spend that
+  // reseller's wallet unless he ticked the charge switch, and the wallet check
+  // below is skipped with it — a broke reseller must not be able to block an
+  // admin's free renewal. A reseller is always charged.
+  const willCharge = shouldCharge(req, viewer, { charge });
+  const byAdmin = actingAsAdmin(req, viewer);
+  const priced = packageRenewalPrice(row, { gb, days, price, charge: willCharge, resetUsage });
   const targets = priced.targets;
   const reseller = priced.reseller;
   const amount = priced.amount;
-  if (billingEnabled() && amount > 0 && reseller && Number(reseller.balance || 0) < amount) {
+  const charged = priced.charged;
+  const outcome = priced.outcome;
+  if (willCharge && billingEnabled() && amount > 0 && reseller && Number(reseller.balance || 0) < amount) {
     throw new ApiError(402, 'insufficient_balance', 'موجودی کیف پول کافی نیست / Insufficient wallet balance');
   }
 
   // The added GB grows ONE shared pool, so the new pool size is computed once
   // from the package quota and written to every member (this also heals members
-  // whose stored quota drifted apart).
-  const groupQuota = targets.reduce((max, target) => Math.max(max, Number(target.total_bytes || 0)), 0);
-  const sharedTotal = addBytes > 0 ? (groupQuota > 0 ? groupQuota + addBytes : addBytes) : groupQuota;
-  const groupExpiry = targets.reduce((max, target) => Math.max(max, Number(target.expiry_at || 0)), 0);
-  const sharedExpiry = addDays > 0
-    ? (groupExpiry > 0 ? Math.max(Date.now(), groupExpiry) : Date.now()) + addDays * DAY_MS
-    : 0;
+  // whose stored quota drifted apart). Since v1.4.26 the same shared numbers come
+  // from renewalOutcome, which is also what the price preview shows — the drawer
+  // and the write can no longer disagree about what the customer ends up with.
   const updates = targets.map((target) => {
     const currentExpiry = Number(target.expiry_at || 0);
     return {
       row: target,
       currentExpiry,
       currentTotal: Number(target.total_bytes || 0),
-      newExpiry: addDays > 0 ? sharedExpiry : currentExpiry,
-      newTotal: addBytes > 0 ? sharedTotal : Number(target.total_bytes || 0),
+      newExpiry: outcome.changeExpiry ? outcome.newExpiry : currentExpiry,
+      newTotal: outcome.changeTotal ? outcome.newTotal : Number(target.total_bytes || 0),
     };
   });
 
@@ -1043,8 +1160,22 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
       }
       applied.push(batch);
     }
-    if (billingEnabled() && amount > 0) {
-      chargeReseller(reseller, amount, `تمدید بسته ${targets.length} اینباندی (+${gb}GB مشترک / +${addDays}d)`, 'renew', req);
+    // v1.4.25: a free admin renewal takes nothing and writes no ledger row at all
+    // — not a zero-amount one, because a 0 transaction in the reseller's book is
+    // a lie about money that never moved.
+    if (willCharge && billingEnabled() && amount > 0) {
+      // The ledger line says which kind of renewal this was: a replace is not a
+      // top-up, and a reseller reading «+20GB» in his book for a package that
+      // ended at 20GB would think the panel cheated him on the quota.
+      chargeReseller(
+        reseller,
+        amount,
+        outcome.replace
+          ? `تمدید جایگزین بسته ${targets.length} اینباندی (${gb}GB / ${addDays}d، مصرف صفر)`
+          : `تمدید بسته ${targets.length} اینباندی (+${gb}GB مشترک / +${addDays}d)`,
+        'renew',
+        req
+      );
     }
   } catch (err) {
     for (const batch of applied.reverse()) {
@@ -1085,26 +1216,48 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
     gb,
     days,
     resetUsage,
+    // v1.4.26: 'replace' means the tick was on — the entered size/days BECOME the
+    // package and the meter is zeroed; 'add' is the old, untouched behaviour. The
+    // audit has to say which one happened, because the two look identical in `gb`.
+    mode: outcome.replace ? 'replace' : 'add',
+    resultGb: bytesToGb(outcome.newTotal),
+    resultExpiryAt: outcome.changeExpiry ? outcome.newExpiry : 0,
     amount,
+    charged,
+    free: !willCharge,
     groupSize: targets.length,
     applied: applied.reduce((sum, batch) => sum + batch.length, 0),
   });
   if (reseller) {
-    // The reseller's confirmation of a renewal: what was added, what it cost and
-    // until when the package is now valid. With the wallet switched off the amount
-    // is still named but plainly marked as not deducted, so the message can never
-    // read like a charge that did not happen.
+    // The reseller's confirmation of a renewal: what the package is now, what it
+    // cost and until when it is valid. With the wallet switched off the amount is
+    // still named but plainly marked as not deducted, so the message can never
+    // read like a charge that did not happen — and since v1.4.25 a renewal the
+    // admin did for free says so, because a reseller who sees a tariff here and
+    // no wallet movement otherwise starts calling to ask what happened.
+    //
+    // Since v1.4.26 a reset-with-renewal is written as the RESULT, not as a
+    // delta: «به ۲۰ گیگ / ۶۰ روز» instead of «+۲۰GB», because the customer did not
+    // gain 20GB on top of what he had — he got a fresh 20GB package.
     const currency = String(settings.getSetting('billing').currency || '').trim();
     const money = amount > 0
-      ? ` · ${amount.toLocaleString('fa-IR')}${currency ? ` ${currency}` : ''}${billingEnabled() ? ' کسر شد' : ' (بدون کسر — کیف پول خاموش)'}`
+      ? ` · ${amount.toLocaleString('fa-IR')}${currency ? ` ${currency}` : ''}`
+        + (charged
+          ? ' کسر شد'
+          : willCharge
+            ? ' (بدون کسر — کیف پول خاموش)'
+            : ' (رایگان — تمدید توسط مدیر، بدون کسر)')
       : '';
-    const until = sharedExpiry > 0
-      ? ` · معتبر تا ${new Intl.DateTimeFormat('fa-IR', { dateStyle: 'medium' }).format(new Date(sharedExpiry))}`
+    const until = outcome.changeExpiry && outcome.newExpiry > 0
+      ? ` · معتبر تا ${new Intl.DateTimeFormat('fa-IR', { dateStyle: 'medium' }).format(new Date(outcome.newExpiry))}`
       : '';
+    const size = outcome.replace
+      ? `${gb ? `${gb}GB ` : ''}${addDays ? `${addDays} روز` : ''}`.trim()
+      : `${gb ? `+${gb}GB ` : ''}${addDays ? `+${addDays} روز` : ''}`.trim();
     notifyUser(reseller.id, {
       type: 'success',
       title: 'تمدید انجام شد',
-      body: `${row.email} — ${gb ? `+${gb}GB ` : ''}${addDays ? `+${addDays} روز` : ''}`.trim()
+      body: `${byAdmin ? 'توسط مدیر — ' : ''}${row.email} — ${outcome.replace && size ? `به ${size} (مصرف صفر)` : size}`.trim()
         + money + until
         + (targets.length > 1 ? ` (${targets.length} اینباند، حجم مشترک)` : ''),
       link: '/reseller/configs',
@@ -1118,10 +1271,25 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
  * returned even while wallet billing is switched off, so the reseller can see the
  * amount and confirm it instead of being charged blind. A client-supplied price is
  * never accepted here — the preview always shows the panel's own tariff.
+ *
+ * Since v1.4.25 it also answers `charged`, the same rule extendConfig applies, so
+ * the drawer labels the money it is showing as "will be deducted" or "not
+ * deducted — free". It is derived from the viewer's role, never trusted from the
+ * body: a reseller who posts {"charge": false} is still quoted as charged.
+ *
+ * Since v1.4.26 it answers `result` too — the quota and expiry the package will
+ * actually have afterwards, and what it has now. The drawer used to print "+20GB"
+ * and leave the reseller to do the arithmetic; with the reset tick the entered
+ * numbers are not a delta at all, so the preview shows the outcome the server is
+ * going to write. It is a preview only: extendConfig recomputes it from its own
+ * body, so nothing here can steer the renewal.
  */
-function quoteRenewalPrice(id, { gb = 0, days = 0 } = {}, viewer) {
+function quoteRenewalPrice(id, { gb = 0, days = 0, charge, resetUsage = false } = {}, viewer, req = null) {
   const { row } = configDetail(id, viewer);
-  const priced = packageRenewalPrice(row, { gb: Math.max(0, Number(gb || 0)), days });
+  const willCharge = shouldCharge(req, viewer, { charge });
+  const amountGb = Math.max(0, Number(gb || 0));
+  const priced = packageRenewalPrice(row, { gb: amountGb, days, charge: willCharge, resetUsage });
+  const outcome = priced.outcome;
   return {
     gb: priced.gb,
     days: priced.days,
@@ -1132,6 +1300,23 @@ function quoteRenewalPrice(id, { gb = 0, days = 0 } = {}, viewer) {
     currency: priced.billing.currency,
     balance: priced.reseller ? Number(priced.reseller.balance || 0) : 0,
     sufficient: priced.sufficient,
+    charge: willCharge,
+    charged: priced.charged,
+    actor: actingAsAdmin(req, viewer) ? 'admin' : 'reseller',
+    resetUsage: outcome.replace,
+    mode: outcome.replace ? 'replace' : 'add',
+    current: {
+      gb: bytesToGb(outcome.groupQuota),
+      expiryAt: outcome.groupExpiry,
+      usedGb: bytesToGb(outcome.usedBytes),
+    },
+    result: {
+      gb: bytesToGb(outcome.newTotal),
+      expiryAt: outcome.changeExpiry ? outcome.newExpiry : 0,
+      changedTotal: outcome.changeTotal,
+      changedExpiry: outcome.changeExpiry,
+      usageCleared: outcome.replace,
+    },
   };
 }
 
@@ -1235,8 +1420,21 @@ async function toggleConfig(id, enabled, req, viewer) {
 // Resetting usage clears the whole shared pool, so every inbound starts at
 // zero. A package that was cut off for running out of traffic is re-enabled,
 // because the pool is no longer exhausted.
+//
+// v1.4.26 — WHO MAY PRESS IT. This is the free traffic reset the owner took away
+// from his resellers: one click handed a customer back every gigabyte he had
+// already paid for, and the panel charged nothing for it. The button is gone from
+// the reseller drawer and the door is shut here as well, so a reseller session
+// that posts to the old address gets a plain refusal instead of a discount he
+// helped himself to. The main admin keeps it — it is his own traffic and his own
+// loss to take. A reseller who wants the meter at zero renews with the reset tick
+// (extendConfig, mode 'replace'), which costs what the tariff says.
 async function resetUsage(id, req, viewer) {
   const { row } = configDetail(id, viewer);
+  if (!actingAsAdmin(req, viewer)) {
+    throw new ApiError(403, 'reset_forbidden',
+      'ریست مصرف رایگان برای نماینده حذف شده است — برای صفر شدن مصرف، اشتراک را تمدید کنید و تیک «ریست مصرف» را بزنید / Free traffic reset was removed for resellers: renew with the reset tick instead');
+  }
   const targets = packageRows(row);
   const clients = distinctClients(targets);
   const quota = targets.reduce((max, target) => Math.max(max, Number(target.total_bytes || 0)), 0);
@@ -1275,6 +1473,109 @@ async function resetUsage(id, req, viewer) {
   }
   audit(req, 'config.reset_usage', 'config', row.id, { groupSize: reset, reEnabled: wasDepleted });
   return packageView(getConfigRow(row.id));
+}
+
+/**
+ * v1.4.26 — the reseller's «رفرش», which takes the place of the free reset button
+ * he used to have. It re-reads THIS package from its node and puts the node's own
+ * numbers into the panel's copy, so a page that is showing a stale meter (the
+ * background sync has not run since the node restarted, or the panel could not
+ * reach it) can be made true again without waiting and without calling support.
+ *
+ * What it deliberately is NOT:
+ *   - not a write to the node. x-ui is only READ here (`clients/get`), so this
+ *     button can never hurt a customer on the پنل ثنایی — no restart, no rewrite,
+ *     no counter being zeroed;
+ *   - not a quota or expiry editor. It copies the same fields the background sync
+ *     copies (traffic counters, online time, enabled flag, uuid, subId) and leaves
+ *     `total_bytes` / `expiry_at` alone: the panel is the authority for what a
+ *     package is worth, and a node whose client row carries an empty quota would
+ *     otherwise wipe the customer's plan on a click;
+ *   - not free money. Nothing here changes what anyone paid for.
+ *
+ * The bytes the customer consumed since the last sync are accrued into
+ * usage_daily once per x-ui client, exactly like syncConfigs does — a refresh
+ * that showed the new total but lost the delta would make the traffic chart lie.
+ */
+async function refreshPackage(id, req, viewer) {
+  const { row } = configDetail(id, viewer);
+  const targets = packageRows(row);
+  const clients = distinctClients(targets);
+  const byRowId = new Map(targets.map((target) => [Number(target.id), target]));
+  const now = Date.now();
+  const today = dayKey();
+  const apply = db().prepare(
+    `UPDATE configs SET up_bytes = ?, down_bytes = ?, last_up = ?, last_down = ?, last_online_at = ?,
+       enabled = ?, uuid = ?, xui_sub_id = ?, sync_status = ?, last_synced_at = ?, updated_at = ?
+     WHERE id = ?`
+  );
+  const upsertUsage = db().prepare(
+    `INSERT INTO usage_daily (config_id, user_id, day, up_bytes, down_bytes) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(config_id, day) DO UPDATE SET
+       up_bytes = usage_daily.up_bytes + excluded.up_bytes,
+       down_bytes = usage_daily.down_bytes + excluded.down_bytes`
+  );
+  const errors = [];
+  let refreshed = 0;
+  let missing = 0;
+  // The toast on the reseller's screen counts inbounds, so the server has to
+  // report inbounds too: a customer with three channels and one client is three
+  // rows that were read, not one — and "(۱ اینباند)" for him would be a lie.
+  // The per-client counters stay on the payload because that is what the audit
+  // line and the x-ui request actually were.
+  let refreshedRows = 0;
+  let missingRows = 0;
+  let errorRows = 0;
+  for (const client of clients) {
+    const first = client[0];
+    let live = null;
+    try {
+      live = await xui.getClient(first.email, serverOfConfig(first));
+    } catch (err) {
+      // A node that did not answer tells us nothing, so nothing is overwritten —
+      // the panel keeps its last known numbers and says what went wrong.
+      errors.push({ email: first.email, rows: client.length, error: String(err?.message || err) });
+      errorRows += client.length;
+      continue;
+    }
+    if (!live) {
+      missing += 1;
+      missingRows += client.length;
+      for (const target of client) {
+        apply.run(target.up_bytes, target.down_bytes, target.last_up, target.last_down, target.last_online_at,
+          target.enabled, target.uuid, target.xui_sub_id, 'missing', now, now, target.id);
+      }
+      continue;
+    }
+    const up = Number(live.up || 0);
+    const down = Number(live.down || 0);
+    const deltaUp = Math.max(0, up - Number(first.last_up || 0));
+    const deltaDown = Math.max(0, down - Number(first.last_down || 0));
+    if ((deltaUp > 0 || deltaDown > 0) && dayKey() === today) {
+      upsertUsage.run(first.id, first.user_id, today, deltaUp, deltaDown);
+    }
+    for (const target of client) {
+      apply.run(up, down, up, down, Number(live.lastOnlineAt || 0),
+        live.enabled ? 1 : 0, live.uuid || target.uuid, live.subId || target.xui_sub_id, '', now, now, target.id);
+    }
+    refreshed += 1;
+    refreshedRows += client.length;
+  }
+  audit(req, 'config.refresh', 'config', row.id, {
+    clients: clients.length, refreshed, refreshedRows, missing, missingRows, errorRows, errors: errors.length,
+  });
+  return {
+    config: packageView(getConfigRow(row.id)),
+    clients: clients.length,
+    refreshed,
+    refreshedRows,
+    missing,
+    missingRows,
+    errorRows,
+    errors,
+    rows: targets.length,
+    syncedAt: now,
+  };
 }
 
 async function updateMeta(id, patch, req, viewer) {
@@ -1623,11 +1924,15 @@ async function updateIdentity(id, patch = {}, req, viewer) {
 
 /**
  * Attach one more inbound to an existing customer package. `row` may be any
- * live member. `options.free` skips pricing, limits and the wallet: the fixed
- * inbound heal adds a channel the customer already pays for as part of the
- * package's shared pool, so charging again would be wrong.
+ * live member.
+ *
+ * `free` means no money moves — the automatic fixed-inbound heal has always used
+ * it, and since v1.4.25 an admin who adds a channel without ticking «کسر از کیف
+ * پول نماینده» uses it too (a reseller can never reach it: addInbound derives the
+ * flag from shouldCharge, which is only ever false for an admin viewer). `healed`
+ * keeps the audit trail honest about WHY it was free.
  */
-async function attachInbound(row, inbound, req, { free = false } = {}) {
+async function attachInbound(row, inbound, req, { free = false, healed = false } = {}) {
   const db = getDb();
   const target = Number(inbound.id);
   const user = getResellerRow(row.user_id);
@@ -1759,13 +2064,16 @@ async function attachInbound(row, inbound, req, { free = false } = {}) {
   }
 
   audit(req, 'config.inbound_add', 'config', insertedId, {
-    source: row.id, inboundId: target, inbound: inbound.remark, amount, healed: free,
+    source: row.id, inboundId: target, inbound: inbound.remark, amount,
+    charged: billingEnabled() && amount > 0, free: Boolean(free), healed: Boolean(healed),
   });
   return insertedId;
 }
 
-async function addInbound(id, inboundId, req, viewer) {
+async function addInbound(id, inboundId, req, viewer, opts = {}) {
   const { row } = configDetail(id, viewer);
+  // v1.4.25: the admin does not spend the reseller's wallet unless he asked to.
+  const free = !shouldCharge(req, viewer, opts);
   const target = Number(inboundId);
   const inbound = getInboundRow(target);
   if (!inbound) throw new ApiError(404, 'inbound_not_found', 'Inbound not found');
@@ -1780,7 +2088,7 @@ async function addInbound(id, inboundId, req, viewer) {
   if (members.some((item) => Number(item.inbound_id) === target)) {
     throw new ApiError(409, 'inbound_exists', 'این مشتری همین اینباند را در بسته دارد / This customer already has this inbound');
   }
-  const insertedId = await attachInbound(row, inbound, req);
+  const insertedId = await attachInbound(row, inbound, req, { free });
   return hydrate(getConfigRow(insertedId));
 }
 
@@ -1843,7 +2151,7 @@ async function applyFixedInbound(userId, { dryRun = false } = {}, req) {
     summary.needFix += 1;
     if (dryRun) continue;
     try {
-      await attachInbound(members[0], inbound, req, { free: true });
+      await attachInbound(members[0], inbound, req, { free: true, healed: true });
       summary.healed += 1;
     } catch (err) {
       summary.skipped += 1;
@@ -2426,6 +2734,7 @@ module.exports = {
   setQuota,
   toggleConfig,
   resetUsage,
+  refreshPackage,
   updateMeta,
   removeConfig,
   deletePackage,
