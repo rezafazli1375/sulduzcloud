@@ -446,6 +446,12 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     return true;
   });
   const fixedInboundId = Number(config?.reseller?.fixedInbound || 0);
+  // v1.4.29: a reseller pays for the package when he builds it, not again for each
+  // channel he adds to it afterwards — the inbound joins the shared quota and
+  // expiry he already bought. So his list shows the tariff greyed with «بدون کسر»
+  // instead of a price that looks like a deduction. The admin still has the
+  // v1.4.25 switch, and only his tick puts the wallet back in the picture.
+  const addInboundFree = !isAdmin || !addInboundCharge;
   // The row this drawer was opened on IS the guaranteed base of a package that
   // still holds other channels. The server refuses to take it off — 409
   // fixed_inbound_locked, the owner's own rule — so since v1.4.24 the button shows
@@ -1062,7 +1068,12 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                   {addInboundCharge ? t('configs.extend.chargeOnHint') : t('configs.extend.adminFreeHint')}
                 </p>
               </div>
-            ) : null}
+            ) : (
+              <p className="mb-2 flex items-start gap-2 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-emerald-100/85">
+                <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{t('configs.group.addFreeHint')}</span>
+              </p>
+            )}
             <div className="max-h-[380px] space-y-2 overflow-y-auto pe-1">
               {addable.map((row) => {
                 const addGb = Number(config?.totalGb || 0);
@@ -1075,7 +1086,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                     key={row.id}
                     type="button"
                     disabled={addInbound.isPending}
-                    onClick={() => addInbound.mutate({ inboundId: row.id, charge: isAdmin ? addInboundCharge : true })}
+                    onClick={() => addInbound.mutate({ inboundId: row.id, charge: isAdmin ? addInboundCharge : false })}
                     className={cx(
                       'flex w-full items-center justify-between gap-3 rounded-xl border px-3 py-2.5 text-start transition disabled:opacity-60',
                       isFixed
@@ -1094,9 +1105,9 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                         {row.protocol}{row.network ? ` · ${row.network}` : ''}{row.nodeName ? ` · ${row.nodeName}` : ''}
                       </p>
                     </div>
-                    <span className={cx('shrink-0 text-[11.5px] font-semibold', isAdmin && !addInboundCharge ? 'text-slate-500' : 'text-emerald-300/90')}>
+                    <span className={cx('shrink-0 text-[11.5px] font-semibold', addInboundFree ? 'text-slate-500' : 'text-emerald-300/90')}>
                       {formatMoney(rowPrice, lang, currency)}
-                      {isAdmin && !addInboundCharge ? <span className="ms-1 text-[9px] font-normal">{t('configs.extend.noCharge')}</span> : null}
+                      {addInboundFree ? <span className="ms-1 text-[9px] font-normal">{t('configs.extend.noCharge')}</span> : null}
                     </span>
                   </button>
                 );

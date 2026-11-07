@@ -1,7 +1,7 @@
 {
   "name": "sulduzcloud-web",
   "private": true,
-  "version": "1.4.27",
+  "version": "1.4.29",
   "type": "module",
   "scripts": {
     "dev": "vite",

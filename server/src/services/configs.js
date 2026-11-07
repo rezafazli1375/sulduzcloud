@@ -273,8 +273,8 @@ function actingAsAdmin(req, viewer) {
 }
 
 /**
- * v1.4.25 — WHO PAYS when a customer package is renewed, built or extended with
- * another channel.
+ * v1.4.25 — WHO PAYS when a customer package is built, renewed or given more
+ * quota.
  *
  * The owner's rule: the main admin acting on a reseller's customer must not
  * spend that reseller's wallet. An admin action is therefore FREE unless he
@@ -283,6 +283,12 @@ function actingAsAdmin(req, viewer) {
  * the flag is only ever read for an admin viewer, and the reseller routes do not
  * forward it at all, so `{"charge": false}` from a reseller session buys nothing
  * and this rule cannot be talked around from the client side.
+ *
+ * v1.4.29 narrowed one action out of that rule: ADDING AN INBOUND to a customer
+ * the reseller already has is free for him, because the channel joins the shared
+ * quota and expiry he paid for when he built the package. addInbound therefore
+ * only consults this function for an admin viewer; building, renewing and adding
+ * quota still go through it unchanged.
  *
  * `amount` is still computed in the free case: the drawer shows the reseller
  * what the tariff WOULD have been, plainly marked as not deducted, so a free
@@ -1957,10 +1963,11 @@ async function updateIdentity(id, patch = {}, req, viewer) {
  * live member.
  *
  * `free` means no money moves — the automatic fixed-inbound heal has always used
- * it, and since v1.4.25 an admin who adds a channel without ticking «کسر از کیف
- * پول نماینده» uses it too (a reseller can never reach it: addInbound derives the
- * flag from shouldCharge, which is only ever false for an admin viewer). `healed`
- * keeps the audit trail honest about WHY it was free.
+ * it, and since v1.4.29 so does EVERY add a reseller makes to a customer he
+ * already has (he paid for the package when he built it, and this channel adds no
+ * quota and no days). Since v1.4.25 an admin who adds a channel without ticking
+ * «کسر از کیف پول نماینده» uses it too, so an admin who DOES tick it is the only
+ * paid case left. `healed` keeps the audit trail honest about WHY it was free.
  */
 async function attachInbound(row, inbound, req, { free = false, healed = false } = {}) {
   const db = getDb();
@@ -1986,7 +1993,11 @@ async function attachInbound(row, inbound, req, { free = false, healed = false }
   const expiryAt = members.reduce((max, item) => Math.max(max, Number(item.expiry_at || 0)), 0);
   const totalGb = bytesToGb(totalBytes);
   const remainingDays = expiryAt > 0 ? Math.max(1, Math.ceil((expiryAt - Date.now()) / DAY_MS)) : 0;
-  const amount = free ? 0 : pricing.priceFor(inbound, totalGb, remainingDays, user.id);
+  // The tariff is priced either way. A free add still records what it WOULD have
+  // cost (`waived` below), so a zero in the audit reads as "this was given away"
+  // and not as "this inbound has no price".
+  const quoted = pricing.priceFor(inbound, totalGb, remainingDays, user.id);
+  const amount = free ? 0 : quoted;
   // This joins the customer's existing package instead of creating a new one,
   // and a heal pass adds no quota either, so limits only gate a paid add.
   if (!free) usersService.checkLimits(user, { count: 0, gb: 0, gbEach: totalGb, days: remainingDays });
@@ -2096,14 +2107,24 @@ async function attachInbound(row, inbound, req, { free = false, healed = false }
   audit(req, 'config.inbound_add', 'config', insertedId, {
     source: row.id, inboundId: target, inbound: inbound.remark, amount,
     charged: billingEnabled() && amount > 0, free: Boolean(free), healed: Boolean(healed),
+    waived: free ? quoted : 0,
   });
   return insertedId;
 }
 
 async function addInbound(id, inboundId, req, viewer, opts = {}) {
   const { row } = configDetail(id, viewer);
-  // v1.4.25: the admin does not spend the reseller's wallet unless he asked to.
-  const free = !shouldCharge(req, viewer, opts);
+  // v1.4.29: a reseller pays for the package when he CREATES it, not again for
+  // every channel he adds to it afterwards. The new inbound joins the same shared
+  // quota and expiry — attachInbound adds no bytes and no days — so charging for it
+  // sold the customer nothing new, and on an empty wallet it refused the add
+  // outright. That is the charge the owner asked to be removed.
+  //
+  // The admin keeps his v1.4.25 switch: ticking «کسر از کیف پول نماینده» is the
+  // only case left that bills anyone for this action. `charge: true` sent from a
+  // reseller session buys nothing, because the reseller branch never reads the
+  // flag — the rule cannot be talked around from the client side.
+  const free = !(actingAsAdmin(req, viewer) && shouldCharge(req, viewer, opts));
   const target = Number(inboundId);
   const inbound = getInboundRow(target);
   if (!inbound) throw new ApiError(404, 'inbound_not_found', 'Inbound not found');

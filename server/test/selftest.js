@@ -3089,6 +3089,410 @@ function startMockXui(inboundRows) {
       if (intervalParked) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
     }
 
+    // --------------------- v1.4.28: hidden traffic is not his traffic
+    // A reseller who switches the adoption list off for himself does not see those
+    // subscriptions anywhere in his panel, yet the day ledger kept booking their
+    // bytes under his user id — so his home page announced a busy day next to a
+    // customer list of one package that had used nothing, and the owner's ranking
+    // of resellers put him first for traffic nobody could see. Every counter that
+    // reads usage_daily now goes through the same visibility rule the list, the
+    // KPI cards and the night report already used.
+    const visDb28 = new Database(path.join(DATA_DIR, 'panel.db'));
+    const dayKey28 = (ts) => new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Tehran', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date(ts));
+    const G28 = 1024 ** 3;
+    const today28 = dayKey28(Date.now());
+    const yesterday28 = dayKey28(Date.now() - 86400000);
+    const OWN28 = 2 * G28;        // his real customer today: 1 GB up + 1 GB down
+    const HID_TODAY28 = 75 * G28; // the adopted row today: 70 GB up + 5 GB down
+    const HID_WEEK28 = 40 * G28;  // and more of it yesterday
+    let visShopId28 = 0;
+    const visIds28 = [];
+    const visEmails28 = [];
+    let visParked28 = false;
+    try {
+      const parkV = await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } });
+      visParked28 = parkV.status === 200;
+      check('the visibility fixture parks the monitor so its bytes stay where they were written',
+        visParked28, `status=${parkV.status}`);
+
+      const mkV = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'visshop', password: 'password123', role: 'reseller', telegram_id: '777000333' },
+      });
+      visShopId28 = Number(mkV.json?.data?.user?.id || 0);
+      const visLogin = await request('POST', '/api/auth/login', { body: { username: 'visshop', password: 'password123' } });
+      const visCookies = cookiesFrom(visLogin.headers);
+      check('the reseller of this fixture can log in to his own panel',
+        mkV.status === 201 && visShopId28 > 0 && visLogin.status === 200 && Boolean(visCookies),
+        `users=${mkV.status} login=${visLogin.status} id=${visShopId28}`);
+
+      // one package of his own, made the way the panel makes them
+      const ownV = await request('POST', '/api/admin/configs', {
+        cookies, csrf,
+        body: { userId: visShopId28, inboundIds: [901], gb: 10, days: 30, customerName: 'VIS-own' },
+      });
+      const ownCfg28 = (ownV.json?.data?.configs || [])[0] || {};
+      const ownId28 = Number(ownCfg28.id || 0);
+      const ownEmail28 = String(ownCfg28.email || '');
+      if (ownId28) visIds28.push(ownId28);
+      if (ownEmail28) visEmails28.push(ownEmail28);
+
+      // and an adopted subscription: a real client on the node, a local row of
+      // origin=external, and a day ledger full of bytes he hid from himself
+      const hidEmail28 = `vis-hidden-${crypto.randomBytes(6).toString('hex')}`;
+      const hidId28 = Number(visDb28.prepare(
+        `INSERT INTO configs
+           (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, uuid, label, customer_name,
+            total_bytes, expiry_at, enabled, status, origin, up_bytes, down_bytes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, '', ?, ?, 'adopted', 'مشتری پنهان', ?, ?, 1, 'active', 'external', 7, 8, ?, ?)`
+      ).run(visShopId28, primaryId, 901, hidEmail28, 'vis-hidden-sub', crypto.randomUUID(),
+        70 * G28, Date.now() + 30 * 86400000, Date.now(), Date.now()).lastInsertRowid);
+      visIds28.push(hidId28);
+      visEmails28.push(hidEmail28);
+      mockXui.clients.set(hidEmail28, {
+        email: hidEmail28, id: 'vis-hidden-uuid', subId: 'vis-hidden-sub', security: 'auto',
+        totalGB: 70 * G28, expiryTime: Date.now() + 30 * 86400000, enable: true,
+        up: 7, down: 8, inboundIds: [901],
+      });
+      check('the fixture is one package of his own plus one adopted subscription he hid',
+        ownV.status === 201 && ownId28 > 0 && hidId28 > 0 && Boolean(mockXui.clients.get(hidEmail28)),
+        `own=${ownId28} adopted=${hidId28}`);
+
+      // Both rows read as "synced up to this instant with these counters", so even
+      // a sync that slips through books nothing and the numbers below stay exact.
+      for (const pair of [[ownId28, ownEmail28], [hidId28, hidEmail28]]) {
+        const client = mockXui.clients.get(pair[1]) || {};
+        visDb28.prepare(
+          'UPDATE configs SET up_bytes = ?, down_bytes = ?, last_up = ?, last_down = ?, last_synced_at = ? WHERE id = ?'
+        ).run(Number(client.up || 0), Number(client.down || 0), Number(client.up || 0), Number(client.down || 0), Date.now(), pair[0]);
+      }
+      const book28 = visDb28.prepare(
+        `INSERT INTO usage_daily (config_id, user_id, day, up_bytes, down_bytes) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (config_id, day) DO UPDATE SET up_bytes = excluded.up_bytes, down_bytes = excluded.down_bytes`
+      );
+      visDb28.prepare('DELETE FROM usage_daily WHERE user_id = ?').run(visShopId28);
+      book28.run(ownId28, visShopId28, today28, 1 * G28, 1 * G28);
+      book28.run(hidId28, visShopId28, today28, 70 * G28, 5 * G28);
+      book28.run(hidId28, visShopId28, yesterday28, HID_WEEK28, 0);
+      const ledgerAll28 = Number(visDb28.prepare(
+        'SELECT COALESCE(SUM(up_bytes + down_bytes), 0) AS t FROM usage_daily WHERE user_id = ?'
+      ).get(visShopId28).t);
+      check('his day ledger holds both kinds of traffic under the same user id',
+        ledgerAll28 === OWN28 + HID_TODAY28 + HID_WEEK28, `ledger=${(ledgerAll28 / G28).toFixed(0)}GB`);
+
+      // The switch is flipped in the database on purpose: through the API, turning
+      // it on also re-runs adoption, which would rewrite the fixture being measured.
+      const setSwitch28 = (on) => visDb28.prepare('UPDATE users SET import_configs = ? WHERE id = ?').run(on ? 1 : 0, visShopId28);
+      setSwitch28(false);
+
+      const offOv28 = await request('GET', '/api/reseller/overview', { cookies: visCookies });
+      const offData28 = offOv28.json?.data || {};
+      const offToday28 = (offData28.series || []).find((row) => row.day === today28) || {};
+      const offYday28 = (offData28.series || []).find((row) => row.day === yesterday28) || {};
+      check('a reseller who hides his adopted list sees only his own traffic on his home page',
+        offOv28.status === 200 && Number(offData28.today?.total) === OWN28
+          && Number(offData28.week?.total) === OWN28
+          && Number(offData28.month?.total) === OWN28,
+        `today=${Number(offData28.today?.total) / G28}GB week=${Number(offData28.week?.total) / G28}GB month=${Number(offData28.month?.total) / G28}GB`);
+      check('so his chart, his customer count and his traffic tell one story',
+        Number(offToday28.total || 0) === OWN28 && Number(offYday28.total || 0) === 0
+          && Number(offData28.configs?.total) === 1
+          && (offData28.topConfigs || []).every((row) => Number(row.id) !== hidId28),
+        `series=${Number(offToday28.total || 0) / G28}GB packages=${offData28.configs?.total}`);
+
+      const offStats28 = await request('GET', '/api/reseller/stats?days=14', { cookies: visCookies });
+      check('his stats page answers the same as his home page',
+        offStats28.status === 200 && Number(offStats28.json?.data?.today?.total) === OWN28
+          && Number(offStats28.json?.data?.week?.total) === OWN28
+          && Number(offStats28.json?.data?.month?.total) === OWN28,
+        `today=${Number(offStats28.json?.data?.today?.total) / G28}GB`);
+
+      const offAdm28 = await request('GET', '/api/admin/stats?days=7', { cookies, csrf });
+      const offMe28 = (offAdm28.json?.data?.topUsers || []).find((row) => Number(row.id) === visShopId28) || {};
+      const fleetOff28 = Number(visDb28.prepare(
+        `SELECT COALESCE(SUM(d.up_bytes + d.down_bytes), 0) AS t
+         FROM usage_daily d JOIN configs c ON c.id = d.config_id
+         WHERE d.day = ? AND (c.origin <> 'external' OR c.user_id IN (SELECT id FROM users WHERE import_configs = 1))`
+      ).get(today28).t);
+      check('and the owner’s ranking of resellers no longer counts traffic a reseller cannot see',
+        offAdm28.status === 200 && Number(offMe28.usedBytes || 0) === OWN28,
+        `ranked=${Number(offMe28.usedBytes || 0) / G28}GB`);
+      check('the owner’s own “today” is the fleet’s visible traffic, hidden rows excluded',
+        Number(offAdm28.json?.data?.overview?.today?.total) === fleetOff28,
+        `today=${Number(offAdm28.json?.data?.overview?.today?.total) / G28}GB visibleFleet=${(fleetOff28 / G28).toFixed(2)}GB`);
+
+      const offRpt28 = await request('GET', `/api/admin/reports/daily/${visShopId28}/preview`, { cookies, csrf });
+      check('the night report of that day says the same number as the home page',
+        offRpt28.status === 200 && Number(offRpt28.json?.data?.stats?.traffic) === OWN28
+          && Number(offRpt28.json?.data?.stats?.packages) === 1,
+        `traffic=${Number(offRpt28.json?.data?.stats?.traffic) / G28}GB packages=${offRpt28.json?.data?.stats?.packages}`);
+
+      // The very same bytes, the moment he asks to see those subscriptions again.
+      setSwitch28(true);
+      const onOv28 = await request('GET', '/api/reseller/overview', { cookies: visCookies });
+      const onData28 = onOv28.json?.data || {};
+      const onAdm28 = await request('GET', '/api/admin/stats?days=7', { cookies, csrf });
+      const onMe28 = (onAdm28.json?.data?.topUsers || []).find((row) => Number(row.id) === visShopId28) || {};
+      const onRpt28 = await request('GET', `/api/admin/reports/daily/${visShopId28}/preview`, { cookies, csrf });
+      check('turning the adopted list back on makes every byte of it his again',
+        Number(onData28.today?.total) === OWN28 + HID_TODAY28
+          && Number(onData28.week?.total) === OWN28 + HID_TODAY28 + HID_WEEK28
+          && Number(onMe28.usedBytes || 0) === OWN28 + HID_TODAY28 + HID_WEEK28
+          && Number(onRpt28.json?.data?.stats?.traffic) === OWN28 + HID_TODAY28,
+        `today=${Number(onData28.today?.total) / G28}GB week=${Number(onData28.week?.total) / G28}GB ranked=${Number(onMe28.usedBytes || 0) / G28}GB report=${Number(onRpt28.json?.data?.stats?.traffic) / G28}GB`);
+      check('nothing was deleted to make the number smaller — the ledger still holds every byte',
+        Number(visDb28.prepare(
+          'SELECT COALESCE(SUM(up_bytes + down_bytes), 0) AS t FROM usage_daily WHERE user_id = ?'
+        ).get(visShopId28).t) === OWN28 + HID_TODAY28 + HID_WEEK28,
+        'ledger untouched by the counters');
+
+      // A ledger row whose config row is gone is still that user's traffic: the
+      // visibility rule needs a row to judge, so an unmatched row is counted
+      // instead of being swallowed by the join.
+      book28.run(0, visShopId28, today28, 1 * G28, 0);
+      const orphanOv28 = await request('GET', '/api/reseller/overview', { cookies: visCookies });
+      check('a day-ledger row that outlived its config is counted, not silently dropped',
+        Number(orphanOv28.json?.data?.today?.total) === OWN28 + HID_TODAY28 + G28,
+        `today=${Number(orphanOv28.json?.data?.today?.total) / G28}GB`);
+      visDb28.prepare('DELETE FROM usage_daily WHERE config_id = 0 AND user_id = ?').run(visShopId28);
+    } finally {
+      for (const id of visIds28) visDb28.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id);
+      for (const id of visIds28) visDb28.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      if (visShopId28) {
+        visDb28.prepare('DELETE FROM sessions WHERE user_id = ?').run(visShopId28);
+        visDb28.prepare('DELETE FROM transactions WHERE user_id = ?').run(visShopId28);
+        visDb28.prepare('DELETE FROM users WHERE id = ?').run(visShopId28);
+      }
+      for (const email of visEmails28) mockXui.clients.delete(email);
+      visDb28.close();
+      if (visParked28) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
+    }
+
+    // --------------------- v1.4.29: adding a channel to an existing customer is free
+    // The owner's rule in his own words: once a reseller has created a customer,
+    // adding an inbound to that customer must not take money from the reseller.
+    // The channel joins the quota and the expiry he ALREADY paid for when he built
+    // the package — attachInbound adds no bytes and no days — so the old charge
+    // sold him nothing new, and on an empty wallet it refused the add outright
+    // (402 insufficient_balance), which is exactly what he hit on the live panel.
+    //
+    // Nothing else moves: building a package and renewing one are still charged,
+    // and the admin keeps his v1.4.25 «کسر از کیف پول نماینده» switch, which is now
+    // the ONLY way this action can cost anyone money.
+    const freeDb29 = new Database(path.join(DATA_DIR, 'panel.db'));
+    const G29 = 1024 ** 3;
+    let freeShopId29 = 0;
+    const freeIds29 = [];
+    const freeEmails29 = [];
+    let freeParked29 = false;
+    try {
+      const parkF = await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } });
+      freeParked29 = parkF.status === 200;
+
+      const mkF = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'addfreeshop', password: 'password123', role: 'reseller', balance: 0 },
+      });
+      freeShopId29 = Number(mkF.json?.data?.user?.id || 0);
+      const freeLogin = await request('POST', '/api/auth/login', { body: { username: 'addfreeshop', password: 'password123' } });
+      const freeCookies = cookiesFrom(freeLogin.headers);
+      const freeCsrf = freeLogin.json?.data?.csrf;
+      check('v1.4.29 the fixture is a reseller with an EMPTY wallet — the case the owner hit',
+        parkF.status === 200 && mkF.status === 201 && freeShopId29 > 0 && freeLogin.status === 200 && Boolean(freeCsrf),
+        `park=${parkF.status} user=${mkF.status} login=${freeLogin.status} id=${freeShopId29}`);
+
+      const wallet29 = async () => Number((await request('GET', '/api/auth/me', { cookies: freeCookies })).json?.data?.user?.balance || 0);
+      const ledger29 = async (type) => {
+        const res = await request('GET', '/api/reseller/transactions?pageSize=100', { cookies: freeCookies, csrf: freeCsrf });
+        return (res.json?.data?.rows || []).filter((row) => row.type === type).length;
+      };
+      const addLedger29 = () => Number(freeDb29.prepare(
+        "SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND type = 'purchase' AND description LIKE 'افزودن اینباند%'"
+      ).get(freeShopId29).c);
+      const group29 = async (id) => {
+        const res = await request('GET', `/api/admin/configs/${id}`, { cookies });
+        return { config: res.json?.data?.config || {}, group: res.json?.data?.group || [] };
+      };
+      const tariff29 = (inboundId, gb, days) => {
+        const row = freeDb29.prepare('SELECT price_fixed, price_per_gb, price_per_day FROM inbounds WHERE id = ?').get(inboundId) || {};
+        return Number(row.price_fixed || 0) + Number(row.price_per_gb || 0) * gb + Number(row.price_per_day || 0) * days;
+      };
+      const keep29 = (cfg) => {
+        const id = Number(cfg?.id || 0);
+        const email = String(cfg?.email || '');
+        if (id) freeIds29.push(id);
+        if (email && !freeEmails29.includes(email)) freeEmails29.push(email);
+        return id;
+      };
+
+      // The customer is built by the ADMIN, free (v1.4.25), so the reseller owns a
+      // real 10GB/30d package while his wallet stays at zero.
+      const buildA = await request('POST', '/api/admin/configs', {
+        cookies, csrf,
+        body: { userId: freeShopId29, inboundIds: [901], gb: 10, days: 30, customerName: 'مشتری رایگان' },
+      });
+      const cfgA = (buildA.json?.data?.configs || [])[0] || {};
+      const idA = keep29(cfgA);
+      const emailA = String(cfgA.email || '');
+      const clientA0 = mockXui.clients.get(emailA) || {};
+      const poolA0 = Number(clientA0.totalGB || 0);
+      const expiryA0 = Number(clientA0.expiryTime || 0);
+      const uuidA0 = String(clientA0.id || '');
+      const clientsBefore29 = mockXui.clients.size;
+      check('v1.4.29 an admin-built package gives him a customer without touching his wallet',
+        buildA.status === 201 && idA > 0 && Boolean(emailA) && (await wallet29()) === 0 && await ledger29('purchase') === 0,
+        `status=${buildA.status} balance=${await wallet29()} purchases=${await ledger29('purchase')}`);
+
+      // THE regression: 902 costs 500 for this pool, the wallet holds 0, and the
+      // old code answered 402 before the node was even asked.
+      const addA1 = await request('POST', `/api/reseller/configs/${idA}/inbounds`, {
+        cookies: freeCookies, csrf: freeCsrf, body: { inboundId: 902 },
+      });
+      const addedA1 = addA1.json?.data?.config || {};
+      keep29(addedA1);
+      check('v1.4.29 a reseller adds a PRICED inbound to his own customer on an empty wallet — no 402 any more',
+        addA1.status === 201 && Number(addedA1.inboundId) === 902 && String(addedA1.email || '') === emailA,
+        `status=${addA1.status} code=${addA1.json?.error?.code} inbound=${addedA1.inboundId}`);
+      check('v1.4.29 nothing was taken from his wallet and no purchase row was written for the add',
+        (await wallet29()) === 0 && addLedger29() === 0 && await ledger29('purchase') === 0,
+        `balance=${await wallet29()} addCharges=${addLedger29()} purchases=${await ledger29('purchase')}`);
+
+      // The flag cannot be steered from the client in EITHER direction: a reseller
+      // asking to be charged is still not charged, because only an admin viewer
+      // ever reads `charge`.
+      const addA2 = await request('POST', `/api/reseller/configs/${idA}/inbounds`, {
+        cookies: freeCookies, csrf: freeCsrf, body: { inboundId: 903, charge: true },
+      });
+      const addedA2 = addA2.json?.data?.config || {};
+      keep29(addedA2);
+      check('v1.4.29 even {"charge":true} from the reseller’s own session adds the channel for free',
+        addA2.status === 201 && Number(addedA2.inboundId) === 903
+          && (await wallet29()) === 0 && addLedger29() === 0,
+        `status=${addA2.status} balance=${await wallet29()} addCharges=${addLedger29()}`);
+
+      const auditOf29 = (id) => {
+        const row = freeDb29.prepare(
+          "SELECT details FROM audit_logs WHERE action = 'config.inbound_add' AND entity = 'config' AND entity_id = ? ORDER BY id DESC LIMIT 1"
+        ).get(String(id)) || {};
+        try { return JSON.parse(row.details || '{}'); } catch (_) { return {}; }
+      };
+      const auditA1 = auditOf29(addedA1.id);
+      const auditA2 = auditOf29(addedA2.id);
+      check('the audit trail says it was GIVEN AWAY and keeps the tariff it would have cost',
+        auditA1.free === true && auditA1.charged === false && Number(auditA1.amount) === 0
+          && Number(auditA1.waived) === tariff29(902, 10, 30)
+          && auditA2.free === true && auditA2.charged === false && Number(auditA2.amount) === 0
+          && Number(auditA2.waived) === tariff29(903, 10, 30),
+        `waived=${auditA1.waived}/${auditA2.waived} expected=${tariff29(902, 10, 30)}/${tariff29(903, 10, 30)} charged=${auditA1.charged}/${auditA2.charged}`);
+
+      const clientA1 = mockXui.clients.get(emailA) || {};
+      const viewA = await group29(idA);
+      const expiriesA = new Set(viewA.group.map((item) => Number(item.expiryAt || 0)));
+      check('both channels joined the customer’s OWN client — no second client was minted',
+        mockXui.clients.size === clientsBefore29
+          && (clientA1.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,902,903'
+          && String(clientA1.id || '') === uuidA0,
+        `clients=${clientsBefore29}→${mockXui.clients.size} attached=${(clientA1.inboundIds || []).join(',')} sameUuid=${String(clientA1.id || '') === uuidA0}`);
+      check('free does not mean a bigger package: the pool, the expiry and the counters are what he paid for',
+        Number(clientA1.totalGB || 0) === poolA0 && Number(clientA1.expiryTime || 0) === expiryA0
+          && viewA.group.length === 3 && expiriesA.size === 1
+          && viewA.group.every((item) => Number(item.totalBytes || 0) === 10 * G29),
+        `pool=${Number(clientA1.totalGB || 0) / G29}GB group=${viewA.group.length} distinctExpiries=${expiriesA.size}`);
+      const linksA = await request('GET', `/api/reseller/configs/${idA}/links`, { cookies: freeCookies });
+      const subsA = linksA.json?.data?.subscriptions || {};
+      check('so the customer still holds ONE subscription link on the node, now listing three channels',
+        linksA.status === 200 && Number(subsA.clientCount) === 1 && subsA.source === 'node'
+          && Number(subsA.node?.[0]?.inboundCount) === 3,
+        `clients=${subsA.clientCount} source=${subsA.source} inbounds=${subsA.node?.[0]?.inboundCount}`);
+
+      // The admin's v1.4.25 switch is the only paid case left, and it must still
+      // behave: on this empty wallet a ticked add is refused before the node is
+      // touched, while the reseller's own add of the very same channel succeeds.
+      const buildB = await request('POST', '/api/admin/configs', {
+        cookies, csrf,
+        body: { userId: freeShopId29, inboundIds: [901], gb: 10, days: 30, customerName: 'مشتری دوم' },
+      });
+      const cfgB = (buildB.json?.data?.configs || [])[0] || {};
+      const idB = keep29(cfgB);
+      const emailB = String(cfgB.email || '');
+      const paidB = await request('POST', `/api/admin/configs/${idB}/inbounds`, {
+        cookies, csrf, body: { inboundId: 902, charge: true },
+      });
+      const viewB0 = await group29(idB);
+      check('v1.4.25 is intact: an admin who TICKS the charge switch is still refused on an empty wallet',
+        buildB.status === 201 && paidB.status === 402 && paidB.json?.error?.code === 'insufficient_balance'
+          && viewB0.group.length === 1
+          && (mockXui.clients.get(emailB)?.inboundIds || []).map(Number).join(',') === '901',
+        `status=${paidB.status} code=${paidB.json?.error?.code} group=${viewB0.group.length} attached=${(mockXui.clients.get(emailB)?.inboundIds || []).join(',')}`);
+
+      const freeB = await request('POST', `/api/reseller/configs/${idB}/inbounds`, {
+        cookies: freeCookies, csrf: freeCsrf, body: { inboundId: 902 },
+      });
+      keep29(freeB.json?.data?.config || {});
+      check('the reseller’s own add of that same channel to that same customer goes through for free',
+        freeB.status === 201 && (await wallet29()) === 0 && addLedger29() === 0
+          && (mockXui.clients.get(emailB)?.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,902',
+        `status=${freeB.status} balance=${await wallet29()} attached=${(mockXui.clients.get(emailB)?.inboundIds || []).join(',')}`);
+
+      const adminFreeB = await request('POST', `/api/admin/configs/${idB}/inbounds`, {
+        cookies, csrf, body: { inboundId: 903 },
+      });
+      keep29(adminFreeB.json?.data?.config || {});
+      check('and an admin add WITHOUT the tick is still free, exactly as v1.4.25 left it',
+        adminFreeB.status === 201 && (await wallet29()) === 0 && addLedger29() === 0,
+        `status=${adminFreeB.status} balance=${await wallet29()} addCharges=${addLedger29()}`);
+
+      // What the owner did NOT ask to change: building a package and renewing one
+      // still cost the tariff. The wallet is funded here so both can be measured.
+      const fund29 = await request('POST', `/api/admin/users/${freeShopId29}/balance`, {
+        cookies, csrf, body: { amount: 1000, description: 'شارژ تست ساخت و تمدید' },
+      });
+      const purchasesBefore29 = await ledger29('purchase');
+      const buildC = await request('POST', '/api/reseller/configs', {
+        cookies: freeCookies, csrf: freeCsrf,
+        body: { inboundIds: [903], gb: 5, days: 10, customerName: 'مشتری سوم' },
+      });
+      keep29((buildC.json?.data?.configs || [])[0] || {});
+      const costC = tariff29(903, 5, 10);
+      check('creating a NEW package still charges its tariff exactly once',
+        fund29.status === 200 && buildC.status === 201 && (await wallet29()) === 1000 - costC
+          && await ledger29('purchase') === purchasesBefore29 + 1,
+        `status=${buildC.status} cost=${costC} balance=${await wallet29()} purchases=${purchasesBefore29}→${await ledger29('purchase')}`);
+
+      const renewQuote29 = await request('POST', `/api/reseller/configs/${idA}/extend/quote`, {
+        cookies: freeCookies, csrf: freeCsrf, body: { gb: 5, days: 5 },
+      });
+      const renewPrice29 = renewQuote29.json?.data || {};
+      const balanceBeforeRenew29 = await wallet29();
+      const renewsBefore29 = await ledger29('renew');
+      const renew29 = await request('POST', `/api/reseller/configs/${idA}/extend`, {
+        cookies: freeCookies, csrf: freeCsrf, body: { gb: 5, days: 5 },
+      });
+      check('renewing still charges what the dialog quoted — free applies to ADDING A CHANNEL only',
+        renewQuote29.status === 200 && renewPrice29.charged === true && Number(renewPrice29.total) > 0
+          && renew29.status === 200 && (await wallet29()) === balanceBeforeRenew29 - Number(renewPrice29.total)
+          && await ledger29('renew') === renewsBefore29 + 1,
+        `quoted=${renewPrice29.total} status=${renew29.status} balance=${balanceBeforeRenew29}→${await wallet29()} renews=${renewsBefore29}→${await ledger29('renew')}`);
+
+      const billingRow29 = JSON.parse(freeDb29.prepare("SELECT value FROM settings WHERE key = 'billing'").get()?.value || '{}');
+      check('the fixture leaves wallet billing switched on, as the rest of the suite assumes',
+        billingRow29.enabled === true, `billing=${JSON.stringify(billingRow29)}`);
+    } finally {
+      for (const id of freeIds29) freeDb29.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id);
+      for (const id of freeIds29) freeDb29.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      if (freeShopId29) {
+        freeDb29.prepare('DELETE FROM notifications WHERE user_id = ?').run(freeShopId29);
+        freeDb29.prepare('DELETE FROM sessions WHERE user_id = ?').run(freeShopId29);
+        freeDb29.prepare('DELETE FROM transactions WHERE user_id = ?').run(freeShopId29);
+        freeDb29.prepare('DELETE FROM users WHERE id = ?').run(freeShopId29);
+      }
+      for (const email of freeEmails29) mockXui.clients.delete(email);
+      freeDb29.close();
+      if (freeParked29) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
+    }
+
     // --------------------------- v1.4.27: the nightly telegram report
     // The owner asked for one message per reseller per day, built from the rows
     // the panel already keeps: what he bought today and what is left in his

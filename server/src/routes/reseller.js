@@ -223,6 +223,10 @@ router.post('/configs/:id/identity', asyncH(async (req, res) => {
   res.json({ ok: true, data: { config, group: configsService.groupFor(row), ...links } });
 }));
 
+// v1.4.29: adding a channel to a customer this reseller already has costs him
+// nothing — he paid for the shared quota and expiry when he built the package,
+// and the new inbound adds neither. No `charge` is forwarded, and the service
+// would ignore it from a reseller session anyway.
 router.post('/configs/:id/inbounds', asyncH(async (req, res) => {
   const config = await configsService.addInbound(num(req.params.id), num(req.body?.inboundId), req, req.user);
   res.status(201).json({ ok: true, data: { config } });

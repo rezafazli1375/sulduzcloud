@@ -371,7 +371,11 @@ const fa = {
       poolUsage: 'مصرف کل بسته: {used} از {total} — مشترک بین {n} اینباند',
       resetNote: 'ریست مصرف، مصرف همه {n} اینباند بسته را صفر می‌کند.',
       add: 'افزودن اینباند',
-      addHint: 'اینباند جدید با همان حجم و زمان بسته اضافه می‌شود؛ حجم جدیدی اضافه نمی‌شود و هزینه طبق تعرفه همان اینباند و تخفیف شما محاسبه می‌گردد',
+      addHint: 'اینباند جدید با همان حجم و زمان بسته اضافه می‌شود؛ حجم و زمان جدیدی به بسته اضافه نمی‌شود',
+      // v1.4.29: the reseller paid for the package when he built it. This channel
+      // joins that same shared quota and expiry, so nothing is taken from his
+      // wallet — the tariff is still shown, greyed and marked «بدون کسر».
+      addFreeHint: 'افزودن اینباند به مشتری فعلی برای شما رایگان است؛ هزینهٔ بسته را هنگام ساخت آن پرداخته‌اید و این کانال همان حجم و زمان مشترک را می‌گیرد. مبلغ تعرفه فقط برای اطلاع نمایش داده می‌شود و از کیف پول شما کسر نمی‌شود.',
       remove: 'حذف',
       removeConfirm: 'این اینباند از مشتری حذف شود؟',
       removed: 'اینباند از مشتری حذف شد',
@@ -1338,7 +1342,8 @@ const en = {
       poolUsage: 'Package usage: {used} of {total} — shared across {n} inbounds',
       resetNote: 'Resetting usage clears the used traffic of all {n} inbounds in this package.',
       add: 'Add inbound',
-      addHint: 'The new inbound joins the package with the same shared quota and expiry; no extra traffic is added and its price comes from that inbound’s tariff and your discount',
+      addHint: 'The new inbound joins the package with the same shared quota and expiry; no extra traffic and no extra days are added',
+      addFreeHint: 'Adding an inbound to a customer you already have is free for you — you paid for the package when you created it, and this channel joins the same shared quota and expiry. The tariff is shown for information only and is not taken from your wallet.',
       remove: 'Remove',
       removeConfirm: 'Remove this inbound from the customer?',
       removed: 'Inbound removed from the customer',
