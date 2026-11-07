@@ -439,7 +439,10 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const allowedList = Array.isArray(config?.reseller?.allowedInbounds) ? config.reseller.allowedInbounds.map(Number) : [];
   const addable = (addableQuery.data?.rows || []).filter((row) => {
     if (!row.enabled) return false;
-    if (!isAdmin && row.visible === false) return false;
+    // No visible check here any more. A reseller's payload is /reseller/inbounds,
+    // which is already the policy — trimming it again here is what made a channel
+    // the admin had ticked disappear from this drawer. The admin's payload is the
+    // whole panel and is trimmed by the allow list below instead.
     if (group.some((item) => Number(item.inboundId) === Number(row.id))) return false;
     if (packageServerId && Number(row.serverId || 0) !== packageServerId) return false;
     if (allowedList.length && !allowedList.includes(Number(row.id))) return false;

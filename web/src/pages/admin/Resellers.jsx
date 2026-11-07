@@ -478,7 +478,7 @@ function UserForm({ open, onClose, editing }) {
                 </option>
                 {inbounds.map((row) => (
                   <option key={row.id} value={row.id}>
-                    {`${row.remark || `#${row.id}`} (${row.protocol})${row.serverName ? ` · ${row.serverName}` : ''}`}
+                    {`${row.remark || `#${row.id}`} (${row.protocol})${row.serverName ? ` · ${row.serverName}` : ''}${row.visible === false ? ` · ${t('common.hidden')}` : ''}`}
                   </option>
                 ))}
               </Select>
@@ -599,7 +599,17 @@ function UserForm({ open, onClose, editing }) {
                     key={row.id}
                     checked={form.allowed_inbounds.includes(row.id)}
                     onChange={() => toggleArray('allowed_inbounds', row.id)}
-                    label={`${row.remark || `#${row.id}`} (${row.protocol})`}
+                    // The «hidden» mark stays static while the box toggles, so
+                    // this cannot re-introduce the v1.4.12 / v1.4.15 scroll jump.
+                    label={(
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate">{row.remark || `#${row.id}`}</span>
+                        <span className="shrink-0 text-slate-500">({row.protocol})</span>
+                        {row.visible === false ? (
+                          <Badge tone="amber" className="shrink-0 px-1.5 py-0 text-[9px]">{t('common.hidden')}</Badge>
+                        ) : null}
+                      </span>
+                    )}
                     className="rounded-md px-1.5 py-1 hover:bg-white/[0.03]"
                   />
                 ))}

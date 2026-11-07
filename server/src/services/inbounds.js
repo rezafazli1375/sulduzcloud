@@ -146,6 +146,36 @@ async function syncInbounds({ forceSubOrder = false, serverId = 0 } = {}) {
   return { ...total, servers: results };
 }
 
+/**
+ * Can this reseller actually use this channel?
+ *
+ * `inbounds.visible` gates the DEFAULT offer — the channels handed to a reseller
+ * whose allow list is empty («خالی یعنی دسترسی به همه اینباندهای قابل نمایش»).
+ * An id the admin ticked by hand is a different kind of decision: an affirmative
+ * grant to one named person. A grant he cannot act on is not a grant, and the
+ * two used to disagree, because syncServer inserts every freshly discovered
+ * channel with visible = 0 and only the admin's eye toggle ever turns it on.
+ * Authorising a channel nobody had un-hidden yet therefore bought the reseller
+ * nothing at all — the create form showed no row and the order refused with
+ * inbound_hidden.
+ *
+ * So: visible = 1 is always usable; otherwise the channel is usable only for the
+ * resellers it was explicitly granted to (allow list, or their fixed inbound).
+ * The admin branch is the panel owner's own pass and stays unchanged.
+ *
+ * Works with both shapes this codebase carries around — the raw `inbounds` row
+ * and the camelCased row listInbounds returns — because id, enabled and visible
+ * are named the same in both.
+ */
+function isUsableBy(inbound, { allowed = null, fixedId = 0, isAdmin = false } = {}) {
+  if (!inbound) return false;
+  if (isAdmin) return true;
+  if (Number(inbound.visible) === 1) return true;
+  const id = Number(inbound.id);
+  if (fixedId && id === Number(fixedId)) return true;
+  return Array.isArray(allowed) && allowed.map(Number).includes(id);
+}
+
 function listInbounds({ includeHidden = true, allowed = null, serverId = 0 } = {}) {
   const db = getDb();
   const params = [];
@@ -162,7 +192,11 @@ function listInbounds({ includeHidden = true, allowed = null, serverId = 0 } = {
      ORDER BY server_sort ASC, i.server_id ASC, i.sub_sort_index ASC, i.id ASC`
   ).all(...params);
   return rows
-    .filter((row) => includeHidden || row.visible)
+    // A channel the admin granted this reseller by name survives the hidden
+    // filter; the filter only trims the default offer. Kept as its own clause
+    // rather than a call to isUsableBy because this list also answers for the
+    // admin, and listInbounds has never dropped disabled rows.
+    .filter((row) => includeHidden || Boolean(row.visible) || (allowed && allowed.includes(Number(row.id))))
     .filter((row) => !allowed || allowed.includes(Number(row.id)))
     .map((row) => ({
       id: row.id,
@@ -232,4 +266,4 @@ function bulkVisibility(ids, visible, req) {
   return { updated: info.changes };
 }
 
-module.exports = { syncInbounds, listInbounds, getInbound, updateInbound, bulkVisibility, nodeMap };
+module.exports = { syncInbounds, listInbounds, getInbound, updateInbound, bulkVisibility, nodeMap, isUsableBy };

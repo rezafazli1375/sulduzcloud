@@ -48,9 +48,9 @@ const bodyOf = (call) => JSON.parse(call.init.body || '{}');
 
 const OFFLINE_ALERT = {
   event: 'nodeOffline',
-  data: { node: 'dl20', server: 'dash', address: '1.2.3.4', failures: 3 },
-  title: 'هشدار: نود dl20 قطع شد',
-  body: 'نود dl20 روی dash پاسخ نداد.',
+  data: { node: 'node-7', server: 'panel-a', address: '1.2.3.4', failures: 3 },
+  title: 'هشدار: نود node-7 قطع شد',
+  body: 'نود node-7 روی panel-a پاسخ نداد.',
 };
 
 async function run() {

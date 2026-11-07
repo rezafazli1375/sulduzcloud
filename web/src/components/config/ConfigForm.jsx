@@ -9,7 +9,7 @@ import { nodeLabel } from '../../lib/nodes.js';
 import { Badge, Button, Checkbox, Field, Input, Modal, Select, Skeleton, Textarea, cx } from '../ui.jsx';
 import { useToast } from '../feedback.jsx';
 
-function InboundPicker({ rows, value, onToggle, lang, t, gb = 0, days = 0, currency = '', fixedId = 0 }) {
+function InboundPicker({ rows, value, onToggle, lang, t, gb = 0, days = 0, currency = '', fixedId = 0, isAdmin = false }) {
   const grouped = useMemo(() => {
     const map = new Map();
     for (const row of rows) {
@@ -75,7 +75,10 @@ function InboundPicker({ rows, value, onToggle, lang, t, gb = 0, days = 0, curre
                     <span className="flex items-center gap-1.5">
                       <span className="truncate text-[11.5px] font-medium text-slate-200">{row.remark || `#${row.id}`}</span>
                       {isFixed ? <Badge tone="blue" className="px-1.5 py-0 text-[9px]">{t('configs.form.fixedInboundBadge')}</Badge> : null}
-                      {row.visible === false ? <Badge tone="slate" className="px-1.5 py-0 text-[9px]">{t('common.hidden')}</Badge> : null}
+                      {/* An admin picks for other people, so the panel flag is worth
+                          showing him. A reseller sees only what he may sell, and a
+                          granted-but-hidden channel is his, not a curiosity. */}
+                      {isAdmin && row.visible === false ? <Badge tone="slate" className="px-1.5 py-0 text-[9px]">{t('common.hidden')}</Badge> : null}
                       {Number(row.discountPercent) > 0 ? (
                         <Badge tone="emerald" className="px-1.5 py-0 text-[9px]">{formatNumber(row.discountPercent, lang)}%</Badge>
                       ) : null}
@@ -165,7 +168,11 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
     retry: false,
   });
 
-  const inbounds = (inboundsQuery.data?.rows || []).filter((row) => row.enabled && (isAdmin || row.visible));
+  // The list IS the policy: /reseller/inbounds already dropped everything this
+  // reseller may not sell, and /admin/inbounds deliberately hands the owner the
+  // full panel. Re-filtering hidden rows here used to undo an explicit grant —
+  // a channel the admin ticked in the reseller form vanished from this very list.
+  const inbounds = (inboundsQuery.data?.rows || []).filter((row) => row.enabled);
   // The inbounds endpoint already knows the reseller whose form this is (admin
   // passes ?userId=, a reseller is themselves) and flags their fixed inbound.
   const fixedId = Number(inboundsQuery.data?.fixedInbound || 0)
@@ -411,6 +418,7 @@ export default function ConfigForm({ open, onClose, onCreated, resellerId }) {
               days={Number(form.days || 0)}
               currency={currency}
               fixedId={fixedId}
+              isAdmin={isAdmin}
             />
           )}
           <p className="mt-1.5 text-[10.5px] text-slate-500">{t('configs.form.inboundHint')}</p>

@@ -3493,6 +3493,191 @@ function startMockXui(inboundRows) {
       if (freeParked29) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
     }
 
+    // --------------------- v1.5.1: a channel the admin granted is usable, hidden or not
+    // The owner authorised two inbounds on the second server for one reseller so
+    // she could sell subscriptions. She opened the create form and found
+    // nothing to tick. Two decisions disagreed: syncServer inserts every freshly
+    // discovered channel with visible = 0 — only the admin's eye toggle ever turns
+    // it on — while the reseller form on the admin side lists those channels anyway.
+    // listInbounds then trimmed the hidden rows out BEFORE applying the allow list,
+    // so a grant nobody had un-hidden bought the reseller nothing, and the order
+    // path would have refused with 403 inbound_hidden even had she seen the row.
+    //
+    // A second live reseller sat in the same trap and nobody noticed, because his
+    // FIXED inbound happens to be hidden too and the fixed-inbound rescue put that
+    // one row back: 16 channels were authorised for him and the form offered 15.
+    // The visible flag is a gate on the DEFAULT offer, not a veto on
+    // a grant, and nothing below flips it for anybody.
+    const hidDb = new Database(path.join(DATA_DIR, 'panel.db'));
+    let hidShopId = 0;
+    let hidOtherId = 0;
+    let hidOpenId = 0;
+    const hidIds = [];
+    const hidEmails = [];
+    let hidParked = false;
+    let hidLimit = 10;
+    let hidLimitRaised = false;
+    try {
+      const parkH = await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } });
+      hidParked = parkH.status === 200;
+      // This block needs three fresh logins and the suite is already nine deep into
+      // the limiter's 10-minute window by now — the second and third would come back
+      // 429 rate_limited, and an empty picker would look like the bug, not like a
+      // missing session. Lift the ceiling for the block, then hand it back.
+      hidLimit = Number((await request('GET', '/api/admin/settings', { cookies })).json
+        ?.data?.settings?.security?.loginRateLimit || 10);
+      const liftH = await request('PATCH', '/api/admin/settings/security', {
+        cookies, csrf, body: { loginRateLimit: 100 },
+      });
+      hidLimitRaised = liftH.status === 200;
+
+      // The reported shape exactly: granted channels, NO fixed inbound to rescue him.
+      const mkH = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'hiddengrant', password: 'password123', role: 'reseller', balance: 5000000 },
+      });
+      hidShopId = Number(mkH.json?.data?.user?.id || 0);
+      const hidLogin = await request('POST', '/api/auth/login', { body: { username: 'hiddengrant', password: 'password123' } });
+      const hidCookies = cookiesFrom(hidLogin.headers);
+      const hidCsrf = hidLogin.json?.data?.csrf;
+      // A neighbour who was NOT granted the hidden channels.
+      const mkH2 = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'hiddenother', password: 'password123', role: 'reseller', balance: 5000000 },
+      });
+      hidOtherId = Number(mkH2.json?.data?.user?.id || 0);
+      const hid2Login = await request('POST', '/api/auth/login', { body: { username: 'hiddenother', password: 'password123' } });
+      const hid2Cookies = cookiesFrom(hid2Login.headers);
+      const hid2Csrf = hid2Login.json?.data?.csrf;
+      // A third with an EMPTY allow list — the default offer must not change.
+      const mkH3 = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'hiddenopen', password: 'password123', role: 'reseller', balance: 5000000 },
+      });
+      hidOpenId = Number(mkH3.json?.data?.user?.id || 0);
+      const hid3Login = await request('POST', '/api/auth/login', { body: { username: 'hiddenopen', password: 'password123' } });
+      const hid3Cookies = cookiesFrom(hid3Login.headers);
+
+      // Three channels the panel flags hidden (901, 902, 903) and one it does not
+      // (904). 901+902 go to the first reseller, 903+904 to the second.
+      hidDb.prepare('UPDATE inbounds SET visible = 0 WHERE id IN (901, 902, 903)').run();
+      hidDb.prepare('UPDATE inbounds SET visible = 1 WHERE id = 904').run();
+      const grantH = await request('PATCH', `/api/admin/users/${hidShopId}`, {
+        cookies, csrf, body: { allowed_inbounds: [901, 902] },
+      });
+      const grantH2 = await request('PATCH', `/api/admin/users/${hidOtherId}`, {
+        cookies, csrf, body: { allowed_inbounds: [903, 904] },
+      });
+
+      const picker = async (ck) => {
+        const res = await request('GET', '/api/reseller/inbounds', { cookies: ck });
+        return (res.json?.data?.rows || []).map((row) => Number(row.id)).sort((a, b) => a - b);
+      };
+      const listed1 = await picker(hidCookies);
+      const listed2 = await picker(hid2Cookies);
+      const listed3 = await picker(hid3Cookies);
+
+      check('v1.5.1 the fixture is the reported shape: two granted channels the panel flags hidden, no fixed inbound',
+        mkH.status === 201 && mkH2.status === 201 && mkH3.status === 201
+          && hidLimitRaised
+          && hidLogin.status === 200 && hid2Login.status === 200 && hid3Login.status === 200
+          && grantH.status === 200 && grantH2.status === 200
+          && hidDb.prepare('SELECT visible FROM inbounds WHERE id = 901').get()?.visible === 0
+          && hidDb.prepare('SELECT visible FROM inbounds WHERE id = 902').get()?.visible === 0
+          && Number(hidDb.prepare('SELECT fixed_inbound FROM users WHERE id = ?').get(hidShopId)?.fixed_inbound) === 0,
+        `users=${mkH.status}/${mkH2.status}/${mkH3.status} logins=${hidLogin.status}/${hid2Login.status}/${hid3Login.status} lift=${hidLimit}->100 grants=${grantH.status}/${grantH2.status}`);
+
+      check('v1.5.1 both channels the admin ticked appear in his create form (was: an empty form)',
+        listed1.join(',') === '901,902', `rows=${listed1.join(',') || 'NOTHING'}`);
+
+      const grantedRows = (await request('GET', '/api/reseller/inbounds', { cookies: hidCookies })).json?.data?.rows || [];
+      check('the granted rows still arrive flagged hidden — the fix grants, it does not un-hide',
+        grantedRows.length === 2 && grantedRows.every((row) => row.visible === false),
+        JSON.stringify(grantedRows.map((row) => ({ id: row.id, visible: row.visible }))));
+
+      check('v1.5.1 a reseller who was NOT granted a hidden channel still cannot see it',
+        listed2.join(',') === '903,904', `neighbour rows=${listed2.join(',')}`);
+
+      // The strongest form of «nothing else changed»: whatever the default offer
+      // happens to contain at this point in the suite (earlier blocks hide and
+      // delete channels, so its size is not ours to promise), every row in it must
+      // be a channel the panel actually flags visible — and the three hidden ones
+      // must be absent even though 904, visible and granted to a NEIGHBOUR, is present.
+      const visibleIds = new Set(hidDb.prepare('SELECT id FROM inbounds WHERE visible = 1').all()
+        .map((row) => Number(row.id)));
+      check('the DEFAULT offer is untouched: an empty allow list means all VISIBLE channels only',
+        listed3.length > 0 && listed3.every((id) => visibleIds.has(id))
+          && !listed3.includes(901) && !listed3.includes(902) && !listed3.includes(903)
+          && listed3.includes(904),
+        `open-list rows=${listed3.join(',')} (${listed3.length}) of ${visibleIds.size} visible in the database`);
+
+      // The permission fix must not become a pricing story: 901 is a real priced
+      // channel and the order goes through the normal charge.
+      const buildH = await request('POST', '/api/reseller/configs', {
+        cookies: hidCookies, csrf: hidCsrf,
+        body: { inboundIds: [901], gb: 10, days: 30, customerName: 'مشتری کانال مخفی' },
+      });
+      const cfgH = (buildH.json?.data?.configs || [])[0] || {};
+      const idH = Number(cfgH.id || 0);
+      const emailH = String(cfgH.email || '');
+      if (idH) hidIds.push(idH);
+      if (emailH && !hidEmails.includes(emailH)) hidEmails.push(emailH);
+      check('v1.5.1 ordering on the granted-but-hidden channel is accepted (was 403 inbound_hidden)',
+        buildH.status === 201 && idH > 0 && Number(cfgH.inboundId) === 901,
+        `status=${buildH.status} code=${buildH.json?.error?.code || '-'} id=${idH}`);
+
+      const clientH = mockXui.clients.get(emailH) || {};
+      check('the customer really joined that channel on the node',
+        (clientH.inboundIds || []).map(Number).includes(901),
+        `node inbounds=${JSON.stringify(clientH.inboundIds || [])}`);
+
+      const addH = await request('POST', `/api/reseller/configs/${idH}/inbounds`, {
+        cookies: hidCookies, csrf: hidCsrf, body: { inboundId: 902 },
+      });
+      const groupH = await request('GET', `/api/admin/configs/${idH}`, { cookies });
+      const groupIds = ((groupH.json?.data?.group) || []).map((item) => Number(item.inboundId)).sort((a, b) => a - b);
+      check('v1.5.1 adding the second hidden channel to his own customer works too (the addInbound path)',
+        addH.status === 201 && groupIds.join(',') === '901,902',
+        `status=${addH.status} code=${addH.json?.error?.code || '-'} group=${groupIds.join(',')}`);
+
+      const denied = await request('POST', '/api/reseller/configs', {
+        cookies: hid2Cookies, csrf: hid2Csrf,
+        body: { inboundIds: [901], gb: 10, days: 30, customerName: 'تجاوز' },
+      });
+      check('a hidden channel is still closed to the reseller it was not granted to',
+        denied.status === 403, `status=${denied.status} code=${denied.json?.error?.code || '-'}`);
+
+      const adminOnHidden = await request('POST', '/api/admin/configs', {
+        cookies, csrf,
+        body: { userId: hidOpenId, inboundIds: [901], gb: 5, days: 10, customerName: 'مدیر روی کانال مخفی' },
+      });
+      const adminCfg = (adminOnHidden.json?.data?.configs || [])[0] || {};
+      if (Number(adminCfg.id)) hidIds.push(Number(adminCfg.id));
+      if (adminCfg.email && !hidEmails.includes(String(adminCfg.email))) hidEmails.push(String(adminCfg.email));
+      check('the admin’s own pass over hidden channels is unchanged',
+        adminOnHidden.status === 201, `status=${adminOnHidden.status} code=${adminOnHidden.json?.error?.code || '-'}`);
+
+      check('none of this touched the visible flag in the database',
+        hidDb.prepare('SELECT COUNT(*) AS c FROM inbounds WHERE id IN (901,902,903) AND visible = 0').get().c === 3,
+        `hidden still = ${hidDb.prepare('SELECT COUNT(*) AS c FROM inbounds WHERE id IN (901,902,903) AND visible = 0').get().c}/3`);
+    } finally {
+      for (const id of hidIds) hidDb.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id);
+      for (const id of hidIds) hidDb.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      for (const shop of [hidShopId, hidOtherId, hidOpenId]) {
+        if (!shop) continue;
+        hidDb.prepare('DELETE FROM notifications WHERE user_id = ?').run(shop);
+        hidDb.prepare('DELETE FROM sessions WHERE user_id = ?').run(shop);
+        hidDb.prepare('DELETE FROM transactions WHERE user_id = ?').run(shop);
+        hidDb.prepare('DELETE FROM users WHERE id = ?').run(shop);
+      }
+      // Hand the fixture channels back exactly as the rest of the suite expects them.
+      hidDb.prepare('UPDATE inbounds SET visible = 1 WHERE id IN (901, 902, 903, 904)').run();
+      for (const email of hidEmails) mockXui.clients.delete(email);
+      hidDb.close();
+      if (hidLimitRaised) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: hidLimit } });
+      if (hidParked) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
+    }
+
     // --------------------------- v1.4.27: the nightly telegram report
     // The owner asked for one message per reseller per day, built from the rows
     // the panel already keeps: what he bought today and what is left in his

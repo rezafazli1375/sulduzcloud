@@ -613,7 +613,8 @@ async function createConfigs(input, req) {
     if (allowed && !allowed.includes(inboundId) && inboundId !== fixedId) {
       throw new ApiError(403, 'inbound_forbidden', 'This reseller cannot use the selected inbound');
     }
-    if (!inbound.visible && req?.user?.role !== 'admin' && inboundId !== fixedId) {
+    // Same rule as the picker that offered it: an explicit grant beats visible=0.
+    if (!inboundsService.isUsableBy(inbound, { allowed, fixedId, isAdmin: req?.user?.role === 'admin' })) {
       throw new ApiError(403, 'inbound_hidden', 'This inbound is not available');
     }
     const price = pricing.priceFor(inbound, gb, days, user.id);
@@ -2129,7 +2130,15 @@ async function addInbound(id, inboundId, req, viewer, opts = {}) {
   const inbound = getInboundRow(target);
   if (!inbound) throw new ApiError(404, 'inbound_not_found', 'Inbound not found');
   if (!inbound.enabled) throw new ApiError(422, 'inbound_disabled', `Inbound ${inbound.remark} is disabled`);
-  if (!inbound.visible && viewer?.role !== 'admin') {
+  // v1.5.1: the add-inbound drawer only ever offers channels this reseller may
+  // use, so this used to refuse the very row the picker showed him — the drawer
+  // had no fixed-inbound exemption either, unlike the create path above. One
+  // predicate now answers both.
+  if (!inboundsService.isUsableBy(inbound, {
+    allowed: usersService.allowedInboundIds(viewer),
+    fixedId: usersService.fixedInboundId(viewer),
+    isAdmin: viewer?.role === 'admin',
+  })) {
     throw new ApiError(403, 'inbound_hidden', 'This inbound is not available');
   }
   // Duplicate detection is scoped to THIS customer's package. The old query
