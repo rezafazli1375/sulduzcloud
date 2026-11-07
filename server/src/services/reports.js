@@ -236,8 +236,16 @@ function collect(userId, at = Date.now()) {
     currency: String(billing.currency || 'تومان'),
     traffic: 0,
   };
+  // The day ledger is read through the same rule: a subscription this reseller
+  // hid from himself must not come back as traffic in his night report either,
+  // or the message and his home page would disagree about the same day. The join
+  // is a LEFT one so a ledger row that outlived its config is still his traffic.
   const trafficRow = db
-    .prepare('SELECT COALESCE(SUM(up_bytes + down_bytes), 0) AS total FROM usage_daily WHERE user_id = ? AND day = ?')
+    .prepare(
+      `SELECT COALESCE(SUM(d.up_bytes + d.down_bytes), 0) AS total
+       FROM usage_daily d LEFT JOIN configs c ON c.id = d.config_id
+       WHERE d.user_id = ? AND d.day = ? ${hiddenAdopted ? "AND (c.id IS NULL OR c.origin <> 'external')" : ''}`
+    )
     .get(Number(userId), win.day);
   stats.traffic = Number(trafficRow?.total || 0);
 

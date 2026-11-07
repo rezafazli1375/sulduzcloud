@@ -7,7 +7,17 @@ const DAY_MS = 86400000;
 
 // Adopted subscriptions vanish from every counter while their owner has the
 // adoption switch off, so lists, KPI cards and reseller stats always agree.
+// Anything that reads the day ledger must JOIN configs to apply this: a bare
+// `FROM usage_daily` also counts rows the very same page hides, which once gave
+// a reseller a "today" full of traffic from subscriptions he had switched out of
+// his own list, next to a customer count of one package that had used nothing.
 const VISIBLE_SQL = "(c.origin <> 'external' OR c.user_id IN (SELECT id FROM users WHERE import_configs = 1))";
+
+// The volume counters reach that rule through a LEFT JOIN: a day-ledger row
+// always points at a config row (a hard delete purges both), but if one ever
+// outlived its config the bytes still belong to the user they were booked
+// under, and a rule with no row to judge must not swallow them silently.
+const LEDGER_VISIBLE_SQL = `(c.id IS NULL OR ${VISIBLE_SQL})`;
 
 function dayRange(days) {
   const out = [];
@@ -74,11 +84,12 @@ function trafficSeries(days = 14, userId = 0) {
   const db = getDb();
   const keys = dayRange(days);
   const from = keys[0];
-  const scope = userId ? 'AND user_id = ?' : '';
+  const scope = `${userId ? 'AND d.user_id = ?' : ''} AND ${LEDGER_VISIBLE_SQL}`;
   const params = userId ? [Number(userId)] : [];
   const rows = db.prepare(
-    `SELECT day, SUM(up_bytes) AS up, SUM(down_bytes) AS down
-     FROM usage_daily WHERE day >= ? ${scope} GROUP BY day`
+    `SELECT d.day AS day, SUM(d.up_bytes) AS up, SUM(d.down_bytes) AS down
+     FROM usage_daily d LEFT JOIN configs c ON c.id = d.config_id
+     WHERE d.day >= ? ${scope} GROUP BY d.day`
   ).all(from, ...params);
   const map = new Map(rows.map((r) => [r.day, r]));
   return keys.map((day) => {
@@ -95,11 +106,12 @@ function trafficSeries(days = 14, userId = 0) {
 function sumRange(days, userId = 0) {
   const db = getDb();
   const from = dayKey(Date.now() - (days - 1) * DAY_MS);
-  const scope = userId ? 'AND user_id = ?' : '';
+  const scope = `${userId ? 'AND d.user_id = ?' : ''} AND ${LEDGER_VISIBLE_SQL}`;
   const params = userId ? [Number(userId)] : [];
   const row = db.prepare(
-    `SELECT COALESCE(SUM(up_bytes), 0) AS up, COALESCE(SUM(down_bytes), 0) AS down
-     FROM usage_daily WHERE day >= ? ${scope}`
+    `SELECT COALESCE(SUM(d.up_bytes), 0) AS up, COALESCE(SUM(d.down_bytes), 0) AS down
+     FROM usage_daily d LEFT JOIN configs c ON c.id = d.config_id
+     WHERE d.day >= ? ${scope}`
   ).get(from, ...params);
   return { up: Number(row.up || 0), down: Number(row.down || 0), total: Number(row.up || 0) + Number(row.down || 0) };
 }
@@ -110,7 +122,8 @@ function topUsers(days = 7, limit = 8) {
   const rows = db.prepare(
     `SELECT u.id, u.username, u.name, SUM(d.up_bytes + d.down_bytes) AS used
      FROM usage_daily d JOIN users u ON u.id = d.user_id
-     WHERE d.day >= ? AND u.deleted_at = 0
+     LEFT JOIN configs c ON c.id = d.config_id
+     WHERE d.day >= ? AND u.deleted_at = 0 AND ${LEDGER_VISIBLE_SQL}
      GROUP BY u.id ORDER BY used DESC LIMIT ?`
   ).all(from, Number(limit));
   return rows.map((r) => ({ id: r.id, username: r.username, name: r.name, usedBytes: Number(r.used || 0) }));
