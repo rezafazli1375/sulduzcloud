@@ -16,7 +16,9 @@ import {
   MessageSquare,
   Network,
   Plus,
+  Receipt,
   ScrollText,
+  Search,
   Server,
   Settings,
   ShieldCheck,
@@ -47,6 +49,8 @@ const ADMIN_GROUPS = [
     items: [
       { to: '/servers', label: 'nav.servers', icon: Server, perm: 'servers' },
       { to: '/tickets', label: 'nav.tickets', icon: MessageSquare, perm: 'tickets' },
+      { to: '/topups', label: 'nav.topups', icon: Receipt, perm: 'users' },
+      { to: '/node-search', label: 'nav.nodeSearch', icon: Search, perm: 'configs' },
       { to: '/broadcasts', label: 'nav.broadcasts', icon: Sparkles, perm: 'broadcasts' },
     ],
   },

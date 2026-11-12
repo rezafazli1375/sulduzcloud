@@ -547,6 +547,237 @@ async function importTelegramClients(user, req) {
   return summary;
 }
 
+// --------------------------------------------------------------------- v1.5.2
+// The admin's way to find ONE customer on a node by uuid / email / remark and hand
+// him to a reseller. The adoption pass above only ever matches a Telegram id, so a
+// client whose name carries no id — or carries somebody else's — was unreachable
+// from this panel. Both functions below are deliberately one-sided: they READ the
+// node and write only into this panel's own database. Nothing is ever created,
+// renamed, attached or deleted on x-ui, which is what makes them safe to point at
+// a panel the owner has placed out of bounds.
+
+const NODE_SEARCH_LIMIT = 60;
+
+// /clients/list carries the identity in `id` on some x-ui builds and in `uuid` on
+// others; for VLESS/VMess that value IS the UUID, so it has to be searchable too.
+function clientUuidOf(client) {
+  const uuid = String(client?.uuid || '').trim();
+  if (uuid) return uuid;
+  const id = String(client?.id || '').trim();
+  return UUID_RE.test(id) ? id : '';
+}
+
+/**
+ * Search every enabled node for a client. Read-only: one /clients/list per server,
+ * then a local match on email, uuid, subscription id and remark (x-ui's `comment`).
+ * Each hit also says whether this panel already holds it and for whom, so the
+ * admin can see a conflict before he tries to adopt.
+ */
+async function searchNodeClients({ q = '', serverId = 0, limit = NODE_SEARCH_LIMIT } = {}) {
+  const needle = String(q || '').trim().toLowerCase();
+  if (needle.length < 2) {
+    throw new ApiError(422, 'query_too_short', 'حداقل دو نویسه برای جست‌وجو لازم است / Type at least two characters to search');
+  }
+  const cap = Math.min(Math.max(Number(limit) || NODE_SEARCH_LIMIT, 1), 200);
+  const wanted = Number(serverId) || 0;
+  const serverList = serversService.listServers({ includeDisabled: false })
+    .filter((server) => !wanted || Number(server.id) === wanted);
+  if (!serverList.length) {
+    throw new ApiError(404, 'server_not_found', 'سرور فعالی برای جست‌وجو نیست / No enabled x-ui server to search');
+  }
+  const db = getDb();
+  const ownersOf = db.prepare(
+    `SELECT c.id, c.user_id, c.inbound_id, c.origin, u.username
+       FROM configs c LEFT JOIN users u ON u.id = c.user_id
+      WHERE lower(c.email) = ? AND c.deleted_at = 0 ORDER BY c.id`
+  );
+  const inboundOf = db.prepare('SELECT id, remark, port, protocol FROM inbounds WHERE server_id = ? AND xui_id = ?');
+  const rows = [];
+  const errors = [];
+  let scanned = 0;
+  for (const server of serverList) {
+    let clients = [];
+    try {
+      clients = await xui.listClients(server);
+    } catch (err) {
+      // One unreachable node must not hide the hits from the others.
+      errors.push(`${server.name || server.id}: ${err.message}`);
+      continue;
+    }
+    scanned += clients.length;
+    for (const client of clients) {
+      const uuid = clientUuidOf(client);
+      const haystack = [client.email, uuid, client.subId, client.comment, client.id]
+        .map((value) => String(value || '').toLowerCase());
+      if (!haystack.some((value) => value && value.includes(needle))) continue;
+      const owned = ownersOf.all(String(client.email || '').toLowerCase());
+      const inbounds = (client.inboundIds || [])
+        .map((xuiId) => inboundOf.get(Number(server.id), Number(xuiId)))
+        .filter(Boolean)
+        .map((row) => ({
+          id: Number(row.id), remark: String(row.remark || ''), port: Number(row.port || 0), protocol: String(row.protocol || ''),
+        }));
+      rows.push({
+        serverId: Number(server.id),
+        serverName: String(server.name || ''),
+        email: String(client.email || ''),
+        uuid,
+        subId: String(client.subId || ''),
+        remark: String(client.comment || ''),
+        totalBytes: Number(client.totalBytes || 0),
+        expiryAt: Number(client.expiryAt || 0),
+        enabled: client.enabled !== false,
+        up: Number(client.up || 0),
+        down: Number(client.down || 0),
+        inboundIds: (client.inboundIds || []).map(Number),
+        inbounds,
+        knownInbounds: inbounds.length,
+        owners: owned.map((row) => ({
+          configId: Number(row.id), userId: Number(row.user_id), username: String(row.username || ''), origin: String(row.origin || 'panel'),
+        })),
+        adopted: owned.length > 0,
+      });
+      if (rows.length >= cap) break;
+    }
+    if (rows.length >= cap) break;
+  }
+  return {
+    rows, errors, scanned, query: String(q || '').trim(), limit: cap, truncated: rows.length >= cap,
+  };
+}
+
+/**
+ * Hand one existing x-ui client to a reseller: one row per inbound the client is
+ * attached to and this panel knows about, exactly the shape the Telegram-id
+ * adoption pass writes, so the drawer, the shared quota and the subscription link
+ * all treat him as one customer.
+ *
+ * The rows are 'external' — this panel did not create the client — which means a
+ * later delete forgets them here and never sends a delete to the node. The wallet
+ * is not touched either: the subscription was paid for before it arrived here.
+ */
+async function adoptNodeClient(payload = {}, req, viewer) {
+  if (viewer?.role !== 'admin') {
+    throw new ApiError(403, 'forbidden', 'فقط مدیر می‌تواند کانفیگ آماده را به نماینده بدهد / Only the admin can adopt a node client');
+  }
+  const targetEmail = String(payload.email || '').trim();
+  if (!targetEmail) throw new ApiError(422, 'email_required', 'ایمیل کلاینت لازم است / Client email is required');
+  const user = getResellerRow(Number(payload.userId) || 0);
+  if (!user) throw new ApiError(404, 'user_not_found', 'Reseller not found');
+  if (Number(user.import_configs ?? 1) === 0) {
+    throw new ApiError(409, 'import_disabled',
+      'دریافت کانفیگ‌های آماده برای این نماینده خاموش است؛ اول آن را در ویرایش نماینده روشن کنید / This reseller switched adoption off — turn it on first');
+  }
+  const server = serversService.resolveServer(Number(payload.serverId) || 0);
+  const client = await xui.getClient(targetEmail, server);
+  if (!client) {
+    throw new ApiError(404, 'xui_client_missing',
+      `این کلاینت روی پنل نود پیدا نشد / No such client on the node: ${targetEmail}`);
+  }
+
+  const db = getDb();
+  const findInbound = db.prepare('SELECT id FROM inbounds WHERE server_id = ? AND xui_id = ?');
+  let inboundIds = (client.inboundIds || []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+  const mapInbounds = () => {
+    const seen = new Set();
+    const list = [];
+    for (const xuiId of inboundIds) {
+      const inbound = findInbound.get(Number(server.id), Number(xuiId));
+      if (!inbound || seen.has(Number(inbound.id))) continue;
+      seen.add(Number(inbound.id));
+      list.push(inbound);
+    }
+    return list;
+  };
+  let attached = mapInbounds();
+  if (!attached.length && inboundIds.length) {
+    // A client can sit on a channel this panel has not discovered yet.
+    await inboundsService.syncInbounds({ serverId: Number(server.id) });
+    attached = mapInbounds();
+  }
+  if (!attached.length) {
+    throw new ApiError(422, 'no_known_inbound',
+      'هیچ‌کدام از اینباندهای این کلاینت در پنل شناخته‌شده نیست؛ اول اینباندها را همگام کنید / None of this client’s inbounds is known here — sync the inbounds first');
+  }
+
+  const findEmailRows = db.prepare('SELECT id, inbound_id, user_id, origin, sub_id, deleted_at FROM configs WHERE email = ?');
+  const rows = findEmailRows.all(targetEmail);
+  const stranger = rows.find((item) => !item.deleted_at && Number(item.user_id) !== Number(user.id));
+  if (stranger) {
+    const owner = getResellerRow(stranger.user_id);
+    throw new ApiError(409, 'config_owned_by_other',
+      `این کانفیگ از قبل در لیست «${owner?.username || stranger.user_id}» است / This client already belongs to another reseller`);
+  }
+  // One group token for the whole customer, reused from any sibling so an existing
+  // subscription link keeps working.
+  const tokenHolder = rows.find((item) => !item.deleted_at && item.sub_id) || rows.find((item) => item.sub_id);
+  const groupToken = tokenHolder ? String(tokenHolder.sub_id) : randomToken(16);
+
+  const now = Date.now();
+  const up = Number(client.up || 0);
+  const down = Number(client.down || 0);
+  const label = String(payload.label || '').slice(0, 120);
+  const customerName = String(payload.customerName || '').slice(0, 120);
+  const customerPhone = String(payload.customerPhone || '').slice(0, 40);
+  const note = String(payload.note || '').slice(0, 500);
+  const insertConfig = db.prepare(
+    `INSERT INTO configs (user_id, inbound_id, server_id, email, sub_id, xui_sub_id, uuid, flow, label,
+      customer_name, customer_phone, note, total_bytes, expiry_at, enabled, status, sync_status,
+      up_bytes, down_bytes, last_up, last_down, last_online_at, last_synced_at, created_at, updated_at, origin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', '', ?, ?, ?, ?, ?, ?, ?, ?, 'external')`
+  );
+  const restoreConfig = db.prepare(
+    `UPDATE configs SET user_id = ?, inbound_id = ?, server_id = ?, email = ?, sub_id = ?, xui_sub_id = ?,
+       uuid = ?, flow = ?, label = ?, customer_name = ?, customer_phone = ?, note = ?, total_bytes = ?,
+       expiry_at = ?, enabled = ?, status = 'active', sync_status = '', up_bytes = ?, down_bytes = ?,
+       last_up = ?, last_down = ?, last_online_at = ?, last_synced_at = ?, updated_at = ?,
+       origin = 'external', deleted_at = 0
+     WHERE id = ?`
+  );
+  const summary = {
+    email: targetEmail, userId: Number(user.id), serverId: Number(server.id),
+    imported: 0, restored: 0, alreadyHis: 0, configs: [], inbounds: attached.map((item) => Number(item.id)),
+  };
+  const write = db.transaction(() => {
+    for (const inbound of attached) {
+      const existing = rows.find((item) => Number(item.inbound_id) === Number(inbound.id));
+      const common = [
+        Number(user.id), Number(inbound.id), Number(server.id), targetEmail, groupToken,
+        String(client.subId || ''), String(client.uuid || clientUuidOf(client) || ''), String(client.flow || ''),
+        label, customerName, customerPhone, note,
+        Number(client.totalBytes || 0), Number(client.expiryAt || 0), client.enabled === false ? 0 : 1,
+        up, down, up, down, Number(client.lastOnlineAt || 0), now,
+      ];
+      if (existing && !existing.deleted_at) {
+        summary.alreadyHis += 1;
+        summary.configs.push(Number(existing.id));
+        continue;
+      }
+      if (existing) {
+        restoreConfig.run(...common, now, Number(existing.id));
+        summary.restored += 1;
+        summary.configs.push(Number(existing.id));
+      } else {
+        const info = insertConfig.run(...common, Number(client.createdAt || now), now);
+        summary.imported += 1;
+        summary.configs.push(Number(info.lastInsertRowid));
+      }
+    }
+  });
+  write();
+
+  if (summary.imported || summary.restored) {
+    notifyUser(Number(user.id), {
+      type: 'info',
+      title: 'کانفیگ به لیست شما اضافه شد',
+      body: `${targetEmail} — ${summary.inbounds.length} کانال از پنل نود`,
+      link: '/reseller/configs',
+    });
+  }
+  audit(req, 'config.adopt', 'user', Number(user.id), summary);
+  return { ok: true, ...summary, groupToken };
+}
+
 async function rollbackCreated(ids, created) {
   const db = getDb();
   for (const item of created) {
@@ -1635,6 +1866,21 @@ async function updateMeta(id, patch, req, viewer) {
   return hydrate(getConfigRow(row.id));
 }
 
+/**
+ * Is this client really on the node? A READ, used before any delete so that a
+ * subscription the node no longer holds is reported as "already gone" instead of
+ * failing the cleanup. An unreachable node still throws: "I cannot see the panel"
+ * is not the same fact as "the customer is not there".
+ */
+async function clientOnNode(email, server) {
+  try {
+    return Boolean(await xui.getClient(email, server));
+  } catch (err) {
+    if (xui.isMissingClient(err)) return false;
+    throw err;
+  }
+}
+
 async function removeConfig(id, { hard = false, silent = false, force = false } = {}, req, viewer) {
   const { row } = configDetail(id, viewer);
   const user = getResellerRow(row.user_id);
@@ -1658,24 +1904,39 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
     .map((item) => Number(getInboundRow(item.inbound_id)?.xui_id || 0))
     .filter((n) => Number.isFinite(n) && n > 0))];
   const sharedClient = siblings.length > 0 && keepIds.length > 0;
+  // v1.5.2: what really happened on the node. A customer whose client is already
+  // gone («اشتراک روی نود نیست») used to be undeletable: the delete call answered
+  // "Obtain (record not found)" and that generic xui_error aborted the whole
+  // action, so the leftover row could never be cleaned up. The node is asked
+  // first, and "not there" is now an outcome instead of an error.
+  let alreadyGone = false;
   if (isExternal) {
     // Adopted subscriptions live on another operator's panel and their owners
     // are connected right now. Removing the row here forgets the subscription
     // locally and never sends a delete to that panel.
     console.warn(`[configs] detaching adopted config ${row.email} without touching x-ui`);
-  } else if (sharedClient) {
-    try {
-      await xui.setInbounds(row.email, keepIds, serverOfConfig(row));
-    } catch (err) {
-      if (!silent) throw err;
-      console.error(`[configs] x-ui detach failed for ${row.email}:`, err.message);
-    }
   } else {
-    try {
-      await xui.deleteClient(row.email, false, serverOfConfig(row));
-    } catch (err) {
-      if (!silent) throw err;
-      console.error(`[configs] x-ui delete failed for ${row.email}:`, err.message);
+    const server = serverOfConfig(row);
+    const present = await clientOnNode(row.email, server);
+    if (!present) {
+      alreadyGone = true;
+      console.warn(`[configs] ${row.email} is already off the node — removing the leftover row only`);
+    } else if (sharedClient) {
+      try {
+        await xui.setInbounds(row.email, keepIds, server);
+      } catch (err) {
+        if (xui.isMissingClient(err)) alreadyGone = true;
+        else if (!silent) throw err;
+        else console.error(`[configs] x-ui detach failed for ${row.email}:`, err.message);
+      }
+    } else {
+      try {
+        await xui.deleteClient(row.email, false, server);
+      } catch (err) {
+        if (xui.isMissingClient(err)) alreadyGone = true;
+        else if (!silent) throw err;
+        else console.error(`[configs] x-ui delete failed for ${row.email}:`, err.message);
+      }
     }
   }
   const db = getDb();
@@ -1686,10 +1947,10 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
     db.prepare('UPDATE configs SET deleted_at = ?, enabled = 0, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), row.id);
   }
   audit(req, 'config.delete', 'config', row.id, {
-    email: row.email, hard, detachedOnly: isExternal, inboundDetached: sharedClient, keptInbounds: keepIds.length,
+    email: row.email, hard, detachedOnly: isExternal, inboundDetached: sharedClient, keptInbounds: keepIds.length, alreadyGone,
   });
   return {
-    ok: true, detachedOnly: isExternal, inboundDetached: sharedClient, keptInbounds: keepIds.length,
+    ok: true, detachedOnly: isExternal, inboundDetached: sharedClient, keptInbounds: keepIds.length, alreadyGone,
   };
 }
 
@@ -1733,12 +1994,22 @@ async function deletePackage(id, req, viewer) {
       continue;
     }
     try {
-      await xui.deleteClient(email, false, serverOfConfig(client[0]));
+      // v1.5.2: ask the node first. A package whose client is already off it
+      // («اشتراک روی نود نیست») is exactly what the operator is trying to clean
+      // up, and the delete call for it answers "Obtain (record not found)" — a
+      // generic xui_error that used to abort the whole action before any row was
+      // touched. "Not there" is an outcome now, not a failure.
+      const server = serverOfConfig(client[0]);
+      if (!(await clientOnNode(email, server))) {
+        alreadyGone.push(email);
+        continue;
+      }
+      await xui.deleteClient(email, false, server);
       xuiDeleted.push(email);
     } catch (err) {
       // The client is already off the node — the row here is the leftover, and the
       // operator is trying to clean it up. Anything else aborts before any write.
-      if (err?.code === 'xui_client_missing') {
+      if (xui.isMissingClient(err)) {
         alreadyGone.push(email);
         continue;
       }
@@ -1755,7 +2026,9 @@ async function deletePackage(id, req, viewer) {
     notifyUser(resellerId, {
       type: 'info',
       title: 'اشتراک حذف شد',
-      body: `${row.email} — ${members.length} کانال${xuiDeleted.length ? `، ${xuiDeleted.length} کلاینت x-ui پاک شد` : '، فقط از این پنل حذف شد'}`,
+      body: `${row.email} — ${members.length} کانال${xuiDeleted.length
+        ? `، ${xuiDeleted.length} کلاینت x-ui پاک شد`
+        : (alreadyGone.length ? '، روی نود از قبل وجود نداشت' : '، فقط از این پنل حذف شد')}`,
       link: '/reseller/configs',
     });
   }
@@ -2813,4 +3086,6 @@ module.exports = {
   emailFor,
   telegramIdMatches,
   importTelegramClients,
+  searchNodeClients,
+  adoptNodeClient,
 };

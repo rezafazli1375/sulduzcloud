@@ -148,6 +148,40 @@ CREATE TABLE IF NOT EXISTS transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, created_at);
 
+-- v1.5.2: a reseller's payment receipt, sent through the Telegram bot and decided
+-- by the admin. The wallet only moves when a row here reaches 'approved', and the
+-- decision is written once: approving twice cannot credit twice.
+CREATE TABLE IF NOT EXISTS topup_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  amount INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  file_kind TEXT NOT NULL DEFAULT '',
+  file_id TEXT NOT NULL DEFAULT '',
+  caption TEXT NOT NULL DEFAULT '',
+  chat_id TEXT NOT NULL DEFAULT '',
+  message_id INTEGER NOT NULL DEFAULT 0,
+  admin_chat_id TEXT NOT NULL DEFAULT '',
+  admin_message_id INTEGER NOT NULL DEFAULT 0,
+  decided_by INTEGER NOT NULL DEFAULT 0,
+  decided_at INTEGER NOT NULL DEFAULT 0,
+  decision_note TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'bot',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_topups_user ON topup_requests(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_topups_status ON topup_requests(status, created_at);
+
+-- v1.5.2: the bot's own small memory — the getUpdates offset and one conversation
+-- step per chat. Kept in the database so a restart never replays old updates and
+-- never loses a half-finished receipt.
+CREATE TABLE IF NOT EXISTS bot_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tickets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,

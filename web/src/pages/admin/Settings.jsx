@@ -669,6 +669,25 @@ export default function Settings() {
               <p>{t('settings.telegram.createHint')}</p>
             </div>
 
+            {/* ---- reseller bot (v1.5.2): balance, stats, payment receipts ---- */}
+            <div className="space-y-4 border-t border-white/[0.06] pt-4">
+              <SwitchRow
+                label={t('settings.telegram.botEnabled')}
+                hint={t('settings.telegram.botEnabledHint')}
+                checked={telegram.botEnabled !== false}
+                onChange={(value) => patch('telegram', 'botEnabled', value)}
+              />
+              <Field label={t('settings.telegram.botAdminChatId')} hint={t('settings.telegram.botAdminChatHint')}>
+                <Input
+                  dir="ltr"
+                  value={telegram.botAdminChatId || ''}
+                  onChange={(e) => patch('telegram', 'botAdminChatId', e.target.value)}
+                  placeholder={telegram.chatId || '123456789'}
+                />
+              </Field>
+              <p className="text-[10.5px] leading-5 text-slate-500">{t('settings.telegram.botNote')}</p>
+            </div>
+
             {/* ---- nightly report: schedule ---- */}
             <div className={cx('space-y-4 border-t border-white/[0.06] pt-4', !telegram.dailyReportEnabled && 'opacity-45')}>
               <SwitchRow

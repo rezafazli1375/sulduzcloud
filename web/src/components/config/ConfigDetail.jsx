@@ -22,7 +22,6 @@ import {
   Ticket,
   Trash2,
   UserRound,
-  UserRoundX,
   Wifi,
   WifiOff,
   Zap,
@@ -298,23 +297,23 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     onError,
   });
 
-  const remove = useMutation({
-    mutationFn: () => api.del(`${base}/${configId}`),
-    onSuccess: () => { toast.success(t('common.deleted')); onClose?.(); refresh(); },
-    onError,
-  });
-
-  // Panel v1.4.24: the whole customer goes — every channel of the package and his
-  // x-ui client, which is the one case the fixed-inbound lock allows. The server
-  // answers how much of it actually left the node, and the toast says exactly that
-  // instead of a generic "deleted".
+  // Panel v1.5.2: ONE delete button. It removes the whole subscription — every
+  // channel of this customer from the reseller's list AND his x-ui client on the
+  // node — because two buttons («حذف» / «حذف کل اشتراک») only made the operator
+  // guess which one really ends the subscription. A package whose client is
+  // already off the node («اشتراک روی نود نیست») deletes cleanly too: the server
+  // asks the node first and reports "already gone" as an outcome, not an error.
   const removePackage = useMutation({
     mutationFn: () => api.del(`${base}/${configId}/package`),
     onSuccess: (data) => {
       const removed = Number(data?.xuiDeleted?.length || 0);
+      const gone = Number(data?.alreadyGone?.length || 0);
+      const rows = formatNumber(Number(data?.rows || 0), lang);
       toast.success(removed > 0
-        ? t('configs.group.packageDeletedRemote', { n: formatNumber(Number(data?.rows || 0), lang) })
-        : t('configs.group.packageDeletedLocal', { n: formatNumber(Number(data?.rows || 0), lang) }));
+        ? t('configs.group.packageDeletedRemote', { n: rows })
+        : (gone > 0
+          ? t('configs.group.packageDeletedGone', { n: rows })
+          : t('configs.group.packageDeletedLocal', { n: rows })));
       onClose?.();
       refresh();
     },
@@ -382,20 +381,11 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     if (ok) removeInbound.mutate(item.id);
   };
 
-  const askDelete = async () => {
-    const ok = await confirm({
-      title: t('configs.deleteConfirm'),
-      body: t('configs.deleteBody'),
-      danger: true,
-      confirmText: t('common.delete'),
-    });
-    if (ok) remove.mutate();
-  };
-
-  // v1.4.24: the action the fixed-inbound lock points at. It names how many
-  // channels go, and — when some of them were adopted from another panel — says
-  // plainly that those subscriptions stay live over there, because this panel
-  // never writes to another operator's x-ui.
+  // v1.5.2: the one delete action. It names how many channels go, and — when some
+  // of them were adopted from another panel — says plainly that those
+  // subscriptions stay live over there, because this panel never writes to
+  // another operator's x-ui. When the client is already off the node it says so
+  // too, so the operator knows this click is a cleanup and not a disconnection.
   const askDeletePackage = async () => {
     const channels = group.length || 1;
     const adopted = group.filter((item) => item?.origin === 'external').length;
@@ -404,9 +394,10 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
       body: `${t('configs.group.packageDeleteBody', { n: formatNumber(channels, lang) })}`
         + (adopted
           ? `\n${t('configs.group.packageDeleteAdopted', { n: formatNumber(adopted, lang) })}`
-          : `\n${t('configs.group.packageDeleteNode')}`),
+          : `\n${t('configs.group.packageDeleteNode')}`)
+        + (clientMissing ? `\n${t('configs.group.packageDeleteMissing')}` : ''),
       danger: true,
-      confirmText: t('configs.group.deletePackage'),
+      confirmText: t('common.delete'),
     });
     if (ok) removePackage.mutate();
   };
@@ -455,13 +446,6 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   // instead of a price that looks like a deduction. The admin still has the
   // v1.4.25 switch, and only his tick puts the wallet back in the picture.
   const addInboundFree = !isAdmin || !addInboundCharge;
-  // The row this drawer was opened on IS the guaranteed base of a package that
-  // still holds other channels. The server refuses to take it off — 409
-  // fixed_inbound_locked, the owner's own rule — so since v1.4.24 the button shows
-  // that up front instead of looking live and failing after the click.
-  const fixedBaseLocked = fixedInboundId > 0
-    && Number(config?.inboundId) === fixedInboundId
-    && group.length > 1;
 
   return (
     <>
@@ -475,30 +459,20 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
           config ? (
             <div className="flex w-full flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-2">
+                {/* v1.5.2: one delete, and it means the whole subscription — the
+                    reseller's rows and the customer's x-ui client together. The
+                    fixed inbound is no longer a reason to grey it out: taking the
+                    whole package off is exactly what the server allows. */}
                 <Button
                   variant="danger"
                   size="sm"
                   icon={Trash2}
-                  onClick={askDelete}
-                  loading={remove.isPending}
-                  disabled={fixedBaseLocked || removePackage.isPending}
-                  title={fixedBaseLocked ? t('configs.group.fixedLocked') : undefined}
+                  onClick={askDeletePackage}
+                  loading={removePackage.isPending}
+                  title={t('configs.group.deletePackageHint')}
                 >
                   {t('common.delete')}
                 </Button>
-                {group.length > 1 ? (
-                  <Button
-                    variant="danger"
-                    size="sm"
-                    icon={UserRoundX}
-                    onClick={askDeletePackage}
-                    loading={removePackage.isPending}
-                    disabled={remove.isPending}
-                    title={t('configs.group.deletePackageHint')}
-                  >
-                    {t('configs.group.deletePackage')}
-                  </Button>
-                ) : null}
                 {/* v1.4.26: the reseller's free «ریست مصرف» is gone — it zeroed the
                     meter without the panel ever charging a tariff, so the money the
                     customer already spent simply vanished. What replaces it is a READ
@@ -518,13 +492,11 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                 >
                   {t('configs.actions.refresh')}
                 </Button>
-                {/* A disabled button cannot show its tooltip, so the reason the
-                    server would refuse this delete is spelled out next to it. */}
-                {fixedBaseLocked ? (
-                  <p className="w-full text-[10px] leading-5 text-amber-300/85">
-                    {t('configs.group.fixedLocked')} · {t('configs.group.deletePackageHint')}
-                  </p>
-                ) : null}
+                {/* What the one delete button really does, in plain words next to
+                    it — the operator never has to guess between two deletes. */}
+                <p className="w-full text-[10px] leading-5 text-slate-400/85">
+                  {t('configs.group.deletePackageHint')}
+                </p>
               </div>
               <div className="flex items-center gap-2">
                 <Button variant="secondary" size="sm" icon={Power} onClick={() => toggle.mutate(!config.enabled)} loading={toggle.isPending}>
@@ -774,7 +746,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                         <IconButton
                           icon={ExternalLink}
                           label={`${t('configs.manageInbound')}: ${item.inbound?.remark || item.inboundId}`}
-                          disabled={[extend, quota, toggle, reset, saveMeta, remove, saveIdentity, addInbound, removeInbound].some((mutation) => mutation.isPending)}
+                          disabled={[extend, quota, toggle, reset, saveMeta, removePackage, saveIdentity, addInbound, removeInbound].some((mutation) => mutation.isPending)}
                           onClick={() => onSelect(item.id)}
                         />
                       ) : null}

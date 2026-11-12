@@ -16,6 +16,8 @@ const pricing = require('../services/pricing');
 const statsService = require('../services/stats');
 const backupService = require('../services/backup');
 const telegram = require('../services/telegram');
+const bot = require('../services/bot');
+const topups = require('../services/topups');
 const reports = require('../services/reports');
 const monitor = require('../services/monitor');
 const ticketsService = require('../services/tickets');
@@ -518,6 +520,7 @@ router.delete('/configs/:id', auth.requirePerm('configs'), asyncH(async (req, re
       detachedOnly: Boolean(result.detachedOnly),
       inboundDetached: Boolean(result.inboundDetached),
       keptInbounds: Number(result.keptInbounds || 0),
+      alreadyGone: Boolean(result.alreadyGone),
     },
   });
 }));
@@ -808,6 +811,20 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     if (clean.dailyReportEnabled === true && !String(clean.botToken || telegram.config().botToken || '').trim()) {
       throw new ApiError(422, 'telegram_not_configured', 'برای گزارش شبانه ابتدا توکن ربات را ذخیره کنید / Save the bot token before switching the nightly report on');
     }
+    // v1.5.2: the two-way reseller bot. Same rule as the nightly report — the
+    // switch may not be turned on without a token, or it would look alive and
+    // answer nothing. The decision chat is optional (empty = the panel chat).
+    if (clean.botEnabled !== undefined) clean.botEnabled = Boolean(clean.botEnabled);
+    if (clean.botAdminChatId !== undefined) {
+      const raw = String(clean.botAdminChatId || '').trim();
+      if (raw && !/^-?\d{4,20}$/.test(raw)) {
+        throw new ApiError(422, 'telegram_chat_id', 'آیدی عددی چت مدیر معتبر نیست / The admin chat id must be numeric');
+      }
+      clean.botAdminChatId = raw;
+    }
+    if (clean.botEnabled === true && !String(clean.botToken || telegram.config().botToken || '').trim()) {
+      throw new ApiError(422, 'telegram_not_configured', 'برای ربات نماینده‌ها ابتدا توکن ربات را ذخیره کنید / Save the bot token before switching the reseller bot on');
+    }
   }
   if (section === 'security') {
     if (clean.sessionDays !== undefined) clean.sessionDays = Math.min(90, Math.max(1, num(clean.sessionDays, 7)));
@@ -1070,6 +1087,130 @@ router.get('/broadcasts', auth.requirePerm('broadcasts'), (req, res) => {
     },
   });
 });
+
+// ------------------------------------------- v1.5.2: wallet receipts (top-ups)
+
+router.get('/topups', auth.requirePerm('users'), (req, res) => {
+  const data = topups.listRequests({
+    status: String(req.query.status || ''),
+    userId: num(req.query.userId, 0),
+    page: num(req.query.page, 1),
+    pageSize: num(req.query.pageSize, 30),
+  });
+  res.json({ ok: true, data: { ...data, bot: bot.status() } });
+});
+
+router.get('/topups/:id', auth.requirePerm('users'), (req, res) => {
+  res.json({ ok: true, data: { request: topups.getRequest(num(req.params.id, 0)) } });
+});
+
+// The receipt picture itself, proxied through the panel so the admin can judge
+// it here as well as in Telegram. Only the file_id stored on the row is ever
+// fetched, the bot token stays server-side, and nothing is cached in the browser.
+router.get('/topups/:id/receipt', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const request = topups.getRequest(num(req.params.id, 0));
+  if (!request.fileId) throw new ApiError(404, 'no_receipt', 'این درخواست فشی ندارد / This request has no receipt file');
+  const file = await telegram.fetchFile(request.fileId);
+  audit(req, 'topup.receipt_view', 'topup', request.id, { kind: request.fileKind });
+  res.setHeader('Content-Type', file.mime);
+  res.setHeader('Content-Disposition', `inline; filename="receipt-${request.id}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(file.buffer);
+}));
+
+router.post('/topups/:id/approve', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const body = req.body || {};
+  const result = topups.approve(
+    num(req.params.id, 0),
+    {
+      amount: body.amount === undefined || body.amount === null || body.amount === '' ? undefined : num(body.amount, 0),
+      note: String(body.note || ''),
+      actor: { id: req.user.id, role: 'admin' },
+      source: 'panel',
+    },
+    req
+  );
+  // Take the buttons away from the Telegram copy too, so the same receipt cannot
+  // be decided twice from two places. The money is already committed.
+  bot.syncAdminMessage(result, 'approved', req.user.username).catch(() => {});
+  res.json({ ok: true, data: { request: result } });
+}));
+
+router.post('/topups/:id/reject', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const result = topups.reject(
+    num(req.params.id, 0),
+    { note: String(req.body?.note || ''), actor: { id: req.user.id, role: 'admin' }, source: 'panel' },
+    req
+  );
+  bot.syncAdminMessage(result, 'rejected', req.user.username).catch(() => {});
+  res.json({ ok: true, data: { request: result } });
+}));
+
+// The bot's own health: is it polling, did another consumer take the token, and
+// where do receipts go. A restart is offered because a 409 Conflict stops the
+// poller for good — after the owner removes the other consumer he needs a way to
+// bring it back without SSH.
+router.get('/bot', auth.requirePerm('settings'), (req, res) => {
+  const cfg = telegram.botConfig();
+  res.json({
+    ok: true,
+    data: {
+      ...bot.status(),
+      hasToken: Boolean(cfg.botToken),
+      adminChatId: cfg.adminChatId,
+      pending: topups.listRequests({ status: 'pending', page: 1, pageSize: 1 }).counts.pending,
+    },
+  });
+});
+
+router.post('/bot/restart', auth.requirePerm('settings'), asyncH(async (req, res) => {
+  bot.stop();
+  const started = await bot.start();
+  audit(req, 'bot.restart', 'settings', 'telegram', started);
+  res.json({ ok: true, data: { ...started, status: bot.status() } });
+}));
+
+// ------------------------------- v1.5.2: find a client on x-ui and adopt it
+
+// Just the enabled nodes, for the search page's filter. /admin/servers also
+// probes CPU/RAM on every panel and needs the servers permission — neither is
+// wanted here.
+router.get('/nodes', auth.requirePerm('configs'), (req, res) => {
+  res.json({
+    ok: true,
+    data: {
+      rows: serversService.listServers({ includeDisabled: false })
+        .map((server) => ({ id: Number(server.id), name: String(server.name || '') })),
+    },
+  });
+});
+
+router.get('/node-clients', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const data = await configsService.searchNodeClients({
+    q: String(req.query.q || ''),
+    serverId: num(req.query.serverId, 0),
+    limit: num(req.query.limit, 60),
+  });
+  res.json({ ok: true, data });
+}));
+
+router.post('/configs/adopt', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const body = req.body || {};
+  const result = await configsService.adoptNodeClient(
+    {
+      email: String(body.email || ''),
+      userId: num(body.userId, 0),
+      serverId: num(body.serverId, 0),
+      label: String(body.label || ''),
+      customerName: String(body.customerName || ''),
+      customerPhone: String(body.customerPhone || ''),
+      note: String(body.note || ''),
+    },
+    req,
+    req.user
+  );
+  res.status(201).json({ ok: true, data: result });
+}));
 
 // ------------------------------------------------------------------ sync
 

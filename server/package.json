@@ -1,6 +1,6 @@
 {
   "name": "sulduzcloud",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "private": true,
   "description": "Sulduz Cloud - Reseller VPN Management Panel",
   "main": "src/index.js",
@@ -12,6 +12,7 @@
     "report-test": "node test/daily-report.js",
     "sms-test": "node test/sms-text.js",
     "telegram-test": "node test/telegram-import.js",
+    "bot-test": "node test/bot-topup.js",
     "admin": "node scripts/admin-cli.js"
   },
   "engines": {

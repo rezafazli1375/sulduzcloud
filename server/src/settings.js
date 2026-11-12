@@ -92,6 +92,12 @@ const DEFAULTS = {
     botToken: '',
     chatId: '',
     sendOnAuto: true,
+    // v1.5.2: the same bot becomes two-way. A reseller whose numeric Telegram id
+    // is on his account can read his balance and his numbers, and send a payment
+    // receipt that the admin approves with one tap. `botAdminChatId` is where the
+    // receipts go; empty means the panel chat above.
+    botEnabled: true,
+    botAdminChatId: '',
     // Nightly report. The hour/minute are wall-clock times in the timezone the
     // traffic ledger itself is bucketed by (PANEL_TZ, Asia/Tehran by default), so
     // "today" in the message is the same day the dashboard chart calls today.

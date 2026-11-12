@@ -24,16 +24,58 @@ import {
   cx,
 } from '../../components/ui.jsx';
 
+// The labels live in the stats namespace (Stats.jsx uses the same ones). Pointing
+// at dash.* printed the raw key — «dash.typeCredit» — on every wallet row.
 const TYPE_LABEL = {
-  credit: 'dash.typeCredit',
-  debit: 'dash.typeDebit',
-  purchase: 'dash.typePurchase',
-  renew: 'dash.typeRenew',
-  manual: 'dash.typeManual',
-  refund: 'dash.typeRefund',
+  credit: 'stats.typeCredit',
+  debit: 'stats.typeDebit',
+  purchase: 'stats.typePurchase',
+  renew: 'stats.typeRenew',
+  manual: 'stats.typeManual',
+  refund: 'stats.typeRefund',
 };
 
 const CREDIT_TYPES = new Set(['credit', 'refund']);
+
+const RECEIPT_TONE = { pending: 'amber', approved: 'emerald', rejected: 'rose' };
+const RECEIPT_KEY = { pending: 'wallet.receiptPending', approved: 'wallet.receiptApproved', rejected: 'wallet.receiptRejected' };
+
+/**
+ * The reseller's own payment receipts (v1.5.2). He sends them through the
+ * Telegram bot; this is where he sees whether the admin approved or rejected
+ * one, without having to ask. Only rendered once he has sent at least one.
+ */
+function MyReceipts({ currency }) {
+  const { t, lang } = useI18n();
+  const { data } = useQuery({
+    queryKey: ['wallet', 'topups'],
+    queryFn: () => api.get('/reseller/topups?pageSize=5'),
+    refetchInterval: 60000,
+  });
+  const rows = data?.rows || [];
+  if (!rows.length) return null;
+  return (
+    <SectionCard icon={ReceiptText} title={t('wallet.receipts')} subtitle={t('wallet.receiptsHint')} bodyClass="p-0">
+      <div className="divide-y divide-white/[0.05]">
+        {rows.map((row) => (
+          <div key={row.id} className="flex flex-wrap items-center gap-2 px-4 py-2.5">
+            <Badge tone={RECEIPT_TONE[row.status] || 'slate'} dot>
+              {t(RECEIPT_KEY[row.status] || 'wallet.receipts')}
+            </Badge>
+            <span className="text-[10.5px] text-slate-500">#{row.id}</span>
+            <span className="text-[12px] font-semibold text-slate-100" dir="ltr">
+              {formatMoney(row.amount, lang, currency)}
+            </span>
+            <span className="ms-auto text-[10.5px] text-slate-500">{relativeTime(row.createdAt, lang)}</span>
+            {row.decisionNote ? (
+              <p className="w-full whitespace-pre-line text-[10.5px] leading-5 text-slate-400">{row.decisionNote}</p>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </SectionCard>
+  );
+}
 
 export default function Wallet() {
   const { t, lang } = useI18n();
@@ -92,6 +134,10 @@ export default function Wallet() {
           hint={t('common.page')}
           tone="rose"
         />
+      </div>
+
+      <div className="mb-4">
+        <MyReceipts currency={currency} />
       </div>
 
       <SectionCard icon={ReceiptText} title={t('wallet.transactions')} bodyClass="p-0">

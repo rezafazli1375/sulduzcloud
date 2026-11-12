@@ -8,6 +8,7 @@ const inboundsService = require('../services/inbounds');
 const configsService = require('../services/configs');
 const pricing = require('../services/pricing');
 const statsService = require('../services/stats');
+const topups = require('../services/topups');
 const { ApiError, asyncH, bytesToGb, toCsv, pageParams } = require('../utils');
 
 const router = express.Router();
@@ -322,6 +323,36 @@ router.get('/transactions', (req, res) => {
         balanceAfter: r.balance_after,
         description: r.description,
         createdAt: r.created_at,
+      })),
+    },
+  });
+});
+
+// v1.5.2: his own payment receipts, sent through the Telegram bot, and what the
+// admin decided. Only his rows, and never the Telegram file ids or the admin's
+// chat — those belong to the panel side of the flow.
+router.get('/topups', (req, res) => {
+  const data = topups.listRequests({
+    userId: req.user.id,
+    status: String(req.query.status || ''),
+    page: num(req.query.page, 1),
+    pageSize: num(req.query.pageSize, 20),
+  });
+  res.json({
+    ok: true,
+    data: {
+      total: data.total,
+      counts: data.counts,
+      balance: Number(req.user.balance || 0),
+      rows: data.rows.map((row) => ({
+        id: row.id,
+        amount: row.amount,
+        status: row.status,
+        caption: row.caption,
+        decisionNote: row.decisionNote,
+        decidedAt: row.decidedAt,
+        source: row.source,
+        createdAt: row.createdAt,
       })),
     },
   });

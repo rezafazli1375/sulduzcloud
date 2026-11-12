@@ -311,8 +311,31 @@ async function setInbounds(email, inboundIds, server) {
   return getClient(email, server);
 }
 
+/**
+ * "This client is not on the panel" — the one answer that is not a failure.
+ *
+ * x-ui 3.8.5 says it in two different ways: the helpers that read a client first
+ * throw `xui_client_missing` themselves, while a write endpoint answers
+ * `success:false` with the words "Obtain (record not found)" and request() turns
+ * that into a generic `xui_error`. v1.5.2: deleting a subscription whose client is
+ * already off the node is exactly the cleanup the operator is asking for, so both
+ * shapes have to be recognised as the same fact.
+ */
+function isMissingClient(err) {
+  if (!err) return false;
+  if (err.code === 'xui_client_missing') return true;
+  return err.code === 'xui_error' && /not found/i.test(String(err.message || ''));
+}
+
 async function deleteClient(email, keepTraffic = false, server) {
-  await request('POST', `/clients/del/${enc(email)}${keepTraffic ? '?keepTraffic=1' : ''}`, undefined, { server });
+  try {
+    await request('POST', `/clients/del/${enc(email)}${keepTraffic ? '?keepTraffic=1' : ''}`, undefined, { server });
+  } catch (err) {
+    if (isMissingClient(err)) {
+      throw new ApiError(404, 'xui_client_missing', `Client does not exist on the x-ui panel: ${email}`);
+    }
+    throw err;
+  }
   return true;
 }
 
@@ -398,6 +421,7 @@ module.exports = {
   request,
   normalizeClient,
   buildClientPayload,
+  isMissingClient,
   listClients,
   getClient,
   addClient,

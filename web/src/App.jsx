@@ -21,6 +21,8 @@ import Resellers from './pages/admin/Resellers.jsx';
 import Inbounds from './pages/admin/Inbounds.jsx';
 import Servers from './pages/admin/Servers.jsx';
 import Broadcasts from './pages/admin/Broadcasts.jsx';
+import Topups from './pages/admin/Topups.jsx';
+import NodeSearch from './pages/admin/NodeSearch.jsx';
 import Backups from './pages/admin/Backups.jsx';
 import Audit from './pages/admin/Audit.jsx';
 import Settings from './pages/admin/Settings.jsx';
@@ -120,6 +122,8 @@ function AppRoutes() {
           <Route path="inbounds" element={<Protected adminOnly perm="inbounds"><Inbounds /></Protected>} />
           <Route path="servers" element={<Protected adminOnly perm="servers"><Servers /></Protected>} />
           <Route path="broadcasts" element={<Protected adminOnly perm="broadcasts"><Broadcasts /></Protected>} />
+          <Route path="topups" element={<Protected adminOnly perm="users"><Topups /></Protected>} />
+          <Route path="node-search" element={<Protected adminOnly perm="configs"><NodeSearch /></Protected>} />
           <Route path="backups" element={<Protected adminOnly perm="backups"><Backups /></Protected>} />
           <Route path="audit" element={<Protected adminOnly perm="audit"><Audit /></Protected>} />
           <Route path="settings" element={<Protected adminOnly perm="settings"><Settings /></Protected>} />

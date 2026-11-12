@@ -107,7 +107,7 @@ function startMockXui(inboundRows) {
   // to notice that from the re-read and attach the leftovers through bulkAttach —
   // it must never paper over a missing channel by writing a row the node does not
   // serve, and never by creating a second client for the same customer.
-  const quirks = { addKeepsOnlyFirst: false };
+  const quirks = { addKeepsOnlyFirst: false, failGet: new Set() };
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (chunk) => { raw += chunk; });
@@ -138,7 +138,12 @@ function startMockXui(inboundRows) {
         if (route === '/server/status') return send({ cpu: 0, mem: { current: 0, total: 1 }, uptime: 0 });
         if (route === '/clients/list') return send([...clients.values()]);
         if (route.startsWith('/clients/get/')) {
-          const client = clients.get(emailOf('/clients/get/'));
+          const asked = emailOf('/clients/get/');
+          // A node that is sick, not empty: the answer is an error that says
+          // nothing about the client. "Not there" and "cannot tell" must never be
+          // treated the same way by a delete.
+          if (quirks.failGet.has(asked)) return failMsg('database is locked');
+          const client = clients.get(asked);
           // The real panel answers a client that is not on it with success:false
           // and "Obtain (record not found)" — not with an empty body. The double
           // has to answer the same way, or the panel would never learn that a
@@ -209,7 +214,13 @@ function startMockXui(inboundRows) {
           return send(true);
         }
         if (route.startsWith('/clients/del/')) {
-          clients.delete(emailOf('/clients/del/'));
+          // v1.5.2: the real x-ui 3.8.5 answers a delete for a client it does not
+          // have with success:false + "Obtain (record not found)". The double used
+          // to answer `true`, which is exactly why the panel's "cannot delete a
+          // subscription that is not on the node" bug survived every earlier run.
+          const email = emailOf('/clients/del/');
+          if (!clients.has(email)) return failMsg('Obtain (record not found)');
+          clients.delete(email);
           return send(true);
         }
         if (route === '/clients/bulkEnable' || route === '/clients/bulkDisable') {
@@ -3676,6 +3687,414 @@ function startMockXui(inboundRows) {
       hidDb.close();
       if (hidLimitRaised) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: hidLimit } });
       if (hidParked) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
+    }
+
+    // --------------------- v1.5.2: delete what is not on the node, receipts, adoption
+    //
+    // (1) «کانفینگ‌هایی که جلوشون نوشته (اشتراک روی نود نیست) قابل حذف شدن نیست و
+    //     هنگام حذف خطا میده». x-ui answers a delete for a client it does not have
+    //     with success:false + "Obtain (record not found)". That reached the operator
+    //     as a generic xui_error and aborted the action before any row was touched,
+    //     so the leftover row could never be cleaned up. The node is asked FIRST now
+    //     and "not there" is an outcome, not a failure. The double above answers the
+    //     way the real 3.8.5 does — before v1.5.2 it answered `true` for a missing
+    //     client, which is exactly why every earlier run passed over this bug.
+    // (2) the mobile balance keyboard is a frontend change (admin/Resellers.jsx);
+    //     it is covered by the UI harness, not by an HTTP suite.
+    // (3) the receipt bot: the panel half is here (list, decide, credit exactly once,
+    //     the reseller's own list). The conversation itself runs in test/bot-topup.js.
+    // (4) finding a client on x-ui by uuid / email / remark and handing it to a
+    //     reseller — read-only search, panel-only adoption.
+    const v52Db = new Database(path.join(DATA_DIR, 'panel.db'));
+    let v52ShopId = 0;
+    let v52OtherId = 0;
+    let v52NoImpId = 0;
+    const v52Ids = [];
+    const v52Emails = [];
+    const v52Topups = [];
+    let v52Parked = false;
+    let v52Limit = 10;
+    let v52LimitRaised = false;
+    let v52BotTouched = false;
+    let v52BotWas = { botEnabled: true, botAdminChatId: '' };
+    try {
+      const park52 = await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } });
+      v52Parked = park52.status === 200;
+      v52Limit = Number((await request('GET', '/api/admin/settings', { cookies })).json
+        ?.data?.settings?.security?.loginRateLimit || 10);
+      const lift52 = await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: 100 } });
+      v52LimitRaised = lift52.status === 200;
+
+      const mk52 = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'v152shop', password: 'password123', role: 'reseller', balance: 2000000 },
+      });
+      v52ShopId = Number(mk52.json?.data?.user?.id || 0);
+      const login52 = await request('POST', '/api/auth/login', { body: { username: 'v152shop', password: 'password123' } });
+      const ck52 = cookiesFrom(login52.headers);
+      const cs52 = login52.json?.data?.csrf;
+      const mk52b = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'v152other', password: 'password123', role: 'reseller', balance: 700000 },
+      });
+      v52OtherId = Number(mk52b.json?.data?.user?.id || 0);
+      const mk52c = await request('POST', '/api/admin/users', {
+        cookies, csrf,
+        body: { username: 'v152noimp', password: 'password123', role: 'reseller', balance: 0 },
+      });
+      v52NoImpId = Number(mk52c.json?.data?.user?.id || 0);
+      // Direct SQL: PATCHing import_configs re-runs the adoption pass, which is a
+      // different feature and would write rows this block does not own.
+      v52Db.prepare('UPDATE users SET import_configs = 0 WHERE id = ?').run(v52NoImpId);
+
+      // The panel's own inbound ids, read instead of assumed: an earlier block may
+      // have re-synced a channel, and only xui_id is stable across that.
+      const inboundMap = {};
+      for (const row of v52Db.prepare('SELECT id, xui_id FROM inbounds WHERE server_id = ?').all(primaryId)) {
+        inboundMap[Number(row.xui_id)] = Number(row.id);
+      }
+      const inA = Number(inboundMap[901] || 0);
+      const inB = Number(inboundMap[902] || 0);
+      const inC = Number(inboundMap[903] || 0);
+      const inD = Number(inboundMap[904] || 0);
+      check('v1.5.2 fixture: three resellers, four known channels and a lifted login ceiling',
+        mk52.status === 201 && mk52b.status === 201 && mk52c.status === 201
+          && login52.status === 200 && v52LimitRaised && v52Parked
+          && inA > 0 && inB > 0 && inC > 0 && inD > 0,
+        `users=${mk52.status}/${mk52b.status}/${mk52c.status} login=${login52.status} inbounds=${inA},${inB},${inC},${inD}`);
+
+      const WRITE_ROUTE = /\/clients\/(add|update\/|del\/|bulkAttach|bulkEnable|bulkDisable|bulkAdjust|resetTraffic\/)|\/detach$/;
+      const writesSince = (from) => mockXui.calls.slice(from).filter((call) => WRITE_ROUTE.test(call.route)).map((call) => call.route);
+      const routeCount = (from, prefix) => mockXui.calls.slice(from).filter((call) => call.route.startsWith(prefix)).length;
+      const buildPackage = async (inboundIds, customerName) => {
+        const res = await request('POST', '/api/admin/configs', {
+          cookies, csrf, body: { userId: v52ShopId, inboundIds, gb: 10, days: 30, customerName },
+        });
+        const rows = res.json?.data?.configs || [];
+        for (const row of rows) {
+          v52Ids.push(Number(row.id));
+          if (row.email && !v52Emails.includes(String(row.email))) v52Emails.push(String(row.email));
+        }
+        return { res, rows, id: Number(rows[0]?.id || 0), email: String(rows[0]?.email || '') };
+      };
+      const rowsOf = (email) => v52Db.prepare('SELECT id, deleted_at, origin, user_id, sub_id, total_bytes FROM configs WHERE email = ?').all(email);
+
+      // ---- (1) the whole subscription whose client is already off the node
+      const gone = await buildPackage([inA, inB], 'مشتری بی‌کلاینت');
+      mockXui.clients.delete(gone.email);
+      const markGone = mockXui.calls.length;
+      const delGone = await request('DELETE', `/api/admin/configs/${gone.id}/package`, { cookies, csrf });
+      const goneData = delGone.json?.data || {};
+      const goneRows = rowsOf(gone.email);
+      check('v1.5.2 a subscription that is not on the node can be deleted (was: xui_error, nothing removed)',
+        gone.res.status === 201 && gone.rows.length === 2
+          && delGone.status === 200 && Number(goneData.rows) === 2
+          && goneData.remoteDeleted === false && (goneData.alreadyGone || []).includes(gone.email)
+          && goneRows.length === 2 && goneRows.every((row) => Number(row.deleted_at) > 0),
+        `create=${gone.res.status} delete=${delGone.status} code=${delGone.json?.error?.code || '-'} rows=${goneData.rows} alreadyGone=${JSON.stringify(goneData.alreadyGone || [])}`);
+      check('the panel asked the node and then stopped — no delete is sent for a client it does not have',
+        routeCount(markGone, '/clients/get/') >= 1 && routeCount(markGone, '/clients/del/') === 0,
+        `get=${routeCount(markGone, '/clients/get/')} del=${routeCount(markGone, '/clients/del/')}`);
+
+      // ---- a node that cannot answer is still an error, and still writes nothing
+      const sick = await buildPackage([inC, inD], 'مشتری نود بیمار');
+      mockXui.quirks.failGet.add(sick.email);
+      const markSick = mockXui.calls.length;
+      const delSick = await request('DELETE', `/api/admin/configs/${sick.id}/package`, { cookies, csrf });
+      const sickRows = rowsOf(sick.email);
+      check('"cannot tell" is not "not there": a sick node aborts the delete and leaves every row alone',
+        delSick.status === 422 && delSick.json?.error?.code === 'xui_error'
+          && sickRows.length === 2 && sickRows.every((row) => Number(row.deleted_at) === 0)
+          && routeCount(markSick, '/clients/del/') === 0,
+        `status=${delSick.status} code=${delSick.json?.error?.code || '-'} untouched=${sickRows.filter((row) => Number(row.deleted_at) === 0).length}/2`);
+      mockXui.quirks.failGet.delete(sick.email);
+      const markWell = mockXui.calls.length;
+      const delWell = await request('DELETE', `/api/admin/configs/${sick.id}/package`, { cookies, csrf });
+      const wellData = delWell.json?.data || {};
+      check('a healthy package still deletes its client on the node — exactly one delete call',
+        delWell.status === 200 && wellData.remoteDeleted === true
+          && (wellData.xuiDeleted || []).includes(sick.email)
+          && routeCount(markWell, '/clients/del/') === 1 && !mockXui.clients.has(sick.email),
+        `status=${delWell.status} del=${routeCount(markWell, '/clients/del/')} remote=${wellData.remoteDeleted}`);
+
+      // ---- one channel of a client-less package (the single delete button)
+      const single = await buildPackage([inA, inB], 'تک‌ردیف بی‌کلاینت');
+      mockXui.clients.delete(single.email);
+      const markSingle = mockXui.calls.length;
+      const delOne = await request('DELETE', `/api/admin/configs/${single.id}`, { cookies, csrf });
+      const oneRow = v52Db.prepare('SELECT deleted_at FROM configs WHERE id = ?').get(single.id) || {};
+      const sibRow = v52Db.prepare('SELECT deleted_at FROM configs WHERE email = ? AND id <> ?').get(single.email, single.id) || {};
+      check('v1.5.2 one channel of a client-less package is removable too, and its sibling stays',
+        delOne.status === 200 && delOne.json?.data?.alreadyGone === true
+          && Number(oneRow.deleted_at) > 0 && Number(sibRow.deleted_at) === 0
+          && routeCount(markSingle, '/clients/del/') === 0 && writesSince(markSingle).length === 0,
+        `status=${delOne.status} alreadyGone=${delOne.json?.data?.alreadyGone} writes=${writesSince(markSingle).join(',') || 'none'}`);
+
+      // ---- (4) search the node, then hand a client to a reseller
+      const nodeUuid = '3f2a9c14-7b6d-4e51-9a2f-0c8d5e7b1a52';
+      const nodeEmail = 'v152node-ready';
+      const nodeBytes = 20 * 1024 ** 3;
+      mockXui.clients.set(nodeEmail, {
+        email: nodeEmail, id: nodeUuid, subId: 'v152sub0001', comment: 'مشتری آماده ۱۵۲',
+        totalGB: nodeBytes, expiryTime: Date.now() + 30 * 86400000, enable: true,
+        up: 4096, down: 8192, inboundIds: [901, 902],
+      });
+      v52Emails.push(nodeEmail);
+      const orphanEmail = 'v152node-orphan';
+      mockXui.clients.set(orphanEmail, {
+        email: orphanEmail, id: '9b1c7d20-4a55-4c3e-8f10-2d6e9a0b7c43', subId: 'v152sub0002',
+        comment: 'کانال ناشناخته', totalGB: 0, expiryTime: 0, enable: true, up: 0, down: 0, inboundIds: [4242],
+      });
+      v52Emails.push(orphanEmail);
+
+      const shortQ = await request('GET', '/api/admin/node-clients?q=a', { cookies });
+      check('v1.5.2 node search refuses a one-character query instead of listing the whole node',
+        shortQ.status === 422 && shortQ.json?.error?.code === 'query_too_short',
+        `status=${shortQ.status} code=${shortQ.json?.error?.code || '-'}`);
+
+      const markSearch = mockXui.calls.length;
+      const byEmail = await request('GET', `/api/admin/node-clients?q=${encodeURIComponent(nodeEmail)}`, { cookies });
+      const hit = (byEmail.json?.data?.rows || [])[0] || {};
+      check('v1.5.2 a client is found on x-ui by email, with its channels and its uuid',
+        byEmail.status === 200 && (byEmail.json?.data?.rows || []).length === 1
+          && hit.email === nodeEmail && hit.uuid === nodeUuid && hit.adopted === false
+          && Number(hit.knownInbounds) === 2 && (hit.inboundIds || []).join(',') === '901,902'
+          && Number(hit.totalBytes) === nodeBytes,
+        `status=${byEmail.status} rows=${(byEmail.json?.data?.rows || []).length} uuid=${hit.uuid} known=${hit.knownInbounds}`);
+      const byUuid = await request('GET', `/api/admin/node-clients?q=${nodeUuid}`, { cookies });
+      check('v1.5.2 the same client is found by UUID',
+        byUuid.status === 200 && (byUuid.json?.data?.rows || []).length === 1
+          && (byUuid.json?.data?.rows || [])[0]?.email === nodeEmail,
+        `rows=${(byUuid.json?.data?.rows || []).length}`);
+      const byRemark = await request('GET', `/api/admin/node-clients?q=${encodeURIComponent('مشتری آماده')}`, { cookies });
+      check('v1.5.2 the same client is found by its remark on the node',
+        byRemark.status === 200 && (byRemark.json?.data?.rows || []).length === 1
+          && (byRemark.json?.data?.rows || [])[0]?.email === nodeEmail,
+        `rows=${(byRemark.json?.data?.rows || []).length}`);
+      check('searching is read-only: not one write reached x-ui',
+        writesSince(markSearch).length === 0 && routeCount(markSearch, '/clients/list') === 3,
+        `writes=${writesSince(markSearch).join(',') || 'none'} lists=${routeCount(markSearch, '/clients/list')}`);
+      const wrongNode = await request('GET', '/api/admin/node-clients?q=v152node&serverId=999999', { cookies });
+      check('searching a node that does not exist is a clear 404',
+        wrongNode.status === 404 && wrongNode.json?.error?.code === 'server_not_found',
+        `status=${wrongNode.status} code=${wrongNode.json?.error?.code || '-'}`);
+      const shopSearch = await request('GET', '/api/admin/node-clients?q=v152node', { cookies: ck52 });
+      check('a reseller cannot search the nodes', shopSearch.status === 403, `status=${shopSearch.status}`);
+      const nodeList = await request('GET', '/api/admin/nodes', { cookies });
+      check('the search page gets its node filter from a light endpoint (no CPU probe, no token)',
+        nodeList.status === 200 && (nodeList.json?.data?.rows || []).length >= 1
+          && (nodeList.json?.data?.rows || []).every((row) => row.id > 0 && typeof row.name === 'string' && row.token === undefined),
+        `rows=${(nodeList.json?.data?.rows || []).length}`);
+
+      const markAdopt = mockXui.calls.length;
+      const adopt = await request('POST', '/api/admin/configs/adopt', {
+        cookies, csrf,
+        body: {
+          email: nodeEmail, userId: v52ShopId, serverId: primaryId,
+          label: 'کانفیگ آماده', customerName: 'مشتری نود', customerPhone: '09120000000', note: 'از جست‌وجوی نود',
+        },
+      });
+      const adoptData = adopt.json?.data || {};
+      for (const id of adoptData.configs || []) v52Ids.push(Number(id));
+      const adoptedRows = rowsOf(nodeEmail).filter((row) => Number(row.deleted_at) === 0);
+      check('v1.5.2 the admin can hand an existing x-ui client to a reseller: one row per known channel',
+        adopt.status === 201 && Number(adoptData.imported) === 2 && Number(adoptData.restored) === 0
+          && adoptedRows.length === 2
+          && adoptedRows.every((row) => row.origin === 'external' && Number(row.user_id) === v52ShopId)
+          && new Set(adoptedRows.map((row) => row.sub_id)).size === 1
+          && Number(adoptedRows[0].total_bytes) === nodeBytes
+          && (adoptData.inbounds || []).join(',') === [inA, inB].join(','),
+        `status=${adopt.status} code=${adopt.json?.error?.code || '-'} imported=${adoptData.imported} rows=${adoptedRows.length} origin=${adoptedRows[0]?.origin}`);
+      check('adopting writes nothing to x-ui — the customer stays connected on the node',
+        writesSince(markAdopt).length === 0 && mockXui.clients.has(nodeEmail),
+        `writes=${writesSince(markAdopt).join(',') || 'none'}`);
+      const shopList52 = await request('GET', `/api/reseller/configs?search=${encodeURIComponent(nodeEmail)}`, { cookies: ck52 });
+      const shopPkg = (shopList52.json?.data?.rows || [])[0] || {};
+      check('the adopted customer appears in the reseller’s own list as ONE package with both channels',
+        shopList52.status === 200 && (shopList52.json?.data?.rows || []).length === 1
+          && Number(shopPkg.groupCount) === 2 && (shopPkg.inbounds || []).length === 2,
+        `rows=${(shopList52.json?.data?.rows || []).length} groupCount=${shopPkg.groupCount}`);
+      const again52 = await request('POST', '/api/admin/configs/adopt', {
+        cookies, csrf, body: { email: nodeEmail, userId: v52ShopId, serverId: primaryId },
+      });
+      check('adopting the same client twice adds nothing and keeps the same group token',
+        again52.status === 201 && Number(again52.json?.data?.imported) === 0
+          && Number(again52.json?.data?.restored) === 0 && Number(again52.json?.data?.alreadyHis) === 2
+          && String(again52.json?.data?.groupToken) === String(adoptData.groupToken)
+          && rowsOf(nodeEmail).filter((row) => Number(row.deleted_at) === 0).length === 2,
+        `imported=${again52.json?.data?.imported} alreadyHis=${again52.json?.data?.alreadyHis}`);
+      const stranger52 = await request('POST', '/api/admin/configs/adopt', {
+        cookies, csrf, body: { email: nodeEmail, userId: v52OtherId, serverId: primaryId },
+      });
+      check('a client that already belongs to one reseller cannot be handed to another',
+        stranger52.status === 409 && stranger52.json?.error?.code === 'config_owned_by_other',
+        `status=${stranger52.status} code=${stranger52.json?.error?.code || '-'}`);
+      const noImp52 = await request('POST', '/api/admin/configs/adopt', {
+        cookies, csrf, body: { email: orphanEmail, userId: v52NoImpId, serverId: primaryId },
+      });
+      check('a reseller who switched adoption off is refused with the reason',
+        noImp52.status === 409 && noImp52.json?.error?.code === 'import_disabled',
+        `status=${noImp52.status} code=${noImp52.json?.error?.code || '-'}`);
+      const missing52 = await request('POST', '/api/admin/configs/adopt', {
+        cookies, csrf, body: { email: 'v152node-not-there', userId: v52ShopId, serverId: primaryId },
+      });
+      check('a client that is not on the node is a clear 404, not a silent empty import',
+        missing52.status === 404 && missing52.json?.error?.code === 'xui_client_missing',
+        `status=${missing52.status} code=${missing52.json?.error?.code || '-'}`);
+      const orphan52 = await request('POST', '/api/admin/configs/adopt', {
+        cookies, csrf, body: { email: orphanEmail, userId: v52ShopId, serverId: primaryId },
+      });
+      check('a client whose channels this panel does not know is refused instead of writing a row it cannot serve',
+        orphan52.status === 422 && orphan52.json?.error?.code === 'no_known_inbound'
+          && rowsOf(orphanEmail).length === 0,
+        `status=${orphan52.status} code=${orphan52.json?.error?.code || '-'} rows=${rowsOf(orphanEmail).length}`);
+      const shopAdopt52 = await request('POST', '/api/admin/configs/adopt', {
+        cookies: ck52, csrf: cs52, body: { email: nodeEmail, userId: v52ShopId, serverId: primaryId },
+      });
+      check('a reseller cannot adopt a client for himself', shopAdopt52.status === 403, `status=${shopAdopt52.status}`);
+      const markAdoptedDel = mockXui.calls.length;
+      const delAdopted = await request('DELETE', `/api/admin/configs/${Number((adoptData.configs || [])[0] || 0)}/package`, { cookies, csrf });
+      const adoptedDelData = delAdopted.json?.data || {};
+      check('the one delete button on an adopted package only forgets it here — the other panel’s client stays',
+        delAdopted.status === 200 && adoptedDelData.remoteDeleted === false
+          && (adoptedDelData.localOnly || []).includes(nodeEmail)
+          && writesSince(markAdoptedDel).length === 0 && mockXui.clients.has(nodeEmail),
+        `status=${delAdopted.status} localOnly=${JSON.stringify(adoptedDelData.localOnly || [])} writes=${writesSince(markAdoptedDel).join(',') || 'none'}`);
+
+      // ---- (3) the receipt flow, panel half
+      const insertTopup52 = v52Db.prepare(
+        `INSERT INTO topup_requests (user_id, amount, status, file_kind, file_id, caption, chat_id, message_id,
+           admin_chat_id, admin_message_id, decided_by, decided_at, decision_note, source, created_at, updated_at)
+         VALUES (?, ?, 'pending', ?, ?, 'فیش واریزی', ?, 0, '', 0, 0, 0, '', 'bot', ?, ?)`
+      );
+      const seedTopup = (userId, amount, kind = 'photo', fileId = 'selftest-file-id') => {
+        const now = Date.now();
+        const info = insertTopup52.run(Number(userId), Number(amount), kind, fileId, String(userId), now, now);
+        const id = Number(info.lastInsertRowid);
+        v52Topups.push(id);
+        return id;
+      };
+      const balanceOf = (id) => Number(v52Db.prepare('SELECT balance FROM users WHERE id = ?').get(id)?.balance || 0);
+      const txCount = (id) => Number(v52Db.prepare('SELECT COUNT(*) AS c FROM transactions WHERE user_id = ?').get(id).c);
+      const t1 = seedTopup(v52ShopId, 500000);
+      const t2 = seedTopup(v52ShopId, 250000);
+      const t3 = seedTopup(v52ShopId, 300000);
+      const t4 = seedTopup(v52ShopId, 100000);
+      const t5 = seedTopup(v52OtherId, 90000);
+      const t6 = seedTopup(v52ShopId, 5000, '', '');
+
+      const list52 = await request('GET', '/api/admin/topups?status=pending', { cookies });
+      const listData52 = list52.json?.data || {};
+      check('v1.5.2 the admin sees the receipts with counters and the bot state on the same page',
+        list52.status === 200 && (listData52.rows || []).some((row) => Number(row.id) === t1)
+          && Number(listData52.counts?.pending) >= 6 && typeof listData52.bot?.enabled === 'boolean'
+          && (listData52.rows || []).every((row) => row.status === 'pending'),
+        `status=${list52.status} pending=${listData52.counts?.pending} bot=${JSON.stringify(listData52.bot || {})}`);
+      const before52 = balanceOf(v52ShopId);
+      const txBefore52 = txCount(v52ShopId);
+      const ok52 = await request('POST', `/api/admin/topups/${t1}/approve`, { cookies, csrf, body: { note: 'فیش بررسی شد' } });
+      const okData52 = ok52.json?.data?.request || {};
+      check('v1.5.2 approving a receipt credits the wallet exactly once',
+        ok52.status === 200 && okData52.status === 'approved' && Number(okData52.credited) === 500000
+          && balanceOf(v52ShopId) === before52 + 500000 && txCount(v52ShopId) === txBefore52 + 1,
+        `status=${ok52.status} credited=${okData52.credited} balance=${balanceOf(v52ShopId)} tx=${txCount(v52ShopId) - txBefore52}`);
+      const twice52 = await request('POST', `/api/admin/topups/${t1}/approve`, { cookies, csrf, body: {} });
+      check('a second approve is refused and moves no money',
+        twice52.status === 409 && twice52.json?.error?.code === 'already_decided'
+          && balanceOf(v52ShopId) === before52 + 500000 && txCount(v52ShopId) === txBefore52 + 1,
+        `status=${twice52.status} code=${twice52.json?.error?.code || '-'}`);
+      const no52 = await request('POST', `/api/admin/topups/${t2}/reject`, { cookies, csrf, body: { note: 'مبلغ فیش نمی‌خواند' } });
+      check('rejecting a receipt moves no money and keeps the reason',
+        no52.status === 200 && no52.json?.data?.request?.status === 'rejected'
+          && no52.json?.data?.request?.decisionNote === 'مبلغ فیش نمی‌خواند'
+          && balanceOf(v52ShopId) === before52 + 500000 && txCount(v52ShopId) === txBefore52 + 1,
+        `status=${no52.status} balance=${balanceOf(v52ShopId)}`);
+      const corrected52 = await request('POST', `/api/admin/topups/${t3}/approve`, { cookies, csrf, body: { amount: 450000 } });
+      check('the admin can correct the amount on the receipt before approving it',
+        corrected52.status === 200 && Number(corrected52.json?.data?.request?.credited) === 450000
+          && Number(corrected52.json?.data?.request?.amount) === 450000
+          && balanceOf(v52ShopId) === before52 + 950000,
+        `credited=${corrected52.json?.data?.request?.credited} balance=${balanceOf(v52ShopId)}`);
+      const zero52 = await request('POST', `/api/admin/topups/${t4}/approve`, { cookies, csrf, body: { amount: 0 } });
+      const huge52 = await request('POST', `/api/admin/topups/${t4}/approve`, { cookies, csrf, body: { amount: 5000000000 } });
+      check('an impossible amount is refused and the receipt stays pending',
+        zero52.status === 422 && huge52.status === 422
+          && v52Db.prepare('SELECT status FROM topup_requests WHERE id = ?').get(t4)?.status === 'pending'
+          && balanceOf(v52ShopId) === before52 + 950000,
+        `zero=${zero52.status} huge=${huge52.status}`);
+      const noReceipt52 = await request('GET', `/api/admin/topups/${t6}/receipt`, { cookies });
+      check('a receipt without a file answers 404 instead of calling Telegram',
+        noReceipt52.status === 404 && noReceipt52.json?.error?.code === 'no_receipt',
+        `status=${noReceipt52.status} code=${noReceipt52.json?.error?.code || '-'}`);
+      const mine52 = await request('GET', '/api/reseller/topups', { cookies: ck52 });
+      const mineData52 = mine52.json?.data || {};
+      const mineRows52 = mineData52.rows || [];
+      check('v1.5.2 the reseller sees only his own receipts, with his live balance and his own counters',
+        mine52.status === 200 && mineRows52.length === 5 && mineRows52.every((row) => Number(row.id) !== t5)
+          && Number(mineData52.balance) === balanceOf(v52ShopId)
+          && Number(mineData52.counts?.approved) === 2 && Number(mineData52.counts?.rejected) === 1
+          && Number(mineData52.counts?.pending) === 2,
+        `rows=${mineRows52.length} counts=${JSON.stringify(mineData52.counts || {})} balance=${mineData52.balance}`);
+      check('the reseller payload carries no Telegram file id and no chat id',
+        mineRows52.every((row) => row.fileId === undefined && row.chatId === undefined && row.adminChatId === undefined),
+        `keys=${Object.keys(mineRows52[0] || {}).join(',')}`);
+      const shopApprove52 = await request('POST', `/api/admin/topups/${t4}/approve`, { cookies: ck52, csrf: cs52, body: {} });
+      const shopAdminList52 = await request('GET', '/api/admin/topups', { cookies: ck52 });
+      check('a reseller can neither read the fleet’s receipts nor approve his own',
+        shopApprove52.status === 403 && shopAdminList52.status === 403,
+        `approve=${shopApprove52.status} list=${shopAdminList52.status}`);
+      const notified52 = v52Db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND title = 'موجودی شما افزایش یافت'").get(v52ShopId).c;
+      check('every approved receipt told the reseller in his panel inbox',
+        Number(notified52) === 2, `notifications=${notified52}`);
+
+      // ---- the bot's own switches, from the settings card
+      const tgBefore52 = (await request('GET', '/api/admin/settings', { cookies })).json?.data?.settings?.telegram || {};
+      v52BotWas = { botEnabled: tgBefore52.botEnabled !== false, botAdminChatId: String(tgBefore52.botAdminChatId || '') };
+      v52BotTouched = true;
+      const botOff52 = await request('PATCH', '/api/admin/settings/telegram', {
+        cookies, csrf, body: { botEnabled: false, botAdminChatId: '-100555000111' },
+      });
+      const botState52 = await request('GET', '/api/admin/bot', { cookies });
+      const botData52 = botState52.json?.data || {};
+      check('v1.5.2 the reseller-bot switch and the decision chat are savable from the panel',
+        botOff52.status === 200 && botOff52.json?.data?.saved?.botEnabled === false
+          && botOff52.json?.data?.saved?.botAdminChatId === '-100555000111'
+          && botState52.status === 200 && botData52.enabled === false && botData52.adminChatId === '-100555000111',
+        `patch=${botOff52.status} state=${botState52.status} enabled=${botData52.enabled} chat=${botData52.adminChatId}`);
+      check('the bot token never travels back to the browser',
+        botOff52.json?.data?.saved?.botToken === '' && botOff52.json?.data?.saved?.hasBotToken === true
+          && botData52.botToken === undefined && botData52.hasToken === true,
+        `saved=${JSON.stringify(botOff52.json?.data?.saved?.botToken)} hasToken=${botData52.hasToken}`);
+      const badChat52 = await request('PATCH', '/api/admin/settings/telegram', { cookies, csrf, body: { botAdminChatId: 'not-a-chat' } });
+      check('a non-numeric decision chat is refused', badChat52.status === 422 && badChat52.json?.error?.code === 'telegram_chat_id',
+        `status=${badChat52.status} code=${badChat52.json?.error?.code || '-'}`);
+      const botOn52 = await request('PATCH', '/api/admin/settings/telegram', {
+        cookies, csrf, body: { botEnabled: true, botAdminChatId: '-100555000111' },
+      });
+      const botStateOn52 = await request('GET', '/api/admin/bot', { cookies });
+      check('switching the bot back on needs no restart to be reflected in its state',
+        botOn52.status === 200 && botStateOn52.json?.data?.enabled === true,
+        `status=${botOn52.status} enabled=${botStateOn52.json?.data?.enabled}`);
+    } finally {
+      for (const id of v52Ids) v52Db.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id);
+      for (const id of v52Ids) v52Db.prepare('DELETE FROM configs WHERE id = ?').run(id);
+      for (const id of v52Topups) v52Db.prepare('DELETE FROM topup_requests WHERE id = ?').run(id);
+      for (const shop of [v52ShopId, v52OtherId, v52NoImpId]) {
+        if (!shop) continue;
+        v52Db.prepare('DELETE FROM notifications WHERE user_id = ?').run(shop);
+        v52Db.prepare('DELETE FROM sessions WHERE user_id = ?').run(shop);
+        v52Db.prepare('DELETE FROM transactions WHERE user_id = ?').run(shop);
+        v52Db.prepare('DELETE FROM topup_requests WHERE user_id = ?').run(shop);
+        v52Db.prepare('DELETE FROM users WHERE id = ?').run(shop);
+      }
+      for (const email of v52Emails) mockXui.clients.delete(email);
+      mockXui.quirks.failGet.clear();
+      v52Db.close();
+      if (v52BotTouched) {
+        await request('PATCH', '/api/admin/settings/telegram', { cookies, csrf, body: v52BotWas });
+      }
+      if (v52LimitRaised) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: v52Limit } });
+      if (v52Parked) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
     }
 
     // --------------------------- v1.4.27: the nightly telegram report

@@ -13,6 +13,7 @@ import {
   EyeOff,
   KeyRound,
   Link2,
+  Minus,
   Pencil,
   Percent,
   Pin,
@@ -635,14 +636,41 @@ function UserForm({ open, onClose, editing }) {
   );
 }
 
+/**
+ * v1.5.2 — the wallet adjustment the owner can actually use on a phone.
+ *
+ * The field used to be `type="number"`, so mobile opened the numeric keypad,
+ * which has no «−» on it: deducting was impossible without a desktop. Now the
+ * sign is a pair of explicit buttons (افزایش / کاهش), the field is plain text so
+ * the FULL keyboard opens, and a typed «−» still works and flips the button for
+ * him. The result is previewed against the real balance before anything is sent.
+ */
+const BALANCE_PRESETS = [100000, 500000, 1000000, 5000000];
+
+function toEnglishDigits(value) {
+  return String(value || '')
+    .replace(/[۰-۹]/g, (d) => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)))
+    .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)));
+}
+
 function BalanceModal({ open, onClose, user }) {
   const { t, lang } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const [amount, setAmount] = useState('');
+  const [mode, setMode] = useState('add');
   const [description, setDescription] = useState('');
 
-  useEffect(() => { if (open) { setAmount(''); setDescription(''); } }, [open]);
+  useEffect(() => { if (open) { setAmount(''); setMode('add'); setDescription(''); } }, [open]);
+
+  const balance = Number(user?.balance || 0);
+  const normalized = toEnglishDigits(amount).replace(/[,\s٬،]/g, '');
+  const typedNegative = normalized.trim().startsWith('-');
+  const value = Number(normalized.replace(/[^0-9]/g, '') || 0);
+  const negative = typedNegative || mode === 'sub';
+  const signed = negative ? -value : value;
+  const after = balance + signed;
+  const invalid = !Number.isFinite(value) || value <= 0 || after < 0;
 
   const adjust = useMutation({
     mutationFn: (payload) => api.post(`/admin/users/${user.id}/balance`, payload),
@@ -655,24 +683,111 @@ function BalanceModal({ open, onClose, user }) {
     onError: (err) => toast.error(translateError(err, t)),
   });
 
+  const onAmountChange = (raw) => {
+    setAmount(raw);
+    // A typed minus is the operator's own choice: follow it instead of fighting
+    // him with a sign he cannot see on the keypad.
+    if (toEnglishDigits(raw).trim().startsWith('-')) setMode('sub');
+  };
+
+  const submit = () => {
+    if (invalid) return;
+    adjust.mutate({ amount: signed, description });
+  };
+
   return (
     <Modal
       open={open}
       onClose={onClose}
       title={t('resellers.detail.adjustBalance')}
-      subtitle={`${user?.username} · ${formatMoney(user?.balance || 0, lang)}`}
+      subtitle={`${user?.username} · ${formatMoney(balance, lang)}`}
       size="sm"
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
-          <Button loading={adjust.isPending} onClick={() => adjust.mutate({ amount: Number(amount), description })} icon={Wallet}>{t('common.apply')}</Button>
+          <Button
+            loading={adjust.isPending}
+            disabled={invalid}
+            onClick={submit}
+            icon={Wallet}
+            variant={negative ? 'danger' : 'primary'}
+          >
+            {t('common.apply')}
+          </Button>
         </>
       }
     >
       <div className="space-y-3">
-        <Field label={t('resellers.detail.amount')} hint={lang === 'fa' ? 'برای افزایش عدد مثبت و برای کاهش عدد منفی وارد کنید' : 'Positive to add, negative to deduct'}>
-          <Input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="+500000" dir="ltr" />
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            variant={mode === 'add' && !typedNegative ? 'primary' : 'secondary'}
+            size="sm"
+            icon={Plus}
+            onClick={() => { setMode('add'); setAmount(toEnglishDigits(amount).replace(/^-/, '')); }}
+          >
+            {t('resellers.detail.addCredit')}
+          </Button>
+          <Button
+            variant={negative ? 'danger' : 'secondary'}
+            size="sm"
+            icon={Minus}
+            onClick={() => { setMode('sub'); setAmount(toEnglishDigits(amount).replace(/^-/, '')); }}
+          >
+            {t('resellers.detail.deduct')}
+          </Button>
+        </div>
+        <Field
+          label={t('resellers.detail.amount')}
+          hint={t('resellers.detail.amountKeyboardHint')}
+        >
+          <Input
+            type="text"
+            inputMode="text"
+            autoComplete="off"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint="done"
+            value={amount}
+            onChange={(e) => onAmountChange(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } }}
+            placeholder={negative ? '-500000' : '500000'}
+            dir="ltr"
+            className="text-center text-lg font-semibold"
+          />
         </Field>
+        <div className="flex flex-wrap gap-1.5">
+          {BALANCE_PRESETS.map((preset) => (
+            <button
+              key={preset}
+              type="button"
+              onClick={() => setAmount(String(preset))}
+              className={cx(
+                'rounded-lg border px-2 py-1 text-[11px] transition',
+                value === preset
+                  ? 'border-emerald-400/60 bg-emerald-400/10 text-emerald-200'
+                  : 'border-white/10 bg-white/5 text-slate-300 hover:border-white/25'
+              )}
+            >
+              {formatNumber(preset, lang)}
+            </button>
+          ))}
+        </div>
+        <div
+          className={cx(
+            'rounded-xl border px-3 py-2 text-xs',
+            after < 0 ? 'border-rose-400/40 bg-rose-400/10 text-rose-200' : 'border-white/10 bg-white/5 text-slate-300'
+          )}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span>{t('resellers.detail.balanceAfter')}</span>
+            <b dir="ltr" className="text-sm">{formatMoney(after, lang)}</b>
+          </div>
+          {value <= 0 ? (
+            <p className="mt-1 text-[11px] opacity-80">{t('resellers.detail.balanceZero')}</p>
+          ) : after < 0 ? (
+            <p className="mt-1 text-[11px]">{t('resellers.detail.balanceNegative')}</p>
+          ) : null}
+        </div>
         <Field label={t('common.description')}>
           <Input value={description} onChange={(e) => setDescription(e.target.value)} />
         </Field>

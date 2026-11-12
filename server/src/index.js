@@ -18,6 +18,7 @@ const auth = require('./auth');
 const monitor = require('./services/monitor');
 const backupService = require('./services/backup');
 const telegram = require('./services/telegram');
+const bot = require('./services/bot');
 const reports = require('./services/reports');
 const usersService = require('./services/users');
 const { ApiError, dayKey, log, logError } = require('./utils');
@@ -203,6 +204,10 @@ function start() {
     monitor.start();
     startAutoBackupTimer();
     startDailyReportTimer();
+    // v1.5.2: the reseller bot. It never blocks the boot — start() only checks
+    // the webhook and then polls in the background, and a bot that is switched
+    // off in settings stays idle without a single network call.
+    bot.start().catch((err) => logError('[bot] start failed:', err.message));
   });
   server.requestTimeout = 120000;
   server.headersTimeout = 130000;
@@ -210,6 +215,7 @@ function start() {
   const shutdown = (signal) => {
     log(`[boot] received ${signal}, shutting down`);
     monitor.stop();
+    bot.stop();
     server.close(() => {
       closeDb();
       process.exit(0);
