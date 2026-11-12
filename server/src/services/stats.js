@@ -80,6 +80,94 @@ function statusCounts(userId = 0) {
   };
 }
 
+/**
+ * v1.5.3: the buckets behind the bot's «📦 آمار اشتراک‌ها» button. The grouping,
+ * the package rules and the visibility rule are the ones statusCounts() already
+ * uses — the very same `active_n / disabled_n / expiry / quota / used` columns, so
+ * the bot can never disagree with the panel or the KPI cards. It adds the two
+ * things only a chat answer needs: which packages run out soon, and which ones
+ * have their shared volume used up. A name is the customer's, then the label,
+ * then the email — the same order the config list shows.
+ */
+function packageBuckets(userId = 0, soonDays = 3, limit = 8) {
+  const db = getDb();
+  const now = Date.now();
+  const horizon = now + Math.min(30, Math.max(1, Number(soonDays) || 3)) * DAY_MS;
+  const scope = `${userId ? 'AND c.user_id = ?' : ''} AND ${VISIBLE_SQL}`;
+  const params = userId ? [Number(userId)] : [];
+  const groups = `
+       SELECT ${CONFIG_GROUP_KEY_SQL} AS gkey,
+         COUNT(*) AS members,
+         SUM(CASE WHEN c.enabled = 1 AND (c.expiry_at = 0 OR c.expiry_at > ${now})
+                    AND (c.total_bytes = 0 OR c.up_bytes + c.down_bytes < c.total_bytes) THEN 1 ELSE 0 END) AS active_n,
+         SUM(CASE WHEN c.enabled = 0 THEN 1 ELSE 0 END) AS disabled_n,
+         MAX(c.expiry_at) AS expiry_at,
+         MAX(c.total_bytes) AS quota,
+         ${CONFIG_GROUP_USED_SQL} AS used,
+         MAX(c.customer_name) AS customer_name,
+         MAX(c.label) AS label,
+         MAX(c.email) AS email
+       FROM configs c WHERE c.deleted_at = 0 ${scope}
+       GROUP BY gkey`;
+
+  const row = db.prepare(
+    `SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN expiry_at > 0 AND expiry_at <= ${now} THEN 1 ELSE 0 END) AS expired,
+      SUM(CASE WHEN (expiry_at = 0 OR expiry_at > ${now}) AND quota > 0 AND used >= quota THEN 1 ELSE 0 END) AS depleted,
+      SUM(CASE WHEN (expiry_at = 0 OR expiry_at > ${now}) AND (quota = 0 OR used < quota)
+                AND disabled_n = members THEN 1 ELSE 0 END) AS disabled,
+      SUM(CASE WHEN (expiry_at = 0 OR expiry_at > ${now}) AND (quota = 0 OR used < quota)
+                AND disabled_n < members AND active_n = members THEN 1 ELSE 0 END) AS active,
+      SUM(CASE WHEN expiry_at > ${now} AND expiry_at <= ${horizon} THEN 1 ELSE 0 END) AS soon,
+      COALESCE(SUM(used), 0) AS used,
+      COALESCE(SUM(quota), 0) AS quota
+     FROM (${groups})`
+  ).get(...params);
+
+  const nameOf = (r) => String(r.customer_name || r.label || r.email || '—');
+  const list = (sql) => db.prepare(sql).all(...params).map((r) => {
+    const expiry = Number(r.expiry_at || 0);
+    const quota = Number(r.quota || 0);
+    const used = Number(r.used || 0);
+    return {
+      name: nameOf(r),
+      members: Number(r.members || 0),
+      expiryAt: expiry,
+      daysLeft: expiry > now ? Math.max(0, Math.ceil((expiry - now) / DAY_MS)) : 0,
+      quotaBytes: quota,
+      usedBytes: used,
+      leftGb: quota > 0 ? Math.max(0, Math.round(((quota - used) / 1024 ** 3) * 10) / 10) : 0,
+      percent: quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0,
+    };
+  });
+
+  const total = Number(row.total || 0);
+  const active = Number(row.active || 0);
+  const expired = Number(row.expired || 0);
+  const depleted = Number(row.depleted || 0);
+  const disabled = Number(row.disabled || 0);
+  return {
+    total,
+    active,
+    expired,
+    depleted,
+    disabled,
+    soon: Number(row.soon || 0),
+    mixed: Math.max(0, total - active - expired - depleted - disabled),
+    usedBytes: Number(row.used || 0),
+    quotaBytes: Number(row.quota || 0),
+    expiringSoon: list(
+      `SELECT * FROM (${groups}) WHERE expiry_at > ${now} AND expiry_at <= ${horizon}
+       ORDER BY expiry_at ASC LIMIT ${Math.min(20, Math.max(1, Number(limit) || 8))}`
+    ),
+    depletedList: list(
+      `SELECT * FROM (${groups}) WHERE (expiry_at = 0 OR expiry_at > ${now}) AND quota > 0 AND used >= quota
+       ORDER BY used DESC LIMIT ${Math.min(20, Math.max(1, Number(limit) || 8))}`
+    ),
+  };
+}
+
 function trafficSeries(days = 14, userId = 0) {
   const db = getDb();
   const keys = dayRange(days);
@@ -264,6 +352,7 @@ function refreshStatuses() {
 
 module.exports = {
   statusCounts,
+  packageBuckets,
   trafficSeries,
   sumRange,
   topUsers,

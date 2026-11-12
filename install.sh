@@ -2,14 +2,13 @@
 # Sulduz Cloud — one-command installer for a fresh Ubuntu/Debian server.
 #
 #   curl -fsSL https://raw.githubusercontent.com/rezafazli1375/sulduzcloud/main/install.sh \
-#     | sudo bash -s -- --key "<installation key>"
+#     | sudo bash -s -- --domain panel.example.com
 #
-# The installation key is private. This file only stores its SHA-256 hash, so the
-# key cannot be read from the repository: without the exact key nothing installs.
-# Get the key from the project owner.
+# No installation key, no activation code: since v1.5.3 the script installs what
+# the repository publishes, exactly like the upstream panels it mirrors. Nothing
+# is asked of the operator except root.
 #
 # Options:
-#   --key <key>           installation key (required)
 #   --domain <host>       public host name (default: server IP; change later with `sc`)
 #   --port <port>         panel port on 127.0.0.1 (default 3100)
 #   --ssl-email <email>   obtain a Let's Encrypt certificate with certbot
@@ -30,12 +29,6 @@ DOMAIN_SET="0"
 SSL_EMAIL=""
 USE_NGINX="1"
 
-# SHA-256 of the private installation key. The key itself is NOT stored here (and
-# must never be committed): the owner hands it out together with the install
-# command, so a leaked or rotated key is simply a new hash below.
-INSTALL_KEY_SHA256="7eb7decb0a915f8f81b016ac0f068759eeacf393e31df838034b4ede0eaca375"
-PROVIDED_KEY=""
-
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
@@ -43,22 +36,16 @@ die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN="${2:-}"; DOMAIN_SET="1"; shift 2 ;;
-    --key) PROVIDED_KEY="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
     --ssl-email) SSL_EMAIL="${2:-}"; shift 2 ;;
     --no-nginx) USE_NGINX="0"; shift ;;
     --dir) APP_DIR="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
 
 [ "$(id -u)" = "0" ] || die "run as root (sudo bash install.sh ...)"
-
-[ -n "$PROVIDED_KEY" ] || die "installation key required: pass --key <key>"
-command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found (coreutils missing)"
-PROVIDED_KEY_HASH="$(printf '%s' "$PROVIDED_KEY" | sha256sum | awk '{print $1}')"
-[ "$PROVIDED_KEY_HASH" = "$INSTALL_KEY_SHA256" ] || die "wrong installation key"
 
 log "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive

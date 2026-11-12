@@ -6,6 +6,7 @@ import {
   CreditCard,
   Info,
   ReceiptText,
+  Send,
   Wallet as WalletIcon,
 } from 'lucide-react';
 import { useAuth } from '../../lib/auth.jsx';
@@ -14,6 +15,7 @@ import { api } from '../../lib/api.js';
 import { formatDate, formatMoney, formatNumber, relativeTime } from '../../lib/format.js';
 import {
   Badge,
+  CopyButton,
   EmptyState,
   ErrorState,
   PageHeader,
@@ -77,6 +79,73 @@ function MyReceipts({ currency }) {
   );
 }
 
+/**
+ * v1.5.3: «افزایش موجودی از طریق ربات تلگرام».
+ *
+ * The owner asked for one button that carries the reseller into the bot instead
+ * of making him search for it and type /start. The link is a /start deep link
+ * with the `topup` payload, so Telegram opens THIS chat with this bot and the bot
+ * drops him straight into the receipt conversation — the same screen as pressing
+ * the «افزایش موجودی» button himself.
+ *
+ * The link is built from the bot's own getMe username, which the poller caches;
+ * with the bot switched off, or before it has introduced itself, the card says so
+ * and tells him what to do instead of offering a broken t.me/… URL.
+ */
+function BotTopup() {
+  const { t } = useI18n();
+  const { data } = useQuery({
+    queryKey: ['wallet', 'bot'],
+    queryFn: () => api.get('/reseller/bot'),
+    staleTime: 120000,
+  });
+
+  const link = data?.link || '';
+  const steps = ['wallet.botStep1', 'wallet.botStep2', 'wallet.botStep3', 'wallet.botStep4'];
+
+  return (
+    <SectionCard icon={Send} title={t('wallet.botTopup')} subtitle={t('wallet.botTopupHint')}>
+      {!data?.enabled ? (
+        <p className="text-[11.5px] leading-6 text-slate-400">{t('wallet.botOff')}</p>
+      ) : link ? (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            <a
+              href={link}
+              target="_blank"
+              rel="noreferrer"
+              className="btn btn-primary inline-flex h-9 items-center gap-2 px-4 text-[11.5px]"
+            >
+              <Send className="h-4 w-4" />
+              {t('wallet.botOpen')}
+            </a>
+            <CopyButton value={link} label={t('wallet.botCopy')} />
+            <span className="ms-auto text-[10.5px] text-slate-500" dir="ltr">
+              t.me/{data.botName}
+            </span>
+          </div>
+          <div className="mt-4 grid gap-2 sm:grid-cols-2">
+            {steps.map((key, index) => (
+              <p
+                key={key}
+                className="flex items-start gap-2 rounded-xl border border-white/[0.06] bg-white/[0.03] px-3 py-2 text-[11.5px] leading-6 text-slate-300"
+              >
+                <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-md bg-emerald-500/15 text-[10px] font-bold text-emerald-300">
+                  {index + 1}
+                </span>
+                {t(key)}
+              </p>
+            ))}
+          </div>
+          <p className="mt-3 text-[10.5px] text-slate-500">{t('wallet.botLive')}</p>
+        </>
+      ) : (
+        <p className="text-[11.5px] leading-6 text-slate-400">{t('wallet.botNoLink')}</p>
+      )}
+    </SectionCard>
+  );
+}
+
 export default function Wallet() {
   const { t, lang } = useI18n();
   const { user, meta } = useAuth();
@@ -134,6 +203,11 @@ export default function Wallet() {
           hint={t('common.page')}
           tone="rose"
         />
+      </div>
+
+      {/* v1.5.3: the one button that carries him into the bot's receipt chat. */}
+      <div className="mb-4">
+        <BotTopup />
       </div>
 
       <div className="mb-4">

@@ -24,12 +24,13 @@ import {
   ShieldCheck,
   Sparkles,
   Users,
+  Wallet,
   X,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth.jsx';
 import { useI18n } from '../lib/i18n.jsx';
 import { api } from '../lib/api.js';
-import { formatBytes, formatDate, relativeTime } from '../lib/format.js';
+import { formatBytes, formatDate, formatMoney, formatNumber, relativeTime } from '../lib/format.js';
 import { Avatar, Badge, ThemeToggle, cx } from './ui.jsx';
 import { useConfirm, useToast } from './feedback.jsx';
 
@@ -233,6 +234,96 @@ function NotificationBell() {
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * v1.5.3: the reseller's balance, live in the header.
+ *
+ * The wallet used to appear only on the wallet page, so after paying through the
+ * Telegram bot the reseller had to reload and hunt for the new number. This chip
+ * reads /reseller/balance — a one-row query — every 20 s, when the tab comes back
+ * to the foreground, and right after the panel itself spent or earned money (the
+ * wallet mutation invalidates this key). A change flashes emerald or rose for a
+ * moment, so a charge that lands while he is working is seen, not guessed.
+ *
+ * It renders for resellers only: an admin has no wallet of his own to watch.
+ */
+function LiveBalance() {
+  const { t, lang } = useI18n();
+  const { isReseller } = useAuth();
+  const queryClient = useQueryClient();
+  const [flash, setFlash] = useState('');
+  const previous = useRef(null);
+
+  const { data } = useQuery({
+    queryKey: ['wallet', 'live'],
+    queryFn: () => api.get('/reseller/balance'),
+    enabled: isReseller,
+    refetchInterval: 20000,
+    staleTime: 10000,
+  });
+
+  // A tab that was in the background is read again the moment it is seen: the bot
+  // charges wallets while nobody is looking at the panel.
+  useEffect(() => {
+    if (!isReseller) return undefined;
+    const onWake = () => {
+      if (document.visibilityState === 'visible') queryClient.invalidateQueries({ queryKey: ['wallet', 'live'] });
+    };
+    window.addEventListener('focus', onWake);
+    document.addEventListener('visibilitychange', onWake);
+    return () => {
+      window.removeEventListener('focus', onWake);
+      document.removeEventListener('visibilitychange', onWake);
+    };
+  }, [isReseller, queryClient]);
+
+  // Navigating is the moment a purchase has already happened: the configs page
+  // spent wallet money, so the chip re-reads the balance instead of showing the
+  // number from before the click.
+  const pagePath = useLocation().pathname;
+  useEffect(() => {
+    if (!isReseller) return;
+    queryClient.invalidateQueries({ queryKey: ['wallet', 'live'] });
+  }, [pagePath, isReseller, queryClient]);
+
+  const balance = data ? Number(data.balance || 0) : null;
+  useEffect(() => {
+    if (balance === null) return undefined;
+    const before = previous.current;
+    previous.current = balance;
+    if (before === null || before === balance) return undefined;
+    setFlash(balance > before ? 'up' : 'down');
+    const timer = setTimeout(() => setFlash(''), 2200);
+    return () => clearTimeout(timer);
+  }, [balance]);
+
+  if (!isReseller) return null;
+
+  return (
+    <Link
+      to="/wallet"
+      title={t('wallet.liveBalanceHint')}
+      className={cx(
+        'flex h-9 items-center gap-2 rounded-xl border px-3 text-[11.5px] font-semibold transition',
+        flash === 'up'
+          ? 'border-emerald-400/50 bg-emerald-500/15 text-emerald-200 shadow-[0_0_18px_-6px_rgba(16,185,129,.9)]'
+          : flash === 'down'
+            ? 'border-rose-400/50 bg-rose-500/15 text-rose-200'
+            : 'border-white/[0.08] bg-white/[0.04] text-slate-200 hover:border-emerald-400/30 hover:text-white'
+      )}
+    >
+      <Wallet className="h-[15px] w-[15px] text-emerald-300" />
+      <span dir="ltr" className="tabular-nums">
+        {balance === null ? '—' : formatMoney(balance, lang, data.currency)}
+      </span>
+      {Number(data?.pending || 0) > 0 ? (
+        <span className="rounded-md bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-bold text-amber-200">
+          {t('wallet.receiptPending')} {formatNumber(data.pending, lang)}
+        </span>
+      ) : null}
+    </Link>
   );
 }
 
@@ -472,6 +563,8 @@ export default function Shell() {
                 {t('dash.createConfig')}
               </Link>
             ) : null}
+            {/* v1.5.3: the reseller's wallet, always in reach; renders for him only. */}
+            <LiveBalance />
             <ThemeToggle />
             <LangToggle />
             <NotificationBell />

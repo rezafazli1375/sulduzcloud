@@ -205,9 +205,9 @@ async function main() {
 
   const start = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, '/start'));
   const startCalls = sentTo(SHOP_TG);
-  check('a linked reseller gets the four-button menu and the guide',
-    start.action === 'start' && startCalls.length === 2
-      && (startCalls[0].payload.reply_markup?.keyboard || []).length === 2
+  check('a linked reseller gets the six-button menu and the guide',
+    start.action === 'help' && startCalls.length === 2
+      && (startCalls[0].payload.reply_markup?.keyboard || []).length === 3
       && textOf(startCalls[1]).includes('/topup') && textOf(startCalls[0]).includes(fa(1250000)),
     `action=${start.action} messages=${startCalls.length}`);
 
@@ -215,7 +215,7 @@ async function main() {
   const balText = textOf(lastTo(SHOP_TG));
   check('«موجودی» shows his wallet, his name and his last transactions',
     bal.action === 'balance' && balText.includes('موجودی کیف پول') && balText.includes('botshop')
-      && balText.includes(fa(1250000)) && lastTo(SHOP_TG).payload.reply_markup?.keyboard?.length === 2,
+      && balText.includes(fa(1250000)) && lastTo(SHOP_TG).payload.reply_markup?.keyboard?.length === 3,
     `action=${bal.action}`);
 
   const st = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, bot.BTN_STATS));
@@ -245,6 +245,124 @@ async function main() {
   check('an unrelated message is answered with the menu, not with silence',
     fallback.action === 'fallback' && textOf(lastTo(SHOP_TG)).includes('/help'),
     `action=${fallback.action}`);
+
+  // ------------------------------------------------- v1.5.3: the six buttons
+  // The owner asked for «مشاهده موجودی / افزایش موجودی و ارسال فیش / آمار» as
+  // buttons. They are a reply keyboard, so they live under the chat instead of
+  // inside one message — and every one of them must answer with the same text the
+  // matching slash command produces, or the panel link and the keypad disagree.
+  const kb = bot.menuKeyboard();
+  check('v1.5.3: the reseller keypad is exactly six buttons in three rows, and it stays put',
+    kb.keyboard.length === 3 && kb.keyboard.every((row) => row.length === 2)
+      && kb.keyboard.flat().length === 6 && kb.resize_keyboard === true && kb.is_persistent === true
+      && [bot.BTN_BALANCE, bot.BTN_PACKAGES, bot.BTN_TOPUP, bot.BTN_RECEIPTS, bot.BTN_STATS, bot.BTN_HELP]
+        .every((label) => kb.keyboard.flat().some((one) => one.text === label)),
+    `rows=${kb.keyboard.length} persistent=${kb.is_persistent}`);
+
+  const pkgs = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, bot.BTN_PACKAGES));
+  const pkText = textOf(lastTo(SHOP_TG));
+  check('«آمار اشتراک‌ها» buckets his own packages — total, active, expiring in 3 days, depleted — and no other shop’s',
+    pkgs.action === 'packages' && pkText.includes('آمار اشتراک‌های شما') && pkText.includes('در حال اتمام')
+      && pkText.includes(fa(2)) && pkText.includes('botshop-a') && !pkText.includes('botother'),
+    `action=${pkgs.action} len=${pkText.length}`);
+  const pkCmd = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, '/packages'));
+  check('the /packages command and its button answer with one and the same text',
+    pkCmd.action === 'packages' && textOf(lastTo(SHOP_TG)) === pkText, 'identical');
+
+  const rc = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, bot.BTN_RECEIPTS));
+  check('«فیش‌های من» answers with his own receipt history, and says so when there is none yet',
+    rc.action === 'receipts' && textOf(lastTo(SHOP_TG)).includes('فیش‌های واریزی شما')
+      && textOf(lastTo(SHOP_TG)).includes('در انتظار'),
+    `action=${rc.action}`);
+
+  const helpBtn = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, bot.BTN_HELP));
+  const helpMsg = textOf(lastTo(SHOP_TG));
+  check('the guide lists the five working buttons, the panel’s bot link and the reseller’s own numeric id',
+    helpBtn.action === 'help'
+      && [bot.BTN_BALANCE, bot.BTN_PACKAGES, bot.BTN_TOPUP, bot.BTN_RECEIPTS, bot.BTN_STATS]
+        .every((label) => helpMsg.includes(label))
+      && helpMsg.includes('t.me/sulduzcloud_bot?start=topup') && helpMsg.includes('/receipts')
+      && helpMsg.includes(SHOP_TG),
+    `len=${helpMsg.length}`);
+
+  // ---- the deep links the panel buttons open
+  const deepTopup = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, '/start topup'));
+  check('the panel link ?start=topup lands straight in the top-up conversation',
+    deepTopup.step === 'amount' && bot.stepOf(SHOP_TG)?.step === 'amount'
+      && textOf(lastTo(SHOP_TG)).includes('افزایش موجودی با فیش واریزی'),
+    `step=${bot.stepOf(SHOP_TG)?.step}`);
+  for (const [payload, action, needle] of [
+    ['balance', 'deep_balance', 'موجودی کیف پول'],
+    ['packages', 'deep_packages', 'آمار اشتراک‌های شما'],
+    ['receipts', 'deep_receipts', 'فیش‌های واریزی شما'],
+    ['stats', 'deep_stats', 'آمار شما'],
+  ]) {
+    const deep = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, `/start ${payload}`));
+    const said = textOf(lastTo(SHOP_TG));
+    const told = sentTo(SHOP_TG).slice(-2)[0];
+    check(`?start=${payload} says which section it opened and answers like the «${payload}» button`,
+      deep.ok === true && deep.action === action && said.includes(needle)
+        && textOf(told).includes('از لینک پنل'),
+      `action=${deep.action}`);
+  }
+  const deepMenu = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, '/start menu'));
+  check('a link that only points at the keypad does not pretend to show anything',
+    deepMenu.action === 'deep_menu' && textOf(lastTo(SHOP_TG)).includes('از دکمه‌های زیر استفاده کنید'),
+    `action=${deepMenu.action}`);
+  const deepBogus = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, '/start wallet2000'));
+  const bogusText = textOf(lastTo(SHOP_TG));
+  check('an unknown ?start payload is answered with the keypad and no section at all — his own balance line is fine, a wallet page is not',
+    deepBogus.ok === false && deepBogus.reason === 'unknown_deep_link'
+      && bogusText.includes('نمی‌شناسم') && !bogusText.includes('آخرین تراکنش‌ها')
+      && !bogusText.includes('آمار اشتراک‌ها') && bot.stepOf(SHOP_TG) === null
+      && lastTo(SHOP_TG).payload.reply_markup?.keyboard?.length === 3,
+    `reason=${deepBogus.reason}`);
+
+  // ---- the bot's own username, cached, and the links built from it
+  const getMeCalls = calls.filter((one) => one.method === 'getMe').length;
+  const botName = await bot.botUsername();
+  check('getMe ran exactly once for the whole conversation and its answer is cached in the database',
+    botName === 'sulduzcloud_bot' && getMeCalls === 1 && bot.cachedBotUsername() === 'sulduzcloud_bot'
+      && bot.stateGet('bot_username') === 'sulduzcloud_bot'
+      && calls.filter((one) => one.method === 'getMe').length === 1,
+    `name=@${botName} getMe=${getMeCalls}`);
+  const beforeCached = calls.filter((one) => one.method === 'getMe').length;
+  const cachedAgain = await bot.botUsername();
+  check('the cached username costs no second network call: the poller already answered for the panel',
+    cachedAgain === 'sulduzcloud_bot' && calls.filter((one) => one.method === 'getMe').length === beforeCached,
+    `getMe calls=${beforeCached}`);
+  check('the deep link is exactly the button the panel shows — t.me/<bot>?start=<section>',
+    bot.deepLink('topup') === 'https://t.me/sulduzcloud_bot?start=topup'
+      && bot.deepLink('receipts') === 'https://t.me/sulduzcloud_bot?start=receipts'
+      && bot.deepLink('menu', 'another_bot') === 'https://t.me/another_bot?start=menu',
+    bot.deepLink('topup'));
+  const savedName = bot.stateGet('bot_username');
+  bot.stateSet('bot_username', '');
+  const noLink = bot.deepLink('topup');
+  bot.stateSet('bot_username', savedName);
+  check('a bot that has not announced itself yields no link at all, rather than a broken one',
+    noLink === '' && bot.deepLink('topup') !== '', `link="${noLink}"`);
+
+  // ---- the native command menu, scoped so a reseller never sees admin commands
+  const cmdCallsBefore = calls.length;
+  const reg = await bot.registerCommands();
+  const scoped = calls.slice(cmdCallsBefore).filter((one) => one.method === 'setMyCommands');
+  check('the command menu is registered twice: wallet commands in private chats, admin commands only in the admin chat',
+    reg.commands === 8 && reg.adminCommands === 6 && scoped.length === 2
+      && scoped[0].payload.scope.type === 'all_private_chats'
+      && !scoped[0].payload.commands.some((one) => ['pending', 'resellers', 'money'].includes(one.command))
+      && scoped[0].payload.commands.some((one) => one.command === 'packages')
+      && scoped[1].payload.scope.type === 'chat'
+      && Number(scoped[1].payload.scope.chat_id) === Number(ADMIN_CHAT)
+      && scoped[1].payload.commands.some((one) => one.command === 'money'),
+    `reseller=${reg.commands} admin=${reg.adminCommands} calls=${scoped.length}`);
+  check('every description is Persian and within Telegram’s 250-character limit',
+    scoped.every((one) => one.payload.commands.every((cmd) => /^[a-z_]{1,32}$/.test(cmd.command)
+      && cmd.description.length > 0 && cmd.description.length <= 256
+      && !cmd.description.includes('لغوَ'))),
+    'names + descriptions');
+
+  await bot.handleUpdate(says(SHOP_TG, SHOP_TG, '/cancel'));
 
   // ------------------------------------------------- the receipt, amount first
   const opened = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, bot.BTN_TOPUP));
@@ -408,6 +526,231 @@ async function main() {
   check('/pending lists the waiting receipts in the admin chat',
     pendingCmd.action === 'admin_pending' && textOf(lastTo(ADMIN_CHAT)).includes('فیش‌های در انتظار'),
     `action=${pendingCmd.action}`);
+
+  // ------------------------------------------- v1.5.3: the admin's own keypad
+  // The owner asked for «دکمه امار کلی نمایندگان و موجودی هاشون» and «افزایش یا
+  // کاهش موجودی یک نماینده بر اساس ایدی عددی تلگرام» — for HIM, separately from
+  // the resellers. So the admin chat gets its own keyboard, and the money move is
+  // a four-step conversation whose every step re-checks who is typing.
+  for (let i = 1; i <= 7; i += 1) {
+    makeUser(`pager${String(i).padStart(2, '0')}`, { telegramId: `7701590${String(i).padStart(2, '0')}`, balance: 1000 * i });
+  }
+  const adminStart = await bot.handleUpdate(says(ADMIN_TG, ADMIN_TG, '/start'));
+  const adminKbRows = lastTo(ADMIN_TG).payload.reply_markup?.keyboard || [];
+  const adminLabels = adminKbRows.flat().map((one) => one.text);
+  check('v1.5.3: an admin gets his OWN keypad — the buttons a reseller uses never appear in his chat',
+    adminStart.action === 'admin_menu' && adminKbRows.length === 2 && adminLabels.length === 4
+      && adminLabels.join('|') === [bot.BTN_A_RESELLERS, bot.BTN_A_MONEY, bot.BTN_A_PENDING, bot.BTN_A_HELP].join('|')
+      && !adminLabels.includes(bot.BTN_TOPUP) && !adminLabels.includes(bot.BTN_RECEIPTS),
+    `rows=${adminKbRows.length} labels=${adminLabels.length}`);
+  const adminHelp = await bot.handleUpdate(says(ADMIN_TG, ADMIN_TG, bot.BTN_A_HELP));
+  const ahText = textOf(lastTo(ADMIN_TG));
+  check('the admin guide explains all four buttons and the five-step manual move',
+    adminHelp.action === 'admin_help'
+      && [bot.BTN_A_RESELLERS, bot.BTN_A_MONEY, bot.BTN_A_PENDING, bot.BTN_A_HELP].every((label) => ahText.includes(label))
+      && ahText.includes('/resellers /money /pending /balance /help') && ahText.includes('فیش در انتظار'),
+    `len=${ahText.length}`);
+
+  const resellerList = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, bot.BTN_A_RESELLERS));
+  const listMsg = lastTo(ADMIN_CHAT);
+  const listText = textOf(listMsg);
+  check('«آمار نمایندگان» gives each reseller his numeric telegram id, live balance, packages and traffic',
+    resellerList.action === 'admin_resellers' && resellerList.page === 1
+      && listText.includes('آمار نمایندگان') && listText.includes('pager01') && listText.includes('770159001')
+      && listText.includes(fa(1000)) && listText.includes('مجموع موجودی‌ها') && listText.includes('⛔')
+      && !listText.includes('botowner') && !listText.includes('botshop'),
+    `action=${resellerList.action}`);
+  check('a fleet of ten is paged, not scrolled: eight rows per page and the next page is one tap away',
+    (listText.match(/شناسه:/g) || []).length === 8 && resellerList.pages === 2
+      && listMsg.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data === 'rs:pg:2',
+    `rows=${(listText.match(/شناسه:/g) || []).length} pages=${resellerList.pages}`);
+  const page2 = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, 'rs:pg:2', messageSeq));
+  const p2Text = textOf(lastTo(ADMIN_CHAT));
+  check('the next page carries the rest of the fleet, and the balance printed is the one the wallet holds',
+    page2.action === 'admin_resellers_page' && page2.page === 2 && p2Text.includes('botshop')
+      && p2Text.includes('botother') && p2Text.includes(fa(balanceOf(shop.id)))
+      && (p2Text.match(/شناسه:/g) || []).length === 2,
+    `page=${page2.page} rows=${(p2Text.match(/شناسه:/g) || []).length}`);
+
+  // ---- the manual move, by numeric telegram id
+  const shopBefore = balanceOf(shop.id);
+  const shopTxBefore = txCount(shop.id);
+  const moneyOpened = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, bot.BTN_A_MONEY));
+  check('«شارژ/کسر نماینده» opens a conversation and asks for the numeric id or the username',
+    moneyOpened.step === 'adm_target' && bot.stepOf(ADMIN_CHAT)?.step === 'adm_target'
+      && textOf(lastTo(ADMIN_CHAT)).includes('شناسهٔ عددی تلگرام یا نام کاربری')
+      && lastTo(ADMIN_CHAT).payload.reply_markup?.keyboard?.[0]?.[0]?.text === bot.BTN_CANCEL,
+    `step=${bot.stepOf(ADMIN_CHAT)?.step}`);
+  const noShop = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, 'no-such-shop'));
+  check('a name that is not a live reseller is refused before any wallet is shown',
+    noShop.ok === false && noShop.reason === 'reseller_not_found'
+      && bot.stepOf(ADMIN_CHAT)?.step === 'adm_target' && balanceOf(shop.id) === shopBefore,
+    `reason=${noShop.reason}`);
+  const selfTarget = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, String(owner.username)));
+  check('an admin is never a target: the owner cannot charge his own wallet through the bot',
+    selfTarget.ok === false && selfTarget.reason === 'reseller_not_found' && balanceOf(owner.id) === 0
+      && txCount(owner.id) === 0,
+    `reason=${selfTarget.reason}`);
+  const parkedTarget = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, 'botparked'));
+  check('a disabled reseller is refused too — money he cannot spend is not moved',
+    parkedTarget.reason === 'reseller_not_found', `reason=${parkedTarget.reason}`);
+
+  const picked = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, SHOP_TG));
+  const dirMsgId = messageSeq;
+  const dirButtons = (lastTo(ADMIN_CHAT).payload.reply_markup?.inline_keyboard || []).flat();
+  check('the numeric id resolves to one reseller and his live balance is shown before anything moves',
+    picked.ok === true && picked.step === 'adm_direction' && Number(picked.userId) === Number(shop.id)
+      && textOf(lastTo(ADMIN_CHAT)).includes('botshop') && textOf(lastTo(ADMIN_CHAT)).includes(fa(shopBefore))
+      && dirButtons.map((one) => one.callback_data).join('|')
+        === `bal:set:${shop.id}:+|bal:set:${shop.id}:-|bal:cancel`,
+    `buttons=${dirButtons.map((one) => one.callback_data).join('|')}`);
+  const wrongTarget = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:set:${other.id}:+`, dirMsgId));
+  check('the direction buttons of a newer screen cannot retarget the move onto another wallet',
+    wrongTarget.ok === false && wrongTarget.reason === 'stale_step' && balanceOf(other.id) === 40000
+      && lastOf('answerCallbackQuery')?.payload?.show_alert === true,
+    `reason=${wrongTarget.reason}`);
+  const awaitDirection = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, '50000'));
+  check('typing an amount before choosing a direction is refused: only the buttons set the sign',
+    awaitDirection.ok === false && awaitDirection.reason === 'await_direction'
+      && bot.stepOf(ADMIN_CHAT)?.step === 'adm_direction' && balanceOf(shop.id) === shopBefore,
+    `reason=${awaitDirection.reason}`);
+
+  const signUp = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:set:${shop.id}:+`, dirMsgId));
+  check('«➕ افزایش موجودی» stores the sign, so the number that follows can only be added',
+    signUp.ok === true && signUp.step === 'adm_amount' && signUp.sign === '+'
+      && bot.stepOf(ADMIN_CHAT)?.sign === '+' && textOf(lastTo(ADMIN_CHAT)).includes('افزایش موجودی'),
+    `sign=${bot.stepOf(ADMIN_CHAT)?.sign}`);
+  const badMoney = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, 'پنجاه هزار تومان'));
+  check('a non-number in the money conversation moves nothing and keeps it open',
+    badMoney.ok === false && badMoney.reason === 'bad_amount'
+      && bot.stepOf(ADMIN_CHAT)?.step === 'adm_amount' && balanceOf(shop.id) === shopBefore,
+    `reason=${badMoney.reason}`);
+  const bigMoney = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, '999999999999'));
+  check('an impossible amount hits the same cap the panel receipts obey',
+    bigMoney.ok === false && bigMoney.reason === 'amount_rejected'
+      && textOf(lastTo(ADMIN_CHAT)).includes('حداکثر') && balanceOf(shop.id) === shopBefore,
+    `reason=${bigMoney.reason}`);
+  const confirmUp = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, '۲۰۰٬۰۰۰'));
+  const upMsgId = messageSeq;
+  const upButton = (lastTo(ADMIN_CHAT).payload.reply_markup?.inline_keyboard || [[]])[0][0] || {};
+  check('the confirm screen shows before and after, and its button carries exactly that amount',
+    confirmUp.ok === true && confirmUp.step === 'adm_confirm' && Number(confirmUp.amount) === 200000
+      && confirmUp.sign === '+' && textOf(lastTo(ADMIN_CHAT)).includes(fa(shopBefore))
+      && textOf(lastTo(ADMIN_CHAT)).includes(fa(shopBefore + 200000))
+      && upButton.callback_data === `bal:do:${shop.id}:+:200000` && String(upButton.text).includes(fa(200000)),
+    `payload=${upButton.callback_data}`);
+  const forgedUp = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:+:900000`, upMsgId));
+  check('a hand-made payload with a bigger number does not match the screen and moves nothing',
+    forgedUp.ok === false && forgedUp.reason === 'stale_confirmation' && balanceOf(shop.id) === shopBefore,
+    `reason=${forgedUp.reason}`);
+  const charged = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:+:200000`, upMsgId));
+  check('the tap credits the wallet through the very function the panel drawer calls',
+    charged.ok === true && charged.action === 'charged' && balanceOf(shop.id) === shopBefore + 200000
+      && txCount(shop.id) === shopTxBefore + 1 && Number(charged.balance) === shopBefore + 200000
+      && bot.stepOf(ADMIN_CHAT) === null,
+    `action=${charged.action} balance=${balanceOf(shop.id)}`);
+  const receiptEdit = lastOf('editMessageText');
+  check('the ✅ screen is REPLACED by the receipt, so no live button is left behind',
+    Boolean(receiptEdit) && String(receiptEdit.payload.chat_id) === ADMIN_CHAT
+      && Number(receiptEdit.payload.message_id) === upMsgId
+      && receiptEdit.payload.reply_markup.inline_keyboard.length === 0
+      && String(receiptEdit.payload.text).includes('موجودی افزایش یافت')
+      && String(receiptEdit.payload.text).includes(fa(shopBefore + 200000)),
+    `message=${receiptEdit?.payload?.message_id}`);
+  const creditTx = getDb().prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').get(shop.id);
+  check('the move is written the way a panel move is: bot-named description and the admin as created_by',
+    creditTx.type === 'credit' && Number(creditTx.amount) === 200000
+      && Number(creditTx.created_by) === Number(owner.id)
+      && String(creditTx.description).includes('ربات تلگرام') && String(creditTx.description).includes('botshop'),
+    `type=${creditTx.type} by=${creditTx.created_by}`);
+  const balanceAudit = getDb().prepare("SELECT * FROM audit_logs WHERE action = 'user.balance' ORDER BY id DESC LIMIT 1").get();
+  check('the audit line the wallet drawer writes is there too, with the delta and the admin who did it',
+    Number(balanceAudit?.user_id) === Number(owner.id) && String(balanceAudit?.details || '').includes('200000'),
+    `audit=${balanceAudit?.action}`);
+  check('the reseller hears about it in his own chat, with the new balance, without asking',
+    textOf(lastTo(SHOP_TG)).includes('موجودی شما افزایش یافت')
+      && textOf(lastTo(SHOP_TG)).includes(fa(shopBefore + 200000))
+      && lastTo(SHOP_TG).payload.reply_markup?.keyboard?.length === 3,
+    `len=${textOf(lastTo(SHOP_TG)).length}`);
+  const twiceUp = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:+:200000`, upMsgId));
+  check('a second tap on the same ✅ — even on the old message — credits nothing',
+    twiceUp.ok === false && twiceUp.reason === 'stale_confirmation'
+      && balanceOf(shop.id) === shopBefore + 200000 && txCount(shop.id) === shopTxBefore + 1,
+    `reason=${twiceUp.reason}`);
+
+  // ---- the deduction
+  await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, bot.BTN_A_MONEY));
+  await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, SHOP_TG));
+  const minusDirId = messageSeq;
+  await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:set:${shop.id}:-`, minusDirId));
+  const shopMid = balanceOf(shop.id);
+  const confirmDown = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, '100000'));
+  const minusMsgId = messageSeq;
+  check('«➖ کاهش موجودی» is the other sign of the same conversation: −100000, never +100000',
+    confirmDown.sign === '-' && bot.stepOf(ADMIN_CHAT)?.sign === '-' && confirmDown.step === 'adm_confirm'
+      && textOf(lastTo(ADMIN_CHAT)).includes('کاهش')
+      && textOf(lastTo(ADMIN_CHAT)).includes(fa(shopMid - 100000))
+      && (lastTo(ADMIN_CHAT).payload.reply_markup?.inline_keyboard || [[]])[0][0].callback_data
+        === `bal:do:${shop.id}:-:100000`,
+    `sign=${bot.stepOf(ADMIN_CHAT)?.sign}`);
+  const overDraft = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, String(shopMid + 1)));
+  check('an amount larger than the wallet is refused at the confirm step and the screen stays put',
+    overDraft.ok === false && overDraft.reason === 'insufficient_balance'
+      && balanceOf(shop.id) === shopMid && bot.stepOf(ADMIN_CHAT)?.step === 'adm_confirm',
+    `reason=${overDraft.reason}`);
+  const forgedDown = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:-:${shopMid + 5000}`, minusMsgId));
+  check('a forged deeper deduction is refused too: the button must match the number on the screen',
+    forgedDown.ok === false && forgedDown.reason === 'stale_confirmation' && balanceOf(shop.id) === shopMid,
+    `reason=${forgedDown.reason}`);
+  const txBeforeDeduct = txCount(shop.id);
+  const deducted = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:-:100000`, minusMsgId));
+  check('the real deduction takes 100000 out, records a debit and writes its receipt in place of the button',
+    deducted.ok === true && deducted.action === 'deducted' && balanceOf(shop.id) === shopMid - 100000
+      && txCount(shop.id) === txBeforeDeduct + 1 && Number(deducted.balance) === shopMid - 100000,
+    `action=${deducted.action} balance=${balanceOf(shop.id)}`);
+  const debitTx = getDb().prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').get(shop.id);
+  const deductEdit = lastOf('editMessageText');
+  check('the wallet is never allowed to go negative, and the reseller is told what was taken',
+    debitTx.type === 'debit' && Number(debitTx.amount) === 100000 && balanceOf(shop.id) >= 0
+      && String(deductEdit?.payload?.text || '').includes('موجودی کاهش یافت')
+      && textOf(lastTo(SHOP_TG)).includes('موجودی شما کاهش یافت'),
+    `type=${debitTx.type} balance=${balanceOf(shop.id)}`);
+
+  // ---- leaving the conversation, and the people who may not enter it
+  await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, bot.BTN_A_MONEY));
+  await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, OTHER_TG));
+  const otherBefore = balanceOf(other.id);
+  const cancelledMoney = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, 'bal:cancel', messageSeq));
+  check('«❌ لغو» closes the move with nothing written and the admin menu back on screen',
+    cancelledMoney.ok === true && cancelledMoney.action === 'money_cancel' && bot.stepOf(ADMIN_CHAT) === null
+      && balanceOf(other.id) === otherBefore && txCount(other.id) === 0
+      && textOf(lastTo(ADMIN_CHAT)).includes('لغو شد')
+      && lastTo(ADMIN_CHAT).payload.reply_markup?.keyboard?.length === 2,
+    `action=${cancelledMoney.action}`);
+  const strangerBal = await bot.handleUpdate(taps(STRANGER_TG, STRANGER_TG, `bal:do:${shop.id}:+:1000`, 1));
+  const resellerBal = await bot.handleUpdate(taps(SHOP_TG, SHOP_TG, `bal:do:${shop.id}:+:1000`, 1));
+  check('neither a stranger nor a reseller may tap a wallet payload, and both are told so out loud',
+    strangerBal.reason === 'not_admin' && resellerBal.reason === 'not_admin'
+      && balanceOf(shop.id) === shopMid - 100000
+      && calls.filter((one) => one.method === 'answerCallbackQuery' && one.payload.show_alert === true).length >= 2,
+    `stranger=${strangerBal.reason} reseller=${resellerBal.reason}`);
+  const adminResellerCmd = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, '/topup'));
+  check('a reseller command in the admin chat sends him to his own menu instead of opening a receipt',
+    adminResellerCmd.action === 'admin_reseller_command' && topups.pendingCount(owner.id) === 0
+      && textOf(lastTo(ADMIN_CHAT)).includes('شما مدیر پنل هستید'),
+    `action=${adminResellerCmd.action}`);
+  check('resellerByIdentity accepts only a live reseller, by id or by name, with or without the @',
+    bot.resellerByIdentity(SHOP_TG)?.username === 'botshop'
+      && bot.resellerByIdentity('BotShop')?.id === shop.id && bot.resellerByIdentity('@botshop')?.id === shop.id
+      && bot.resellerByIdentity(ADMIN_TG) === null && bot.resellerByIdentity('botparked') === null
+      && bot.resellerByIdentity('nope') === null && bot.resellerByIdentity('') === null
+      && bot.resellerByIdentity('12') === null,
+    'seven shapes');
+  check('the direction of a move is read from the text, not from Number(): «-», «-1» and −500 all mean minus',
+    bot.isMinus('-') === true && bot.isMinus(-1) === true && bot.isMinus(-500) === true
+      && bot.isMinus('−۱۰۰') === false && bot.isMinus('+') === false && bot.isMinus('1') === false
+      && bot.isMinus(null) === false && bot.isMinus(undefined) === false,
+    'the sign that decides whether money is added or taken');
 
   // ------------------------------------------------- the receipt file in the panel
   // fetchFile asks Telegram twice: getFile for the path, then the file itself.

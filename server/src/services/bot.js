@@ -1,23 +1,35 @@
 'use strict';
 
 /**
- * The panel's own two-way Telegram bot (v1.5.2).
+ * The panel's own two-way Telegram bot (v1.5.3).
  *
  * A reseller talks to the SAME bot the panel already uses for backups and the
  * nightly report — no second bot, no second token. He can:
  *   • see his wallet balance and his last transactions,
- *   • see his own stats (packages, traffic today/7d/30d, expiring soon),
+ *   • see his packages by state — active, running out, out of volume, expired,
+ *     disabled — and his traffic,
  *   • send a payment receipt, which is forwarded to the admin's chat with
- *     «تایید» / «رد» buttons. The wallet moves only when the admin taps تایید.
+ *     «تایید و شارژ» / «رد» buttons. The wallet moves only when the admin taps تایید.
+ *
+ * An admin gets his OWN keyboard in the same chat: the reseller list with every
+ * wallet, the pending receipts, and a charge/deduct conversation that targets a
+ * reseller by his numeric Telegram id (or username) and moves the wallet through
+ * usersService.adjustBalance — the very function the panel's own edit drawer
+ * calls, so a bot charge and a panel charge write the same transaction row.
  *
  * Rules this file is written against:
  *   - identity is `users.telegram_id` and nothing else. A chat that is not linked
  *     to an account is told so (with its own numeric id, so the owner can link
  *     it) and is never shown anybody's data;
- *   - only an admin may decide a receipt: either his own telegram_id belongs to
- *     an admin account, or the tap happened in the configured admin chat;
- *   - the money lives in services/topups.js. This file only delivers messages,
- *     so the panel's own approve button and the Telegram button cannot disagree;
+ *   - only an admin may decide a receipt or touch a wallet: either his own
+ *     telegram_id belongs to an admin account, or the tap happened in the
+ *     configured admin chat. The admin money flow re-checks that on EVERY step,
+ *     so a stolen callback payload cannot move a balance;
+ *   - the money lives in services/topups.js and services/users.js. This file only
+ *     delivers messages and asks for confirmation before it calls them, so the
+ *     panel's own approve button and the Telegram button cannot disagree;
+ *   - every amount is re-parsed and re-capped on the confirm tap: the number that
+ *     is executed is the number on the confirmation screen, never a stale one;
  *   - the bot must never take the panel down: every update is handled inside a
  *     try/catch, the offset is stored BEFORE handling (a poison update cannot
  *     loop forever), and a 409 Conflict — another poller or a webhook owns this
@@ -32,6 +44,7 @@ const { getDb } = require('../db');
 const settings = require('../settings');
 const telegram = require('./telegram');
 const topups = require('./topups');
+const usersService = require('./users');
 const stats = require('./stats');
 const { ApiError, log, logError } = require('../utils');
 
@@ -41,12 +54,24 @@ const IDLE_SLEEP_MS = 15000;
 const TEXT_MAX = 4096;
 const GIB = 1024 ** 3;
 const DAY_MS = 86400000;
+const PAGE_ROWS = 8;
 
+// Reseller keyboard. Six buttons, the money path first, because that is what a
+// reseller actually comes here for; آمار اشتراک‌ها is the «تموم‌شده / در حال اتمام»
+// view the owner asked for, and آمار مصرف stays the traffic view it grew out of.
 const BTN_BALANCE = '💰 موجودی';
-const BTN_STATS = '📊 آمار من';
-const BTN_TOPUP = '🧾 ارسال فیش واریزی';
+const BTN_TOPUP = '💳 افزایش موجودی';
+const BTN_PACKAGES = '📦 آمار اشتراک‌ها';
+const BTN_RECEIPTS = '🧾 فیش‌های من';
+const BTN_STATS = '📊 آمار مصرف';
 const BTN_HELP = '📖 راهنما';
 const BTN_CANCEL = '❌ لغو';
+
+// Admin keyboard: the owner's own views, never mixed with the reseller's.
+const BTN_A_RESELLERS = '👥 آمار نمایندگان';
+const BTN_A_MONEY = '💰 شارژ/کسر نماینده';
+const BTN_A_PENDING = '🧾 فیش‌های در انتظار';
+const BTN_A_HELP = '📖 راهنمای مدیر';
 
 // ------------------------------------------------------------------ formatting
 
@@ -72,6 +97,19 @@ function faBytes(value) {
   if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(0)} مگ`;
   if (n > 0) return `${(n / 1024).toFixed(0)} کیلوبایت`;
   return '۰';
+}
+
+/**
+ * The direction of a wallet move, read from whatever the caller holds: the '+'
+ * and '-' that ride in a callback payload, the '-1' a step stores, or a plain
+ * negative number. Number('-') is NaN, so a bare sign character has to be read as
+ * text first — deciding the direction of a charge by Number() alone would silently
+ * turn a deduction into an increase.
+ */
+function isMinus(value) {
+  const raw = String(value === null || value === undefined ? '' : value).trim();
+  if (raw.startsWith('-')) return true;
+  return Number(raw) < 0;
 }
 
 function faDate(ts, withTime = false) {
@@ -182,11 +220,132 @@ function adminActor(fromId, chatId) {
 
 // ------------------------------------------------------------------ keyboards
 
+/**
+ * v1.5.3: which reseller is the admin talking about? A numeric Telegram id is
+ * the exact answer and the one the panel shows everywhere; a username is the
+ * convenient one. Either has to resolve to a live RESSELLER account — an admin
+ * must not be able to charge the owner's own wallet by typing a name, and a
+ * deleted reseller must not get money he cannot spend.
+ */
+function resellerByIdentity(raw) {
+  const needle = String(raw || '').trim().replace(/^@/, '');
+  if (!needle) return null;
+  let found = null;
+  if (/^\d{4,20}$/.test(needle)) found = userByTelegramId(needle);
+  else found = getDb().prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE AND deleted_at = 0").get(needle) || null;
+  if (!found || found.role === 'admin' || found.status !== 'active') return null;
+  return found;
+}
+
+/**
+ * The bot's own username, from getMe, cached in bot_state: the panel needs it
+ * for the «افزایش موجودی از طریق ربات» link, and the help text wants it for
+ * /start deep links. Best effort — an empty answer only means the link cannot
+ * be promised yet, never that the bot is down.
+ */
+async function botUsername(force = false) {
+  if (!force) {
+    const cached = stateGet('bot_username');
+    if (cached) return String(cached || '');
+  }
+  try {
+    const me = await telegram.call('getMe', {}, { timeoutMs: 15000 });
+    const username = String(me?.username || '');
+    stateSet('bot_username', username);
+    return username;
+  } catch (err) {
+    logError('[bot] getMe failed:', err.message);
+    return String(stateGet('bot_username') || '');
+  }
+}
+
+/**
+ * The username already in the cache, with no network call at all: the panel's
+ * header and settings card render synchronously and must never wait on Telegram
+ * for a label. Empty means the poller has not fetched getMe yet.
+ */
+function cachedBotUsername() {
+  return String(stateGet('bot_username') || '');
+}
+
+/**
+ * The one link the panel shows for «افزایش موجودی از طریق ربات». `payload` is
+ * the /start argument, so a link can open any section, not only the top-up.
+ * Without a known username it is empty — the panel then says the bot has not
+ * announced itself yet instead of showing a broken link.
+ */
+function deepLink(payload = 'topup', name = '') {
+  const bot = String(name || cachedBotUsername() || '').trim();
+  if (!bot) return '';
+  return `https://t.me/${bot}?start=${String(payload || 'menu')}`;
+}
+
+/**
+ * The native command menu. Resellers get the wallet commands in private chats;
+ * the admin's own commands go only to the chat the receipts are posted in, so a
+ * reseller never sees a «pending» he cannot use. Failure is a log line: the
+ * buttons work with or without the menu.
+ */
+async function registerCommands() {
+  const commands = [
+    { command: 'start', description: 'منوی ربات' },
+    { command: 'balance', description: 'موجودی کیف پول' },
+    { command: 'packages', description: 'آمار اشتراک‌ها' },
+    { command: 'stats', description: 'آمار مصرف' },
+    { command: 'topup', description: 'افزایش موجودی با فیش' },
+    { command: 'receipts', description: 'فیش‌های من' },
+    { command: 'help', description: 'راهنما' },
+    { command: 'cancel', description: 'لغو درخواست جاری' },
+  ];
+  const adminCommands = [
+    { command: 'start', description: 'منوی مدیر' },
+    { command: 'resellers', description: 'آمار نمایندگان و موجودی‌ها' },
+    { command: 'money', description: 'افزایش یا کاهش موجودی نماینده' },
+    { command: 'pending', description: 'فیش‌های در انتظار' },
+    { command: 'balance', description: 'موجودی خودتان' },
+    { command: 'help', description: 'راهنما' },
+  ];
+  const adminChat = String(telegram.botConfig().adminChatId || '').trim();
+  try {
+    await telegram.call('setMyCommands', { commands, scope: { type: 'all_private_chats' } }, { timeoutMs: 15000 });
+    if (adminChat && /^-?\d{4,20}$/.test(adminChat)) {
+      await telegram.call(
+        'setMyCommands',
+        { commands: adminCommands, scope: { type: 'chat', chat_id: Number(adminChat) } },
+        { timeoutMs: 15000 }
+      );
+    }
+  } catch (err) {
+    logError('[bot] setMyCommands failed:', err.message);
+  }
+  return { commands: commands.length, adminCommands: adminCommands.length, adminChat: Boolean(adminChat) };
+}
+
+// ------------------------------------------------------------------ keyboards
+
 function menuKeyboard() {
   return {
     keyboard: [
-      [{ text: BTN_BALANCE }, { text: BTN_STATS }],
-      [{ text: BTN_TOPUP }, { text: BTN_HELP }],
+      [{ text: BTN_BALANCE }, { text: BTN_PACKAGES }],
+      [{ text: BTN_TOPUP }, { text: BTN_RECEIPTS }],
+      [{ text: BTN_STATS }, { text: BTN_HELP }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
+
+/**
+ * v1.5.3: the admin's own reply keyboard. It appears in the chat the receipts are
+ * posted to — the configured admin chat, or a private chat with an account whose
+ * telegram_id belongs to an admin — so the two keyboards never fight over one
+ * reseller's menu.
+ */
+function adminMenuKeyboard() {
+  return {
+    keyboard: [
+      [{ text: BTN_A_RESELLERS }, { text: BTN_A_MONEY }],
+      [{ text: BTN_A_PENDING }, { text: BTN_A_HELP }],
     ],
     resize_keyboard: true,
     is_persistent: true,
@@ -206,6 +365,51 @@ function decisionKeyboard(id) {
   };
 }
 
+/** Step 2 of the admin money flow: which way does this wallet move? */
+function moneyChoiceKeyboard(userId) {
+  const id = Number(userId);
+  return {
+    inline_keyboard: [
+      [
+        { text: '➕ افزایش موجودی', callback_data: `bal:set:${id}:+` },
+        { text: '➖ کاهش موجودی', callback_data: `bal:set:${id}:-` },
+      ],
+      [{ text: '❌ لغو', callback_data: 'bal:cancel' }],
+    ],
+  };
+}
+
+/**
+ * Step 3: the last look before money moves. The amount and the sign are carried
+ * in the payload and re-checked on the tap, so what gets executed is what the
+ * admin just read — and a stale button cannot spend a newer amount.
+ */
+function moneyConfirmKeyboard(userId, sign, amount) {
+  const id = Number(userId);
+  const delta = Math.round(Number(amount));
+  const minus = isMinus(sign);
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: minus ? `⚠️ کسر ${faNum(delta)}` : `✅ ثبت ${faNum(delta)}`,
+          callback_data: `bal:do:${id}:${minus ? '-' : '+'}:${delta}`,
+        },
+      ],
+      [{ text: '❌ تغییر نمی‌دهم', callback_data: 'bal:cancel' }],
+    ],
+  };
+}
+
+/** Paging for the reseller list, so a fleet of ten does not scroll forever. */
+function pagerKeyboard(page, hasPrev, hasNext) {
+  const row = [];
+  if (hasPrev) row.push({ text: '⬅️ قبلی', callback_data: `rs:pg:${Number(page) - 1}` });
+  if (hasNext) row.push({ text: 'بعدی ➡', callback_data: `rs:pg:${Number(page) + 1}` });
+  if (!row.length) return undefined;
+  return { inline_keyboard: [row] };
+}
+
 // ------------------------------------------------------------------ sending
 
 async function reply(chatId, text, extra = {}) {
@@ -220,6 +424,10 @@ async function reply(chatId, text, extra = {}) {
 
 async function replyMenu(chatId, text) {
   return reply(chatId, text, { reply_markup: menuKeyboard() });
+}
+
+async function replyAdminMenu(chatId, text) {
+  return reply(chatId, text, { reply_markup: adminMenuKeyboard() });
 }
 
 // ------------------------------------------------------------------ the texts
@@ -286,13 +494,88 @@ function statsText(user) {
   return lines.join('\n');
 }
 
-function helpText(user) {
+/**
+ * v1.5.3: «آمار اشتراک‌ها». statusCounts() counts packages through the very same
+ * grouping the panel's list and the dashboard use, so this chat, the KPI cards
+ * and the config list can never disagree about what one customer is; the two
+ * lists below the buckets are the packages the reseller has to act on.
+ */
+function packagesText(user) {
+  const b = stats.packageBuckets(Number(user.id), 3, 6);
+  const lines = [
+    `📦 <b>آمار اشتراک‌های شما</b> — ${esc(faDate(Date.now()))}`,
+    `نماینده: <code>${esc(user.username)}</code>`,
+    '',
+    `👥 بسته‌ها: <b>${faNum(b.total)}</b>`,
+    `• ✅ فعال: <b>${faNum(b.active)}</b>`,
+    `• ⏳ در حال اتمام (۳ روز): <b>${faNum(b.soon)}</b>`,
+    `• 🛑 حجم تمام‌شده: <b>${faNum(b.depleted)}</b>`,
+    `• ⌛ منقضی‌شده: <b>${faNum(b.expired)}</b>`,
+    `• ⛔ غیرفعال: <b>${faNum(b.disabled)}</b>`,
+  ];
+  if (b.mixed > 0) lines.push(`• ◽ وضعیت ترکیبی: <b>${faNum(b.mixed)}</b>`);
+  lines.push(
+    '',
+    `📶 حجم مصرفی: <b>${faBytes(b.usedBytes)}</b> از <b>${faBytes(b.quotaBytes)}</b>`,
+    ''
+  );
+  if (b.expiringSoon.length) {
+    lines.push('⏳ <b>نزدیک انقضا</b>');
+    for (const row of b.expiringSoon) {
+      lines.push(`• ${esc(row.name)} — ${faNum(row.daysLeft)} روز مانده · ${faBytes(row.leftGb * GIB)} باقی‌مانده`);
+    }
+  } else {
+    lines.push('<i>اشتراکی در آستانهٔ انقضا نیست.</i>');
+  }
+  if (b.depletedList.length) {
+    lines.push('', '🛑 <b>حجم تمام‌شده</b>');
+    for (const row of b.depletedList) {
+      lines.push(`• ${esc(row.name)} — ${faNum(row.percent)}٪ مصرف‌شده`);
+    }
+  }
+  const pending = topups.pendingCount(user.id);
+  if (pending > 0) lines.push('', `🧾 فیش در انتظار بررسی: <b>${faNum(pending)}</b> — دکمهٔ «${BTN_TOPUP}» برای واریزی جدید.`);
+  lines.push('', `<i>${esc(panelName())}</i>`);
+  return lines.join('\n');
+}
+
+/** Every receipt this reseller sent, with what the admin decided about it. */
+function receiptsText(user) {
+  const data = topups.listRequests({ userId: Number(user.id), page: 1, pageSize: 8 });
+  const unit = esc(currency());
+  const tone = { pending: '⏳', approved: '✅', rejected: '❌' };
+  const lines = [
+    '🧾 <b>فیش‌های واریزی شما</b>',
+    `نماینده: <code>${esc(user.username)}</code>`,
+    `در انتظار: <b>${faNum(data.counts.pending)}</b> · تاییدشده: <b>${faNum(data.counts.approved)}</b> · ردشده: <b>${faNum(data.counts.rejected)}</b>`,
+    '',
+  ];
+  if (!data.rows.length) {
+    lines.push('<i>هنوز فیشی ارسال نکرده‌اید. دکمهٔ «' + esc(BTN_TOPUP) + '» را بزنید.</i>');
+  }
+  for (const row of data.rows) {
+    lines.push(`${tone[row.status] || '•'} #${Number(row.id)} · <b>${faNum(row.amount)}</b> ${unit} · ${esc(faDate(row.createdAt, true))}`);
+    if (row.status === 'approved') {
+      lines.push(`  <i>تایید شد${row.decidedByName ? ` توسط ${esc(row.decidedByName)}` : ''} · موجودی آن لحظه ${faNum(row.balance)} ${unit}</i>`);
+    } else if (row.decisionNote) {
+      lines.push(`  <i>یادداشت مدیر: ${esc(String(row.decisionNote).slice(0, 120))}</i>`);
+    } else if (row.status === 'pending') {
+      lines.push('  <i>در انتظار تایید مدیر</i>');
+    }
+  }
+  lines.push('', `<i>${esc(panelName())}</i>`);
+  return lines.join('\n');
+}
+
+function helpText(user, botName = '') {
   const lines = [
     '📖 <b>راهنمای ربات</b>',
     '',
     `${BTN_BALANCE} — موجودی کیف پول و آخرین تراکنش‌ها`,
-    `${BTN_STATS} — آمار بسته‌ها و ترافیک مشتریان شما`,
-    `${BTN_TOPUP} — افزایش موجودی با فیش واریزی`,
+    `${BTN_PACKAGES} — اشتراک‌های فعال، در حال اتمام، حجم‌تمام‌شده و منقضی`,
+    `${BTN_TOPUP} — افزایش موجودی با ارسال فیش واریزی`,
+    `${BTN_RECEIPTS} — وضعیت همهٔ فیش‌هایی که فرستاده‌اید`,
+    `${BTN_STATS} — آمار مصرف و ترافیک مشتریان شما`,
     '',
     '<b>روش افزایش موجودی</b>',
     `۱) دکمهٔ «${BTN_TOPUP}» را بزنید (یا دستور /topup).`,
@@ -300,11 +583,71 @@ function helpText(user) {
     '۳) عکس یا فایل فیش واریزی را بفرستید.',
     '۴) فیش برای مدیر ارسال می‌شود؛ پس از تایید او موجودی شما افزایش پیدا می‌کند و همین‌جا خبر می‌گیرید.',
     '',
-    'دستورها: /start /balance /stats /topup /help /cancel',
+    botName
+      ? `از پنل هم می‌توانید: بخش کیف پول دکمهٔ «افزایش موجودی از طریق ربات» شما را مستقیم به این چت می‌آورد — <code>t.me/${esc(botName)}?start=topup</code>`
+      : 'از پنل هم می‌توانید درخواست واریز بفرستید (بخش کیف پول).',
+    '',
+    'دستورها: /start /balance /packages /stats /topup /receipts /help /cancel',
     '',
     `<i>شناسهٔ تلگرام شما: <code>${esc(user?.telegram_id || '')}</code></i>`,
   ];
   return lines.join('\n');
+}
+
+/** What the admin's own keyboard offers, in his own chat. */
+function adminHelpText(actor, pending) {
+  const unit = esc(currency());
+  return [
+    '📖 <b>راهنمای مدیر</b>',
+    '',
+    `${BTN_A_RESELLERS} — فهرست نمایندگان با موجودی، بسته‌ها و مصرف ۷ روز`,
+    `${BTN_A_MONEY} — افزایش یا کاهش موجودی یک نماینده با شناسهٔ عددی تلگرام یا نام کاربری او`,
+    `${BTN_A_PENDING} — فیش‌های واریزی در انتظار تصمیم`,
+    `${BTN_A_HELP} — همین راهنما`,
+    '',
+    '<b>روش شارژ دستی نماینده</b>',
+    `۱) دکمهٔ «${BTN_A_MONEY}» را بزنید.`,
+    '۲) شناسهٔ عددی تلگرام یا نام کاربری نماینده را بفرستید؛ مثلا <code>1234567890</code> یا <code>reseller-name</code>.',
+    `۳) جهت را انتخاب کنید: «➕ افزایش موجودی» یا «➖ کاهش موجودی».`,
+    `۴) مبلغ را به ${unit} بفرستید؛ فقط عدد.`,
+    '۵) آخرین صفحه با «✅ ثبت» تایید می‌شود؛ تا آن دکمه هیچ پولی جابه‌جا نمی‌شود.',
+    '',
+    'دستورها: /resellers /money /pending /balance /help',
+    '',
+    `<i>فیش در انتظار: <b>${faNum(pending)}</b></i>`,
+    '',
+    `<i>${esc(panelName())}</i>`,
+  ].join('\n');
+}
+
+/**
+ * The reseller fleet, one page of it: who has how much money, how many packages,
+ * and what their customers consumed in 7 days. Balances are what the wallet will
+ * spend on the next receipt, so they come from the users row the bot charges too.
+ */
+function resellersText(page = 1) {
+  const pageSize = PAGE_ROWS;
+  const data = usersService.listUsers({ role: 'reseller', page: Number(page) || 1, pageSize });
+  const unit = esc(currency());
+  const lines = [
+    `👥 <b>آمار نمایندگان</b> — ${esc(faDate(Date.now()))}`,
+    `مجموع موجودی‌ها: <b>${faNum(data.rows.reduce((sum, row) => sum + Number(row.balance || 0), 0))}</b> ${unit} · ربات: <b>${telegram.botConfig().enabled ? 'روشن' : 'خاموش'}</b>`,
+    '',
+  ];
+  if (!data.rows.length) lines.push('<i>نماینده‌ای ثبت نشده است.</i>');
+  for (const row of data.rows) {
+    const s = row.stats || {};
+    lines.push(
+      `<b>${esc(row.username)}</b>${row.name ? ` (${esc(row.name)})` : ''}`,
+      `  شناسه: <code>${esc(row.telegramId || '—')}</code> · ${row.status === 'active' ? '✅' : '⛔'}`,
+      `  موجودی: <b>${faNum(row.balance)}</b> ${unit} · بسته: ${faNum(s.packages)} (فعال ${faNum(s.activePackages)})`,
+      `  مصرف مشتریان: ${faBytes(Number(s.usedBytes || 0))}`
+    );
+  }
+  const size = Math.max(1, Math.ceil(data.total / pageSize));
+  lines.push('', `<i>صفحه ${faNum(Number(page) || 1)} از ${faNum(size)} · مجموع ${faNum(data.total)} نماینده</i>`);
+  lines.push('', `<i>${esc(panelName())}</i>`);
+  return { text: lines.join('\n'), page: Number(page) || 1, pages: size, total: Number(data.total || 0) };
 }
 
 function unlinkedText(fromId) {
@@ -456,7 +799,234 @@ async function startTopup(chatId, user) {
   return { ok: true, step: 'amount' };
 }
 
+/** The pending receipts, the way both /pending and the admin button show them. */
+function pendingListText(list) {
+  const unit = esc(currency());
+  const lines = [`🧾 <b>فیش‌های در انتظار: ${faNum(list.counts.pending)}</b>`];
+  for (const row of list.rows) {
+    lines.push(`• #${Number(row.id)} · <code>${esc(row.username)}</code> · ${faNum(row.amount)} ${unit} · ${esc(faDate(row.createdAt, true))}`);
+  }
+  if (!list.rows.length) lines.push('<i>موردی نیست.</i>');
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------- admin money flow
+
+/**
+ * v1.5.3 step 1 of a manual wallet move: which reseller? The numeric Telegram id
+ * is what the panel shows everywhere, the username is what the owner remembers,
+ * so both are accepted — but only a live RESELLER account resolves.
+ */
+async function askResellerTarget(chatId) {
+  setStep(chatId, { step: 'adm_target' });
+  await reply(chatId, [
+    '💰 <b>افزایش یا کاهش موجودی یک نماینده</b>',
+    '',
+    'شناسهٔ عددی تلگرام یا نام کاربری نماینده را بفرستید.',
+    `مثلا <code>1234567890</code> یا <code>reseller-name</code>.`,
+    '',
+    `برای بی‌خیال شدن «${BTN_CANCEL}» یا /cancel را بزنید.`,
+  ].join('\n'), { reply_markup: cancelKeyboard() });
+  return { ok: true, step: 'adm_target' };
+}
+
+/** Step 2: the target is known, so the admin sees the wallet before touching it. */
+async function pickMoneyDirection(chatId, raw) {
+  const target = resellerByIdentity(raw);
+  if (!target) {
+    await reply(chatId, [
+      '⚠️ نماینده‌ای با این شناسه پیدا نشد.',
+      '',
+      'شناسهٔ عددی تلگرام یا نام کاربری نماینده را درست بفرستید؛ برای لغو «' + esc(BTN_CANCEL) + '» را بزنید.',
+    ].join('\n'), { reply_markup: cancelKeyboard() });
+    return { ok: false, reason: 'reseller_not_found' };
+  }
+  const balance = Number(target.balance || 0);
+  setStep(chatId, {
+    step: 'adm_direction',
+    target: { id: Number(target.id), username: String(target.username || ''), telegramId: String(target.telegram_id || ''), balance },
+  });
+  await reply(chatId, [
+    `نماینده: <code>${esc(target.username)}</code>${target.name ? ` (${esc(target.name)})` : ''}`,
+    `شناسهٔ تلگرام: <code>${esc(target.telegram_id || '—')}</code>`,
+    `موجودی فعلی: <b>${faNum(balance)}</b> ${esc(currency())}`,
+    '',
+    'جهت را انتخاب کنید:',
+  ].join('\n'), { reply_markup: moneyChoiceKeyboard(target.id) });
+  return { ok: true, step: 'adm_direction', userId: Number(target.id) };
+}
+
+/** Step 3: the direction is fixed in the state; now the amount, on the keypad. */
+async function askMoneyAmount(chatId, state, sign) {
+  const target = state.target || {};
+  const minus = isMinus(sign);
+  setStep(chatId, { step: 'adm_amount', sign: minus ? '-' : '+' });
+  await reply(chatId, [
+    `💳 <b>${minus ? 'کاهش' : 'افزایش'} موجودی</b> <code>${esc(target.username)}</code>`,
+    `موجودی فعلی: <b>${faNum(Number(target.balance || 0))}</b> ${esc(currency())}`,
+    minus ? `حداکثر قابل کسر: <b>${faNum(Number(target.balance || 0))}</b> ${esc(currency())}` : '',
+    '',
+    'مبلغ را فقط با عدد بفرستید؛ مثلا <code>500000</code>.',
+    `با «${BTN_CANCEL}» هیچ پولی جابه‌جا نمی‌شود.`,
+  ].filter(Boolean).join('\n'), { reply_markup: cancelKeyboard() });
+  return { ok: true, step: 'adm_amount', sign: minus ? '-' : '+' };
+}
+
+/**
+ * Step 4: nothing moves until the admin taps ✅ on this screen. The amount is
+ * re-parsed and re-capped here, so the number on the confirm button is the number
+ * that will be executed — a stale chat cannot smuggle a different amount in.
+ */
+async function confirmMoneyAmount(chatId, state, raw) {
+  const target = state.target || {};
+  const sign = state.sign === '-' ? '-' : '+';
+  const parsed = parseAmount(raw);
+  if (parsed === null) {
+    await reply(chatId, [
+      '⚠️ مبلغ را فقط با عدد بفرستید؛ مثلا <code>500000</code>.',
+      `برای بی‌خیال شدن «${BTN_CANCEL}» را بزنید.`,
+    ].join('\n'), { reply_markup: cancelKeyboard() });
+    return { ok: false, reason: 'bad_amount' };
+  }
+  let amount = parsed;
+  try {
+    amount = topups.cleanAmount(parsed);
+  } catch (err) {
+    await reply(chatId, `⚠️ ${esc(err.message)}`);
+    return { ok: false, reason: 'amount_rejected' };
+  }
+  const balance = Number(target.balance || 0);
+  if (sign === '-' && amount > balance) {
+    await reply(chatId, [
+      `⚠️ موجودی <code>${esc(target.username)}</code> فقط <b>${faNum(balance)}</b> ${esc(currency())} است.`,
+      'این مبلغ را نمی‌توان کم کرد؛ مقدار کمتر را بفرستید.',
+    ].join('\n'), { reply_markup: cancelKeyboard() });
+    return { ok: false, reason: 'insufficient_balance' };
+  }
+  setStep(chatId, { step: 'adm_confirm', amount, sign });
+  await reply(chatId, [
+    '⚠️ <b>تایید نهایی</b>',
+    '',
+    `نماینده: <code>${esc(target.username)}</code>`,
+    `${sign === '-' ? 'کاهش' : 'افزایش'}: <b>${faNum(amount)}</b> ${esc(currency())}`,
+    `موجودی فعلی: ${faNum(balance)} ${esc(currency())}`,
+    `موجودی پس از این کار: <b>${faNum(sign === '-' ? balance - amount : balance + amount)}</b> ${esc(currency())}`,
+    '',
+    'با «ثبت» موجودی تغییر می‌کند و در کیف پول یک تراکنش ثبت می‌شود.',
+  ].join('\n'), { reply_markup: moneyConfirmKeyboard(target.id, sign, amount) });
+  return { ok: true, step: 'adm_confirm', amount, sign };
+}
+
+/**
+ * The one place the bot moves money. It calls the very function the panel's edit
+ * drawer calls, so the wallet row, the transaction and the audit line are written
+ * exactly the same way from both sides. The admin gate is re-checked here, and
+ * the amount is re-capped from the FRESH balance: this is the last line before a
+ * write, and it is the one that must not be bypassed.
+ */
+async function runMoneyMove(state, actor) {
+  const target = state.target || {};
+  const amount = Math.round(Number(state.amount || 0));
+  if (!amount) throw new ApiError(422, 'invalid_amount', 'مبلغ نامعتبر است');
+  if (amount > topups.MAX_AMOUNT) throw new ApiError(422, 'amount_too_large', 'مبلغ بیش از حد مجاز است');
+  const user = usersService.getUser(Number(target.id));
+  if (!user || user.role === 'admin' || user.deleted_at) {
+    throw new ApiError(404, 'not_found', 'این نماینده دیگر در دسترس نیست');
+  }
+  const delta = isMinus(state.sign) ? -amount : amount;
+  const description = `شارژ دستی نماینده از ربات تلگرام · ${user.username}`;
+  const result = usersService.adjustBalance(Number(user.id), delta, description, { user: { id: actor.id, role: 'admin' } });
+  return { user, delta, result };
+}
+
 // ------------------------------------------------------------------ messages
+
+/**
+ * v1.5.3: everything an admin can do from the bot, in his own chat or the
+ * configured admin chat. The money conversation is driven by the stored step, so
+ * a half-finished one survives a restart of the panel only as far as the step
+ * does (30 minutes), and every reply re-checks adminActor() before it reads.
+ */
+async function handleAdminMessage(message, chatId, fromId, text, actor) {
+  const state = stepOf(chatId);
+  const parts = String(text || '').split(/\s+/);
+  const command = (parts[0] || '').toLowerCase().replace(/@.*$/, '');
+  const unit = esc(currency());
+
+  if (command === '/cancel' || text === BTN_CANCEL) {
+    clearStep(chatId);
+    await replyAdminMenu(chatId, '❌ درخواست جاری لغو شد.');
+    return { ok: true, action: 'admin_cancel' };
+  }
+
+  // ---- inside the manual wallet move
+  if (state?.step === 'adm_target') {
+    if (!text) return { ok: false, reason: 'no_identity' };
+    return pickMoneyDirection(chatId, text);
+  }
+  if (state?.step === 'adm_amount') {
+    return confirmMoneyAmount(chatId, state, text);
+  }
+  if (state?.step === 'adm_confirm') {
+    if (parseAmount(text) !== null) return confirmMoneyAmount(chatId, state, text);
+    await reply(chatId, [
+      '⚠️ برای ثبت دکمهٔ «✅ ثبت» را بزنید.',
+      'برای تغییر مبلغ، عدد تازه را بفرستید؛ برای بی‌خیال شدن «' + esc(BTN_CANCEL) + '».',
+    ].join('\n'), { reply_markup: cancelKeyboard() });
+    return { ok: false, reason: 'await_confirm' };
+  }
+  if (state?.step === 'adm_direction') {
+    await reply(chatId, [
+      '⚠️ جهت را از دکمه‌های «افزایش موجودی» و «کاهش موجودی» انتخاب کنید.',
+      'برای شروع دوباره «' + esc(BTN_CANCEL) + '» را بزنید.',
+    ].join('\n'));
+    return { ok: false, reason: 'await_direction' };
+  }
+
+  const pending = topups.listRequests({ status: 'pending', page: 1, pageSize: 10 });
+
+  if (command === '/pending' || text === BTN_A_PENDING) {
+    clearStep(chatId);
+    await reply(chatId, pendingListText(pending), { reply_markup: adminMenuKeyboard() });
+    return { ok: true, action: 'admin_pending' };
+  }
+  if (command === '/resellers' || text === BTN_A_RESELLERS) {
+    clearStep(chatId);
+    const list = resellersText(1);
+    await reply(chatId, list.text, { reply_markup: pagerKeyboard(1, false, list.pages > 1) });
+    return { ok: true, action: 'admin_resellers', page: list.page, pages: list.pages, total: list.total };
+  }
+  if (command === '/money' || text === BTN_A_MONEY) {
+    return askResellerTarget(chatId, actor);
+  }
+  if (command === '/balance') {
+    const self = usersService.getUser(actor.id);
+    await reply(chatId, self ? balanceText(self) : 'حساب شما در پنل پیدا نشد.');
+    return { ok: true, action: 'admin_balance' };
+  }
+  if (command === '/help' || text === BTN_A_HELP) {
+    clearStep(chatId);
+    await replyAdminMenu(chatId, adminHelpText(actor, pending.counts.pending));
+    return { ok: true, action: 'admin_help' };
+  }
+  if (command === '/start' || !text) {
+    await replyAdminMenu(chatId, [
+      '👋 <b>سلام مدیر</b>',
+      `فیش‌های در انتظار: <b>${faNum(pending.counts.pending)}</b>`,
+      'با دکمه‌های پایین همین پیام از آمار نمایندگان، شارژ و کسر موجودی و فیش‌ها استفاده کنید.',
+      'روی هر فیش هم دکمه‌های «تایید و شارژ» و «رد» هست؛ هر دو راه فقط یک بار پول جابه‌جا می‌کند.',
+    ].join('\n'));
+    return { ok: true, action: 'admin_menu' };
+  }
+  // A reseller command an admin typed by mistake: answer with the admin menu
+  // instead of the wallet data, because nothing here has a reseller account.
+  if (['/stats', '/topup', '/packages', '/receipts'].includes(command)) {
+    await reply(chatId, 'این دکمه‌ها برای نماینده‌هاست. شما مدیر پنل هستید — از منوی بالا استفاده کنید.', { reply_markup: adminMenuKeyboard() });
+    return { ok: true, action: 'admin_reseller_command' };
+  }
+  await replyAdminMenu(chatId, 'متوجه نشدم. از دکمه‌های زیر یا /help استفاده کنید.');
+  return { ok: true, action: 'admin_fallback' };
+}
 
 async function handleMessage(message) {
   const chatId = String(message?.chat?.id || '');
@@ -467,16 +1037,7 @@ async function handleMessage(message) {
   if (message.chat.type !== 'private') {
     if (String(chatId) === String(telegram.botConfig().adminChatId || '')) {
       const actor = adminActor(fromId, chatId);
-      if (actor && String(message.text || '').trim().startsWith('/pending')) {
-        const list = topups.listRequests({ status: 'pending', page: 1, pageSize: 10 });
-        const lines = [`🧾 <b>فیش‌های در انتظار: ${faNum(list.counts.pending)}</b>`];
-        for (const row of list.rows) {
-          lines.push(`• #${row.id} · ${esc(row.username)} · ${faNum(row.amount)} ${esc(currency())} · ${esc(faDate(row.createdAt, true))}`);
-        }
-        if (!list.rows.length) lines.push('<i>موردی نیست.</i>');
-        await reply(chatId, lines.join('\n'));
-        return { ok: true, action: 'admin_pending' };
-      }
+      if (actor) return handleAdminMessage(message, chatId, fromId, String(message.text || '').trim(), actor);
     }
     return { ok: false, reason: 'not_private' };
   }
@@ -485,28 +1046,15 @@ async function handleMessage(message) {
   const text = String(message.text || '').trim();
   const file = fileOf(message);
 
+  // v1.5.3: an admin's own chat — private or the configured group — is served by
+  // the ADMIN keyboard. His wallet has no reseller buttons in it, and a receipt
+  // he could send here would be his own money.
+  const adminHere = adminActor(fromId, chatId);
+  if (adminHere) return handleAdminMessage(message, chatId, fromId, text, adminHere);
+
   if (!user) {
-    // An admin who is not linked to a telegram_id still gets his own chat served.
-    const actor = adminActor(fromId, chatId);
-    if (actor && String(chatId) === String(telegram.botConfig().adminChatId || '')) {
-      if (text === '/pending') {
-        const list = topups.listRequests({ status: 'pending', page: 1, pageSize: 10 });
-        const lines = [`🧾 <b>فیش‌های در انتظار: ${faNum(list.counts.pending)}</b>`];
-        for (const row of list.rows) {
-          lines.push(`• #${row.id} · ${esc(row.username)} · ${faNum(row.amount)} ${esc(currency())}`);
-        }
-        if (!list.rows.length) lines.push('<i>موردی نیست.</i>');
-        await reply(chatId, lines.join('\n'));
-        return { ok: true, action: 'admin_pending' };
-      }
-      await reply(chatId, [
-        '👋 <b>سلام مدیر</b>',
-        'فیش‌های واریزی نماینده‌ها به همین چت ارسال می‌شود و با دکمه‌های زیر هر فیش تایید یا رد می‌شوند.',
-        'دستور /pending فهرست فیش‌های در انتظار را نشان می‌دهد.',
-        'برای دیدن موجودی و آمار خودتان، شناسهٔ تلگرامتان را در حساب کاربری پنل ثبت کنید.',
-      ].join('\n'));
-      return { ok: true, action: 'admin_hello' };
-    }
+    // adminActor() above already covers every admin, linked or not: what is left
+    // here is a stranger's chat, and a stranger never reads a wallet.
     clearStep(chatId);
     await reply(chatId, unlinkedText(fromId));
     return { ok: false, reason: 'unlinked' };
@@ -527,6 +1075,37 @@ async function handleMessage(message) {
   }
   if (command === '/start' || command === '/help' || text === BTN_HELP) {
     clearStep(chatId);
+    const name = await botUsername();
+    // A panel link carries a payload (t.me/<bot>?start=topup): the deep link is
+    // the button the owner asked for, so it opens exactly that conversation.
+    const payload = (text.split(/\s+/)[1] || '').toLowerCase();
+    if (command === '/start' && payload) {
+      const welcome = [
+        `👋 <b>خوش آمدید ${esc(user.name || user.username)}</b>`,
+        `موجودی کیف پول: <b>${faNum(user.balance)}</b> ${esc(currency())}`,
+        '',
+      ];
+      if (payload === 'topup') return startTopup(chatId, user);
+      const DEEP = {
+        menu: { text: () => 'از دکمه‌های زیر استفاده کنید:', action: 'deep_menu' },
+        balance: { text: () => balanceText(user), action: 'deep_balance', label: 'موجودی' },
+        stats: { text: () => statsText(user), action: 'deep_stats', label: 'آمار مصرف' },
+        packages: { text: () => packagesText(user), action: 'deep_packages', label: 'آمار اشتراک‌ها' },
+        receipts: { text: () => receiptsText(user), action: 'deep_receipts', label: 'فیش‌های من' },
+      };
+      const deep = DEEP[payload] || null;
+      if (!deep) {
+        await replyMenu(chatId, [...welcome, `دکمهٔ «${esc(payload)}» را نمی‌شناسم؛ از دکمه‌های زیر استفاده کنید:`].join('\n'));
+        return { ok: false, reason: 'unknown_deep_link' };
+      }
+      // The link IS the panel's «افزایش موجودی از طریق ربات» button: name the
+      // section it opened, then answer exactly like that button press would.
+      if (deep.label) {
+        await replyMenu(chatId, [...welcome, `🔗 از لینک پنل به بخش <b>${esc(deep.label)}</b> آمدید:`].join('\n'));
+      }
+      await replyMenu(chatId, deep.text());
+      return { ok: true, action: deep.action };
+    }
     if (command === '/start') {
       await replyMenu(chatId, [
         `👋 <b>خوش آمدید ${esc(user.name || user.username)}</b>`,
@@ -534,10 +1113,8 @@ async function handleMessage(message) {
         '',
         'از دکمه‌های زیر استفاده کنید:',
       ].join('\n'));
-      await reply(chatId, helpText(user));
-      return { ok: true, action: 'start' };
     }
-    await replyMenu(chatId, helpText(user));
+    await reply(chatId, helpText(user, name));
     return { ok: true, action: 'help' };
   }
   if (command === '/balance' || text === BTN_BALANCE) {
@@ -549,6 +1126,16 @@ async function handleMessage(message) {
     clearStep(chatId);
     await replyMenu(chatId, statsText(user));
     return { ok: true, action: 'stats' };
+  }
+  if (command === '/packages' || text === BTN_PACKAGES) {
+    clearStep(chatId);
+    await replyMenu(chatId, packagesText(user));
+    return { ok: true, action: 'packages' };
+  }
+  if (command === '/receipts' || text === BTN_RECEIPTS) {
+    clearStep(chatId);
+    await replyMenu(chatId, receiptsText(user));
+    return { ok: true, action: 'receipts' };
   }
   if (command === '/topup' || text === BTN_TOPUP) {
     return startTopup(chatId, user);
@@ -635,6 +1222,23 @@ async function editAdminMessage(chatId, messageId, text, isMedia) {
 }
 
 /**
+ * A text that has to REPLACE an inline-keyboard screen: edit the tapped message
+ * when we know its id, and fall back to a plain (button-free) send when the
+ * update arrived without one. Used by the admin money flow, where a live «تایید»
+ * button must never outlive the decision it belongs to.
+ */
+async function showAdminText(chatId, messageId, text) {
+  const id = Number(messageId || 0);
+  if (id > 0) return editAdminMessage(chatId, id, text, false);
+  try {
+    return await reply(chatId, text);
+  } catch (err) {
+    logError('[bot] sending the admin follow-up failed:', err.message);
+    return null;
+  }
+}
+
+/**
  * A decision made in the PANEL must also take the buttons away from the copy in
  * the admin's Telegram chat, otherwise the owner can tap «تایید» on a receipt he
  * already rejected here. Best effort: the money is already decided, so a
@@ -659,9 +1263,109 @@ async function syncAdminMessage(request, decision, actorName = '') {
   return { synced: true };
 }
 
+/**
+ * v1.5.3: the admin's own inline buttons — the money flow and the reseller pager.
+ * `adminActor` is re-checked here and on every step, so tapping a button from an
+ * old message (or in a chat that is not the admin's) cannot move a wallet; the
+ * confirm payload carries target, direction AND amount, and all three have to
+ * still match the stored step before a single row is written.
+ * `messageId` is the id of the message the tap came from: the confirmation
+ * screen is edited in place, so no live «تایید» button survives a move.
+ */
+async function handleAdminCallback(data, chatId, fromId, answer, messageId = 0) {
+  const actor = adminActor(fromId, chatId);
+  if (!actor) {
+    await answer('⛔ فقط مدیر پنل می‌تواند موجودی نماینده را تغییر دهد.', true);
+    return { ok: false, reason: 'not_admin' };
+  }
+  const state = stepOf(chatId);
+
+  if (data === 'bal:cancel') {
+    clearStep(chatId);
+    await answer('❌ لغو شد — هیچ مبلغی تغییر نکرد.');
+    await replyAdminMenu(chatId, '❌ درخواست تغییر موجودی لغو شد. برای شروع دوباره «' + BTN_A_MONEY + '» را بزنید.');
+    return { ok: true, action: 'money_cancel' };
+  }
+
+  if (data.startsWith('rs:pg:')) {
+    const page = Math.min(500, Math.max(1, Number(data.slice(6)) || 1));
+    const list = resellersText(page);
+    await answer(`صفحه ${faNum(list.page)} از ${faNum(list.pages)}`);
+    await reply(chatId, list.text, { reply_markup: pagerKeyboard(list.page, list.page > 1, list.page < list.pages) });
+    return { ok: true, action: 'admin_resellers_page', page: list.page, pages: list.pages, total: list.total };
+  }
+
+  let match = /^bal:set:(\d+):([+-])$/.exec(data);
+  if (match) {
+    if (!state?.target || Number(state.target.id) !== Number(match[1])) {
+      await answer('⚠️ این پیام کهنه است. «' + BTN_A_MONEY + '» را دوباره بزنید.', true);
+      return { ok: false, reason: 'stale_step' };
+    }
+    return askMoneyAmount(chatId, state, match[2]);
+  }
+
+  match = /^bal:do:(\d+):([+-]):(\d{1,12})$/.exec(data);
+  if (!match) {
+    await answer('دستور ناشناخته');
+    return { ok: false, reason: 'unknown_callback' };
+  }
+  const uid = Number(match[1]);
+  const sign = match[2];
+  const amount = Number(match[3]);
+  const fresh = state?.step === 'adm_confirm' && state.sign === sign && Number(state.amount) === amount;
+  if (!fresh || !state.target || Number(state.target.id) !== uid) {
+    // The buttons of a confirmation the panel (or another chat) already answered
+    // must not move money a second time or from stale numbers.
+    await answer('⚠️ این تایید کهنه است. اگر مبلغی جابه‌جا شده، در کیف پول نماینده دیده می‌شود.', true);
+    return { ok: false, reason: 'stale_confirmation' };
+  }
+  let moved = null;
+  try {
+    moved = await runMoneyMove(state, actor);
+  } catch (err) {
+    const message = err instanceof ApiError ? err.message : String(err.message || err || 'خطا');
+    logError('[bot] manual balance move failed:', message);
+    clearStep(chatId);
+    await answer(`⚠️ ${String(message).slice(0, 180)}`, true);
+    // Nothing moved, but the «تایید» buttons must not stay live on a failed
+    // attempt — the owner might tap it again after fixing the cause.
+    await showAdminText(chatId, messageId, `⚠️ <b>جابه‌جایی انجام نشد</b>\n<i>${esc(message)}</i>`);
+    return { ok: false, reason: 'move_failed', message };
+  }
+  clearStep(chatId);
+  const unit = esc(currency());
+  const receipt = [
+    moved.delta > 0 ? '✅ <b>موجودی افزایش یافت</b>' : '✅ <b>موجودی کاهش یافت</b>',
+    `نماینده: <code>${esc(moved.user.username)}</code>`,
+    `${moved.delta > 0 ? 'افزایش' : 'کاهش'}: <b>${faNum(Math.abs(moved.delta))}</b> ${unit}`,
+    `موجودی جدید: <b>${faNum(moved.result.balance)}</b> ${unit}`,
+    ``,
+    `توسط: ${esc(actor.username)} · ${esc(faDate(Date.now(), true))}`,
+    '<i>این کار در پنل هم در تراکنش‌های کیف پول ثبت شد.</i>',
+  ].join('\n');
+  await answer(moved.delta > 0 ? `✅ ثبت شد — موجودی: ${faNum(moved.result.balance)}` : '✅ کسر شد');
+  // Replace the confirmation screen with the receipt, so no button is left live.
+  await showAdminText(chatId, messageId, receipt);
+  // The reseller hears about it in his own chat, the same way a receipt decision
+  // reaches him. Best effort: the money already moved.
+  const resellerChat = String(moved.user.telegram_id || '').trim();
+  if (/^\d{4,20}$/.test(resellerChat)) {
+    try {
+      await replyMenu(resellerChat, [
+        moved.delta > 0 ? '💰 <b>موجودی شما افزایش یافت</b>' : '💸 <b>موجودی شما کاهش یافت</b>',
+        `مبلغ: <b>${faNum(Math.abs(moved.delta))}</b> ${unit}`,
+        `موجودی جدید: <b>${faNum(moved.result.balance)}</b> ${unit}`,
+        '<i>توسط مدیر پنل · در صورت اشتباه با پشتیبانی تماس بگیرید.</i>',
+      ].join('\n'));
+    } catch (err) {
+      logError('[bot] telling the reseller about a manual move failed:', err.message);
+    }
+  }
+  return { ok: true, action: moved.delta > 0 ? 'charged' : 'deducted', userId: uid, amount: Math.abs(moved.delta), balance: Number(moved.result.balance || 0) };
+}
+
 async function handleCallback(callback) {
   const data = String(callback?.data || '');
-  const match = /^topup:(ok|no):(\d+)$/.exec(data);
   const chatId = String(callback?.message?.chat?.id || '');
   const fromId = String(callback?.from?.id || '');
   const answer = (text, alert = false) => telegram.call('answerCallbackQuery', {
@@ -669,6 +1373,13 @@ async function handleCallback(callback) {
     text: String(text || '').slice(0, 190),
     show_alert: alert,
   }).catch(() => null);
+
+  // v1.5.3: an admin keyboard lives on its own callback namespaces.
+  if (!data.startsWith('topup:')) {
+    return handleAdminCallback(data, chatId, fromId, answer, Number(callback?.message?.message_id || 0));
+  }
+
+  const match = /^topup:(ok|no):(\d+)$/.exec(data);
 
   if (!match) {
     await answer('دستور ناشناخته');
@@ -861,6 +1572,16 @@ async function start() {
     }
   }
   running = true;
+  // v1.5.3: the panel link and the /start deep links both need the bot's own
+  // username, and the native command menu is what makes the keyboard feel
+  // professional. Both talk to Telegram, so they run after the poller is up and
+  // never decide anything: a getMe/setMyCommands failure only costs the menu.
+  if (cfg.enabled) {
+    botUsername()
+      .then((name) => (name ? log(`[bot] bot username: @${name}`) : null))
+      .catch((err) => logError('[bot] getMe failed:', err.message));
+    registerCommands().catch((err) => logError('[bot] setMyCommands failed:', err.message));
+  }
   loop().catch((err) => {
     running = false;
     logError('[bot] poller crashed:', err && err.stack ? err.stack : err);
@@ -901,12 +1622,25 @@ module.exports = {
   handleUpdate,
   handleMessage,
   handleCallback,
+  handleAdminMessage,
+  handleAdminCallback,
   parseAmount,
   fileOf,
+  isMinus,
   balanceText,
   statsText,
   helpText,
+  packagesText,
+  receiptsText,
   adminActor,
+  adminHelpText,
+  resellerByIdentity,
+  resellersText,
+  pendingListText,
+  botUsername,
+  cachedBotUsername,
+  deepLink,
+  registerCommands,
   userByTelegramId,
   stateGet,
   stateSet,
@@ -918,10 +1652,21 @@ module.exports = {
   clearStep,
   postToAdmin,
   syncAdminMessage,
+  menuKeyboard,
+  adminMenuKeyboard,
+  moneyChoiceKeyboard,
+  moneyConfirmKeyboard,
+  pagerKeyboard,
   BTN_BALANCE,
+  BTN_PACKAGES,
+  BTN_RECEIPTS,
   BTN_STATS,
   BTN_TOPUP,
   BTN_HELP,
   BTN_CANCEL,
+  BTN_A_RESELLERS,
+  BTN_A_MONEY,
+  BTN_A_PENDING,
+  BTN_A_HELP,
   DAY_MS,
 };

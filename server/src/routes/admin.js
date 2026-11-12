@@ -1152,12 +1152,19 @@ router.post('/topups/:id/reject', auth.requirePerm('users'), asyncH(async (req, 
 // bring it back without SSH.
 router.get('/bot', auth.requirePerm('settings'), (req, res) => {
   const cfg = telegram.botConfig();
+  // v1.5.3: the owner's card shows the same link the reseller panel offers, plus
+  // the keyboard he is supposed to see. cachedBotUsername() never waits on
+  // Telegram: an empty name here means the poller has not introduced itself yet.
+  const name = bot.cachedBotUsername();
   res.json({
     ok: true,
     data: {
       ...bot.status(),
       hasToken: Boolean(cfg.botToken),
       adminChatId: cfg.adminChatId,
+      botName: name,
+      topupLink: bot.deepLink('topup', name),
+      commands: Boolean(name),
       pending: topups.listRequests({ status: 'pending', page: 1, pageSize: 1 }).counts.pending,
     },
   });

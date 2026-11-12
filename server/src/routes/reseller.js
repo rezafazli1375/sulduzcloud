@@ -9,6 +9,9 @@ const configsService = require('../services/configs');
 const pricing = require('../services/pricing');
 const statsService = require('../services/stats');
 const topups = require('../services/topups');
+const settings = require('../settings');
+const telegram = require('../services/telegram');
+const bot = require('../services/bot');
 const { ApiError, asyncH, bytesToGb, toCsv, pageParams } = require('../utils');
 
 const router = express.Router();
@@ -357,6 +360,46 @@ router.get('/topups', (req, res) => {
     },
   });
 });
+
+// v1.5.3: the header chip asks for nothing but his own wallet, every ~20 seconds
+// and on every tab that comes back to the foreground. req.user is re-read from
+// the users row on each request (auth middleware), so this number is as live as
+// the bot's «موجودی» button — and after the admin charges him in Telegram the
+// panel shows the new balance without him reloading anything. `pending` is the
+// same count the receipt page shows, so «در انتظار تایید» never disagrees.
+router.get('/balance', (req, res) => {
+  res.json({
+    ok: true,
+    data: {
+      balance: Number(req.user.balance || 0),
+      currency: String(settings.getSetting('billing').currency || 'تومان'),
+      pending: topups.pendingCount(req.user.id),
+      updatedAt: Date.now(),
+    },
+  });
+});
+
+// v1.5.3: «افزایش موجودی از طریق ربات تلگرام». The link is a /start deep link, so
+// tapping it opens THIS chat with this bot and lands the reseller straight in the
+// receipt conversation — the button the owner asked for. The username comes from
+// the bot's own getMe, cached in bot_state by the poller: when the poller is off
+// (or Telegram did not answer yet) the link is empty and the card says so
+// honestly instead of offering a broken t.me/… URL. No secret is exposed here:
+// a bot username is public information.
+router.get('/bot', asyncH(async (req, res) => {
+  const name = await bot.botUsername();
+  const cfg = telegram.botConfig();
+  res.json({
+    ok: true,
+    data: {
+      enabled: Boolean(cfg.enabled),
+      botName: name,
+      link: bot.deepLink('topup', name),
+      receiptsLink: bot.deepLink('receipts', name),
+      balanceLink: bot.deepLink('balance', name),
+    },
+  });
+}));
 
 router.get('/me', (req, res) => {
   res.json({

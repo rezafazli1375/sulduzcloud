@@ -4075,6 +4075,70 @@ function startMockXui(inboundRows) {
       check('switching the bot back on needs no restart to be reflected in its state',
         botOn52.status === 200 && botStateOn52.json?.data?.enabled === true,
         `status=${botOn52.status} enabled=${botStateOn52.json?.data?.enabled}`);
+
+      // ---- v1.5.3: the header chip and the panel's «افزایش موجودی از طریق ربات»
+      // The reseller panel polls /reseller/balance every twenty seconds, so that
+      // one query has to be cheap, honest about the currency, and impossible to
+      // aim at another wallet. /reseller/bot is the link the wallet page shows:
+      // it is built from getMe's cached username and must degrade to "no link"
+      // instead of a broken t.me address or a 500.
+      const seedBotName = (name) => v52Db.prepare(
+        'INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+      ).run('bot_username', JSON.stringify(name), Date.now());
+      const liveBal = await request('GET', '/api/reseller/balance', { cookies: ck52 });
+      const liveData = liveBal.json?.data || {};
+      const pendNow = Number(v52Db.prepare("SELECT COUNT(*) AS c FROM topup_requests WHERE user_id = ? AND status = 'pending'").get(v52ShopId).c);
+      check('v1.5.3 /reseller/balance answers with the wallet the panel shows: money, currency, waiting receipts',
+        liveBal.status === 200 && Number(liveData.balance) === balanceOf(v52ShopId)
+          && typeof liveData.currency === 'string' && liveData.currency.length > 0
+          && Number(liveData.pending) === pendNow && Number(liveData.updatedAt) > 0,
+        `status=${liveBal.status} balance=${liveData.balance} pending=${liveData.pending} currency=${liveData.currency}`);
+      const movedBal = await request('POST', `/api/admin/topups/${t4}/approve`, { cookies, csrf, body: { amount: 120000 } });
+      const afterBal = await request('GET', '/api/reseller/balance', { cookies: ck52 });
+      check('a receipt approved in the panel is in the chip on the next read — no reload, no cache',
+        movedBal.status === 200 && afterBal.status === 200
+          && Number(afterBal.json?.data?.balance) === balanceOf(v52ShopId)
+          && Number(afterBal.json?.data?.balance) === Number(liveData.balance) + 120000
+          && Number(afterBal.json?.data?.pending) === pendNow - 1,
+        `after=${afterBal.json?.data?.balance} expected=${balanceOf(v52ShopId)}`);
+      const adminBalance = await request('GET', '/api/reseller/balance', { cookies });
+      const ownerRow53 = v52Db.prepare('SELECT balance FROM users WHERE username = ?').get(OWNER) || {};
+      check('the same route never reaches across a wallet: an admin reads his own number, not the shop’s',
+        adminBalance.status === 200 && Number(adminBalance.json?.data?.balance) === Number(ownerRow53.balance || 0)
+          && Number(adminBalance.json?.data?.balance) !== Number(afterBal.json?.data?.balance),
+        `admin=${adminBalance.json?.data?.balance} shop=${afterBal.json?.data?.balance}`);
+      const noAuth53 = await request('GET', '/api/reseller/balance', {});
+      check('an anonymous poller gets 401, not a balance', noAuth53.status === 401, `status=${noAuth53.status}`);
+
+      seedBotName('selftest_bot');
+      const resellerBot = await request('GET', '/api/reseller/bot', { cookies: ck52 });
+      const rbData = resellerBot.json?.data || {};
+      check('the wallet page can promise a bot link: t.me/<bot>?start=topup, built from getMe’s cached answer',
+        resellerBot.status === 200 && rbData.enabled === true && rbData.botName === 'selftest_bot'
+          && rbData.link === 'https://t.me/selftest_bot?start=topup'
+          && rbData.receiptsLink === 'https://t.me/selftest_bot?start=receipts'
+          && rbData.balanceLink === 'https://t.me/selftest_bot?start=balance',
+        `link=${rbData.link} enabled=${rbData.enabled}`);
+      const adminBot53 = await request('GET', '/api/admin/bot', { cookies });
+      const abData = adminBot53.json?.data || {};
+      check('the settings card shows the same username and link the reseller is sent to',
+        adminBot53.status === 200 && abData.botName === 'selftest_bot'
+          && abData.topupLink === 'https://t.me/selftest_bot?start=topup' && abData.commands === true
+          && abData.botToken === undefined,
+        `name=${abData.botName} link=${abData.topupLink}`);
+      seedBotName('');
+      const blankBot = await request('GET', '/api/reseller/bot', { cookies: ck52 });
+      const bbData = blankBot.json?.data || {};
+      check('before getMe has answered, the panel gets an empty link instead of a broken one — and no 500',
+        blankBot.status === 200 && bbData.botName === '' && bbData.link === ''
+          && bbData.receiptsLink === '' && bbData.enabled === true,
+        `status=${blankBot.status} link="${bbData.link}"`);
+      const adminBlank53 = await request('GET', '/api/admin/bot', { cookies });
+      check('the admin card says the commands are not registered yet rather than claiming they are',
+        adminBlank53.status === 200 && adminBlank53.json?.data?.topupLink === ''
+          && adminBlank53.json?.data?.commands === false,
+        `commands=${adminBlank53.json?.data?.commands}`);
+      v52Db.prepare("DELETE FROM bot_state WHERE key = 'bot_username'").run();
     } finally {
       for (const id of v52Ids) v52Db.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(id);
       for (const id of v52Ids) v52Db.prepare('DELETE FROM configs WHERE id = ?').run(id);
