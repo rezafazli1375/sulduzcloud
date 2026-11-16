@@ -9,6 +9,8 @@ const auth = require('../auth');
 const usersService = require('../services/users');
 const serversService = require('../services/servers');
 const ticketsService = require('../services/tickets');
+const topups = require('../services/topups');
+const payment = require('../services/payment');
 const xui = require('../xui');
 const notify = require('../notify');
 const monitor = require('../services/monitor');
@@ -46,7 +48,11 @@ router.get('/setup/status', (req, res) => {
 
 router.post('/setup', asyncH(async (req, res) => {
   if (usersCount() > 0) throw new ApiError(403, 'already_setup', 'The panel is already configured');
-  const { username, password, name, panelName } = req.body || {};
+  // v1.5.4: the brand name is NOT taken from this form any more. The owner asked
+  // that his name survive somebody else's install, so the panel is called what
+  // src/brand.js says and a setup POST — or the settings screen behind it — has
+  // no way to rename it. Anything sent as panelName is simply not read.
+  const { username, password, name } = req.body || {};
   const user = usersService.createUser(
     {
       username,
@@ -59,7 +65,6 @@ router.post('/setup', asyncH(async (req, res) => {
     },
     req
   );
-  if (panelName) settings.updateSection('general', { panelName: String(panelName).slice(0, 60) });
   auth.setSessionCookie(res, user, req);
   const csrf = auth.setCsrfCookie(res);
   audit(req, 'setup.complete', 'user', user.id, {});
@@ -284,6 +289,172 @@ router.get('/nodes/status', auth.requireAuth, asyncH(async (req, res) => {
       })),
       monitor: monitor.status(),
     },
+  });
+}));
+
+// ------------------------------------------- v1.5.4: ZarinPal's callback
+//
+// This is the one URL in the panel a stranger can hit with no session, so what
+// it is allowed to do is deliberately tiny. The reseller lands here from the
+// bank with ?Authority=…&Status=OK, and that query string proves nothing —
+// anybody can type it. The ONLY thing that credits a wallet is the server-to-server
+// verify for that authority, which ZarinPal answers yes to at most once. No
+// authority, no row, no money: an unknown authority has nothing to verify
+// against, and a row that is no longer pending has already been paid into.
+//
+// The page is self-contained HTML on purpose. This is the last screen a payer
+// sees, sometimes on a connection that just bounced through a bank's redirect,
+// and it must render even if the SPA failed to load.
+
+function paymentPage(req, res, { status, title, lines, tone = 'info', link = '/wallet', linkLabel = 'بازگشت به کیف پول' }) {
+  const esc = (value) => String(value ?? '')
+    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+  const meta = settings.publicMeta();
+  const langDir = 'rtl';
+  const accent = tone === 'ok' ? '#16a34a' : tone === 'warn' ? '#d97706' : '#64748b';
+  const csrf = auth.ensureCsrfCookie(req, res);
+  res.status(status).type('html').send(`<!doctype html>
+<html lang="fa" dir="${langDir}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>${esc(meta.panelName)} — ${esc(title)}</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1120;
+    font:14px/1.9 system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;color:#e2e8f0}
+  .card{width:min(92vw,460px);background:#111827;border:1px solid #1f2937;border-radius:16px;
+    padding:22px 20px;text-align:center}
+  .dot{width:54px;height:54px;border-radius:50%;background:${accent};display:grid;place-items:center;
+    margin:0 auto 14px;font-size:26px;color:#fff}
+  h1{margin:0 0 6px;font-size:17px}
+  p{margin:0 0 8px;color:#94a3b8}
+  ul{list-style:none;margin:10px 0 0;padding:0;text-align:right;color:#cbd5e1}
+  li{background:#0b1120;border:1px solid #1f2937;border-radius:10px;padding:8px 12px;margin-bottom:6px;word-break:break-all}
+  li b{color:#e2e8f0;font-weight:600}
+  a{display:inline-block;margin-top:16px;background:#2563eb;color:#fff;text-decoration:none;
+    border-radius:10px;padding:10px 18px;font-weight:600}
+  .brand{margin-top:14px;color:#475569;font-size:12px}
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="dot">${tone === 'ok' ? '✓' : tone === 'warn' ? '!' : 'i'}</div>
+    <h1>${esc(title)}</h1>
+    <ul>${lines.map((line) => `<li>${esc(line.label)}: <b>${esc(line.value)}</b></li>`).join('')}</ul>
+    <a href="${esc(link)}">${esc(linkLabel)}</a>
+    <div class="brand">${esc(meta.panelName)} ${esc(config.version)}</div>
+  </main>
+</body>
+</html>`);
+}
+
+router.get('/payments/zarinpal/callback', asyncH(async (req, res) => {
+  const authority = String(req.query.Authority || req.query.authority || '').trim();
+  const bankStatus = String(req.query.Status || req.query.status || '').trim().toUpperCase();
+  if (!authority) {
+    return paymentPage(req, res, {
+      status: 400, tone: 'warn', title: 'کد پرداخت نامشخص است',
+      lines: [{ label: 'وضعیت', value: 'هیچ شناسه‌ای در آدرس بازگشت نبود' }],
+    });
+  }
+  const row = topups.findByReference(authority);
+  if (!row) {
+    // Nothing in this panel was ever ordered under this authority. Say so and pay
+    // nothing — the honest answer, and the one that cannot be argued with.
+    return paymentPage(req, res, {
+      status: 404, tone: 'warn', title: 'درخواست پرداخت پیدا نشد',
+      lines: [{ label: 'کد پیگیری', value: authority }, { label: 'نتیجه', value: 'هیچ سفارشی با این کد ثبت نشده است' }],
+    });
+  }
+  if (row.status !== 'pending') {
+    return paymentPage(req, res, {
+      status: 200, tone: row.status === 'approved' ? 'ok' : 'warn',
+      title: row.status === 'approved' ? 'این پرداخت قبلاً ثبت شده است' : 'این درخواست بسته شده است',
+      lines: [
+        { label: 'شماره درخواست', value: `#${Number(row.id)}` },
+        { label: 'مبلغ', value: Number(row.amount).toLocaleString('en-US') },
+        { label: 'وضعیت', value: row.status === 'approved' ? 'تایید و شارژ شده' : 'رد شده' },
+      ],
+    });
+  }
+  // The bank says the payer left the page. Whether he actually paid is a question
+  // only verify() can answer, so a NAK here costs nothing and stops the call.
+  if (bankStatus && bankStatus !== 'OK') {
+    return paymentPage(req, res, {
+      status: 200, tone: 'warn', title: 'پرداخت انجام نشد',
+      lines: [
+        { label: 'شماره درخواست', value: `#${Number(row.id)}` },
+        { label: 'مبلغ', value: Number(row.amount).toLocaleString('en-US') },
+        { label: 'وضعیت', value: 'در بانک لغو شد — هیچ مبلغی شارژ نشده است' },
+      ],
+    });
+  }
+  let proof = null;
+  try {
+    proof = await payment.zarinpalVerify({ authority, amount: Number(row.amount) });
+  } catch (err) {
+    console.error('[zarinpal] verify failed:', err?.message || err);
+    return paymentPage(req, res, {
+      status: 502, tone: 'warn', title: 'استعلام از بانک ممکن نشد',
+      lines: [
+        { label: 'شماره درخواست', value: `#${Number(row.id)}` },
+        { label: 'مبلغ', value: Number(row.amount).toLocaleString('en-US') },
+        { label: 'وضعیت', value: 'درخواست شما در صف مانده و پشتیبانی آن را بررسی می‌کند' },
+      ],
+    });
+  }
+  if (!proof.ok) {
+    // ZarinPal did not confirm the money (code != 100, or the authority was
+    // already settled elsewhere). The row stays pending on purpose: a human looks
+    // at it, and the reseller is told the truth instead of a fake failure.
+    return paymentPage(req, res, {
+      status: 200, tone: 'warn', title: 'پرداخت تایید نشد',
+      lines: [
+        { label: 'شماره درخواست', value: `#${Number(row.id)}` },
+        { label: 'مبلغ', value: Number(row.amount).toLocaleString('en-US') },
+        { label: 'کد بانک', value: proof.code || 'نامشخص' },
+        { label: 'وضعیت', value: 'مبلغی شارژ نشده است؛ با پشتیبانی تماس بگیرید' },
+      ],
+    });
+  }
+  let credited = null;
+  try {
+    credited = topups.approve(Number(row.id), {
+      // No actor: the gateway proved the payment, the panel's own status lock
+      // keeps this idempotent, and the ref_id is recorded as the receipt number.
+      actor: null,
+      source: 'gateway',
+      reference: proof.refId,
+      paidAt: Date.now(),
+      note: `درگاه زرین‌پال — ref_id ${proof.refId}${proof.cardPan ? ` — کارت ${String(proof.cardPan).slice(-4)}` : ''}`,
+    });
+  } catch (err) {
+    if (err?.code === 'already_decided') {
+      return paymentPage(req, res, {
+        status: 200, tone: 'ok', title: 'این پرداخت قبلاً ثبت شده است',
+        lines: [{ label: 'شماره درخواست', value: `#${Number(row.id)}` }],
+      });
+    }
+    console.error('[zarinpal] credit failed:', err?.message || err);
+    return paymentPage(req, res, {
+      status: 500, tone: 'warn', title: 'شارژ کیف پول انجام نشد',
+      lines: [
+        { label: 'شماره درخواست', value: `#${Number(row.id)}` },
+        { label: 'کد پیگیری بانک', value: proof.refId },
+        { label: 'وضعیت', value: 'پول از بانک آمده ولی شارژ ثبت نشده — با پشتیبانی تماس بگیرید' },
+      ],
+    });
+  }
+  return paymentPage(req, res, {
+    status: 200, tone: 'ok', title: 'پرداخت موفق — کیف پول شارژ شد',
+    lines: [
+      { label: 'شماره درخواست', value: `#${Number(row.id)}` },
+      { label: 'مبلغ شارژ شده', value: Number(credited.credited ?? row.amount).toLocaleString('en-US') },
+      { label: 'موجودی جدید', value: Number(credited.balance ?? 0).toLocaleString('en-US') },
+      { label: 'کد پیگیری بانک', value: proof.refId },
+    ],
   });
 }));
 

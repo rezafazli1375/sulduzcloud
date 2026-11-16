@@ -12,6 +12,7 @@ import Shell from './components/Shell.jsx';
 import Login from './pages/auth/Login.jsx';
 import Overview from './pages/Overview.jsx';
 import Configs from './pages/Configs.jsx';
+import Plans from './pages/Plans.jsx';
 import Stats from './pages/Stats.jsx';
 import Tickets from './pages/Tickets.jsx';
 import Notifications from './pages/Notifications.jsx';
@@ -113,6 +114,7 @@ function AppRoutes() {
         <Route element={<Protected><Shell /></Protected>}>
           <Route index element={<Overview />} />
           <Route path="configs" element={<Configs />} />
+          <Route path="plans" element={<Plans />} />
           <Route path="stats" element={<Stats />} />
           <Route path="tickets" element={<Tickets />} />
           <Route path="notifications" element={<Notifications />} />

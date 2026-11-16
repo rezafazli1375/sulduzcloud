@@ -9,6 +9,8 @@ const configsService = require('../services/configs');
 const pricing = require('../services/pricing');
 const statsService = require('../services/stats');
 const topups = require('../services/topups');
+const payment = require('../services/payment');
+const plansService = require('../services/plans');
 const settings = require('../settings');
 const telegram = require('../services/telegram');
 const bot = require('../services/bot');
@@ -399,6 +401,189 @@ router.get('/bot', asyncH(async (req, res) => {
       balanceLink: bot.deepLink('balance', name),
     },
   });
+}));
+
+// --------------------------------------- v1.5.4: how a wallet gets filled
+//
+// Four ways in, and they are NOT the same kind of thing (services/payment.js
+// spells out why): the card numbers and the بلو link are things the reseller acts
+// on OUTSIDE this panel, so all the panel can record is his claim; ZarinPal is the
+// one route that can come back with proof of a real payment. Every path here
+// therefore ends in the same topup_requests table with the same rules — a pending
+// row, capped amount, the admin or the schedule deciding — and only topups.approve()
+// moves money. That is deliberate: two different screens offering two different
+// "pay now" buttons must not be able to credit the same order twice.
+
+router.get('/payments/methods', (req, res) => {
+  res.json({ ok: true, data: payment.methods() });
+});
+
+// The owner's prepared بلو link, with this reseller's amount filled in. Nothing is
+// written here: opening a link is not a payment, and a row for it would put an
+// unpaid claim in front of the admin. He comes back with /payments/claim once the
+// bank has actually taken the money, and quotes the tracking code he was shown.
+router.get('/payments/blue', (req, res) => {
+  const amount = topups.cleanAmount(num(req.query.amount, 0));
+  const link = payment.blueLinkFor(amount);
+  res.json({ ok: true, data: { ...link, currency: String(settings.getSetting('billing').currency || 'تومان') } });
+});
+
+// A claim: «I paid» — by receipt, card-to-card, or through the بلو link.
+router.post('/payments/claim', asyncH(async (req, res) => {
+  const body = req.body || {};
+  const method = topups.cleanMethod(body.method);
+  if (method === 'zarinpal') {
+    throw new ApiError(422, 'use_gateway',
+      'پرداخت آنلاین از طریق درگاه انجام می‌شود، نه این فرم / Pay online through the gateway instead of this form');
+  }
+  const request = topups.createRequest({
+    userId: req.user.id,
+    amount: num(body.amount, 0),
+    method,
+    cardNumber: String(body.cardNumber || ''),
+    reference: String(body.reference || ''),
+    caption: String(body.note || '').slice(0, 1000),
+    source: 'panel',
+    paidAt: num(body.paidAt, 0),
+  });
+  res.status(201).json({
+    ok: true,
+    data: {
+      request: {
+        id: request.id, amount: request.amount, status: request.status,
+        method: request.method, methodLabel: request.methodLabel,
+        reference: request.reference, cardNumber: request.cardNumber, createdAt: request.createdAt,
+      },
+      pending: topups.pendingCount(req.user.id),
+      balance: Number(req.user.balance || 0),
+    },
+  });
+}));
+
+// ZarinPal step 1 — and the only step that talks to a bank.
+//
+// The row is created BEFORE the gateway is asked, so there is something for the
+// callback to come back to, and the amount the reseller is billed for is the
+// amount written down here rather than a number a later request can bring with
+// it. The authority ZarinPal returns becomes the row's reference, which is the
+// only thing the callback is allowed to identify a payment by.
+router.post('/payments/zarinpal/start', asyncH(async (req, res) => {
+  const amount = topups.cleanAmount(num(req.body?.amount, 0));
+  const zp = payment.zarinpal();
+  if (!zp.enabled) {
+    throw new ApiError(409, 'zarinpal_disabled', 'پرداخت آنلاین در این پنل فعال نیست / Online payment is not enabled on this panel');
+  }
+  const request = topups.createRequest({
+    userId: req.user.id, amount, method: 'zarinpal', source: 'panel',
+    caption: 'پرداخت آنلاین زرین‌پال',
+  });
+  let start = null;
+  try {
+    start = await payment.zarinpalRequest({
+      amount,
+      description: `شارژ کیف پول نماینده ${req.user.username} #${request.id}`,
+      mobile: String(req.user.phone || ''),
+      email: String(req.user.email || ''),
+      orderId: request.id,
+    });
+  } catch (err) {
+    // The gateway said no, so nothing was billed and nothing may linger: the row
+    // is rejected rather than left as a pending claim nobody paid. The reason is
+    // kept in the decision note, which is exactly what the admin would ask.
+    topups.reject(request.id, { note: `درگاه: ${String(err?.message || err).slice(0, 200)}`, actor: null, source: 'gateway' });
+    throw err;
+  }
+  topups.setReference(request.id, start.authority);
+  res.json({
+    ok: true,
+    data: {
+      topupId: request.id,
+      amount: request.amount,
+      rial: start.rial,
+      authority: start.authority,
+      paymentUrl: start.paymentUrl,
+      sandbox: zp.sandbox,
+    },
+  });
+}));
+
+// The reseller's own gateway orders, so the wallet page can say "this one is
+// still with the bank" without guessing from a pending count.
+router.get('/payments/orders', (req, res) => {
+  const data = topups.listRequests({ userId: req.user.id, page: num(req.query.page, 1), pageSize: num(req.query.pageSize, 20) });
+  res.json({
+    ok: true,
+    data: {
+      total: data.total,
+      counts: data.counts,
+      balance: Number(req.user.balance || 0),
+      rows: data.rows.map((row) => ({
+        id: row.id,
+        amount: row.amount,
+        status: row.status,
+        method: row.method,
+        methodLabel: row.methodLabel,
+        reference: row.reference,
+        cardNumber: row.cardNumber,
+        autoApproved: row.autoApproved,
+        decidedAt: row.decidedAt,
+        decisionNote: row.decisionNote,
+        createdAt: row.createdAt,
+      })),
+    },
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.5.4 — پلن‌های آماده. The owner writes the plan (volume, days, channels and
+// HIS price); the reseller only ever picks one by id. That is why no route here
+// reads a price, a gb, a days or an inbound list from the body: the numbers come
+// from the plans row, and the only field the client controls is which plan.
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/plans', (req, res) => {
+  res.json({ ok: true, data: { plans: plansService.listPlans({ viewer: req.user }) } });
+});
+
+// What this plan costs me, what the tariff would have cost, and whether my
+// wallet covers it. Read-only — the drawer shows it before any money moves.
+router.post('/plans/quote', asyncH(async (req, res) => {
+  const data = plansService.quote(num(req.body?.planId, 0), req.user);
+  res.json({ ok: true, data });
+}));
+
+// Buy a plan for a NEW customer. The customer fields are the reseller's; the
+// package and the price are the owner's.
+router.post('/plans/new', asyncH(async (req, res) => {
+  const body = req.body || {};
+  const data = await plansService.applyNew(
+    {
+      planId: num(body.planId, 0),
+      customerName: body.customerName,
+      customerPhone: body.customerPhone,
+      label: body.label,
+      note: body.note,
+    },
+    req
+  );
+  res.status(201).json({ ok: true, data });
+}));
+
+// Buy a plan for an EXISTING customer: his usage and expiry are reset and the
+// plan is applied to him from scratch — the owner's wording, implemented by the
+// v1.4.26 replace-renewal inside configs.extendConfig.
+router.post('/plans/renew', asyncH(async (req, res) => {
+  const body = req.body || {};
+  const data = await plansService.applyRenew({ planId: num(body.planId, 0), configId: num(body.configId, 0) }, req);
+  res.json({ ok: true, data });
+}));
+
+// The renewal drawer needs the customer's CURRENT numbers next to the plan's, so
+// it can say what changes instead of what gets added.
+router.post('/plans/renew/preview', asyncH(async (req, res) => {
+  const { row } = configsService.detailView(num(req.body?.configId, 0), req.user);
+  const data = plansService.renewalPreview(num(req.body?.planId, 0), row, req.user);
+  res.json({ ok: true, data });
 }));
 
 router.get('/me', (req, res) => {

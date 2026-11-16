@@ -8,20 +8,26 @@ import {
   DatabaseBackup,
   Eye,
   Globe2,
+  Info,
   KeyRound,
+  Landmark,
   Lock,
   Mail,
   MessageSquareText,
+  Play,
   Plug,
+  Plus,
   RefreshCw,
   Save,
   Send,
   ShieldCheck,
   SlidersHorizontal,
+  Trash2,
 } from 'lucide-react';
 import { useAuth } from '../../lib/auth.jsx';
 import { useI18n, translateError } from '../../lib/i18n.jsx';
 import { api } from '../../lib/api.js';
+import { formatNumber } from '../../lib/format.js';
 import {
   Badge,
   Button,
@@ -58,6 +64,7 @@ const TAB_LIST = [
   { value: 'smtp', icon: Mail, label: 'settings.tabs.smtp' },
   { value: 'sms', icon: MessageSquareText, label: 'settings.tabs.sms' },
   { value: 'billing', icon: CreditCard, label: 'settings.tabs.billing' },
+  { value: 'payment', icon: Landmark, label: 'settings.tabs.payment' },
   { value: 'backup', icon: DatabaseBackup, label: 'settings.tabs.backup' },
   { value: 'telegram', icon: Send, label: 'settings.tabs.telegram' },
   { value: 'security', icon: Lock, label: 'settings.tabs.security' },
@@ -92,8 +99,34 @@ function SaveBar({ onSave, saving, extra }) {
   );
 }
 
-export default function Settings() {
+/**
+ * v1.5.4: one payment rail, described the way the reseller will meet it.
+ *
+ * `state` is not the switch in this form — it comes from /admin/payment/status,
+ * which runs the same payment.methods() the wallet page calls. That difference is
+ * the whole point of the row: a gateway can be switched on here and still be
+ * absent from the reseller's page (a merchant id with no PUBLIC_URL, a بلو link
+ * never pasted), and only the server knows which of the two it is.
+ */
+function Rail({ icon: Icon, label, state, hint }) {
   const { t } = useI18n();
+  const tone = state === 'on' ? 'emerald' : state === 'warn' ? 'amber' : 'slate';
+  return (
+    <div className="flex items-start gap-2.5 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3.5 py-3">
+      <Icon className={cx('mt-0.5 h-4 w-4 shrink-0', state === 'on' ? 'text-emerald-300' : state === 'warn' ? 'text-amber-300' : 'text-slate-500')} />
+      <div className="min-w-0">
+        <p className="text-[12px] font-medium text-slate-200">{label}</p>
+        <p className="mt-0.5 text-[10.5px] leading-5 text-slate-500">{hint}</p>
+      </div>
+      <Badge tone={tone} dot className="ms-auto shrink-0">
+        {state === 'on' ? t('settings.payment.railOn') : state === 'warn' ? t('settings.payment.railPartial') : t('settings.payment.railOff')}
+      </Badge>
+    </div>
+  );
+}
+
+export default function Settings() {
+  const { t, lang } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const { refresh } = useAuth();
@@ -155,6 +188,52 @@ export default function Settings() {
     onSuccess: (result) => toast.success(`${t('settings.telegram.connected')}${result?.bot ? ` · @${result.bot}` : ''}`),
     onError: (err) => toast.error(err?.message || t('errors.generic')),
   });
+
+  // ---- v1.5.4: payment rails ---------------------------------------------
+  // The read model, not this form: what the reseller wallet would actually show
+  // right now, and how many receipts are still waiting for him.
+  const payStatus = useQuery({
+    queryKey: ['payment-status'],
+    queryFn: () => api.get('/admin/payment/status'),
+    enabled: tab === 'payment',
+  });
+
+  // Manual sweep of the same schedule the timer runs, so the owner can release a
+  // pending receipt after saving the settings without waiting for the next tick.
+  const runAuto = useMutation({
+    mutationFn: () => api.post('/admin/topups/auto-approve/run'),
+    onSuccess: (result) => {
+      const approved = Number(result?.approved ?? 0);
+      const skipped = Number(result?.skipped ?? 0);
+      toast.success(`${t('settings.payment.autoRunOk')} · ${approved} / ${skipped}`, {
+        title: t('settings.payment.autoRun'),
+      });
+      payStatus.refetch();
+      queryClient.invalidateQueries({ queryKey: ['topups'] });
+    },
+    onError: (err) => toast.error(translateError(err, t)),
+  });
+
+  // Cards are a list inside the section, so a keystroke in one row may not touch
+  // the other rows or the gateway switches beside them.
+  const patchCard = (index, field, value) => {
+    setLocal((prev) => {
+      const list = [...(prev.payment?.cards || [])];
+      if (!list[index]) return prev;
+      list[index] = { ...list[index], [field]: value };
+      return { ...prev, payment: { ...prev.payment, cards: list } };
+    });
+  };
+
+  const addCard = () => setLocal((prev) => ({
+    ...prev,
+    payment: { ...prev.payment, cards: [...(prev.payment?.cards || []), { number: '', holder: '', bank: '', note: '' }] },
+  }));
+
+  const removeCard = (index) => setLocal((prev) => ({
+    ...prev,
+    payment: { ...prev.payment, cards: (prev.payment?.cards || []).filter((_, i) => i !== index) },
+  }));
 
   // ---- the nightly report -------------------------------------------------
   // `daily` is the read model the schedule card, the recipient list and the
@@ -234,6 +313,11 @@ export default function Settings() {
   const backup = local.backup || {};
   const telegram = local.telegram || {};
   const security = local.security || {};
+  const payment = local.payment || {};
+  const payCards = payment.cards || [];
+  const payLive = payStatus.data?.methods || {};
+  const payAuto = payStatus.data?.autoApprove || {};
+  const pendingCount = Number(payStatus.data?.pending?.pending || 0);
   // Read model of the nightly report: schedule, recipients and delivery history.
   const rep = daily.data || {};
   const repRows = rep.recipients || [];
@@ -264,8 +348,18 @@ export default function Settings() {
         <SectionCard icon={Globe2} title={t('settings.tabs.general')}>
           <div className="space-y-4">
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field label={t('settings.general.panelName')} required>
-                <Input value={general.panelName || ''} onChange={(e) => patch('general', 'panelName', e.target.value)} />
+              {/*
+                v1.5.4, item 4: the panel name is a constant in the code, not a
+                setting. The write path already drops it (LOCKED_FIELDS), so this
+                is the honest half: the name is shown, not offered for editing.
+                Whoever installs this software gets the same brand as everybody
+                else, which is exactly what the owner asked for.
+              */}
+              <Field label={t('settings.general.panelName')} hint={t('settings.general.panelNameLocked')}>
+                <div className="flex h-10 items-center gap-2 rounded-xl border border-white/[0.07] bg-white/[0.03] px-3">
+                  <Lock className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                  <span className="truncate text-[12.5px] font-semibold text-slate-200">{general.panelName || 'Sulduz Cloud'}</span>
+                </div>
               </Field>
               <Field label={t('settings.general.tagline')}>
                 <Input value={general.tagline || ''} onChange={(e) => patch('general', 'tagline', e.target.value)} />
@@ -579,6 +673,23 @@ export default function Settings() {
             <Field label={t('settings.billing.currency')}>
               <Input value={billing.currency || ''} onChange={(e) => patch('billing', 'currency', e.target.value)} placeholder="تومان" />
             </Field>
+            {/*
+              v1.5.4, item 6: پورسانت. These two numbers are the fleet default and
+              its ceiling; a reseller can carry his own percentage on his account
+              (Resellers page) and that wins, bounded by commissionCapPercent.
+              Nothing here pays out — services/configs.js credits the referrer when
+              a charge actually happens, which is why the copy insists on "of what
+              he pays", not "of what he sells".
+            */}
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label={t('settings.billing.commissionPercent')} hint={t('settings.billing.commissionHint')}>
+                <Input type="number" min="0" max="50" dir="ltr" value={billing.commissionPercent ?? 0} onChange={(e) => patch('billing', 'commissionPercent', e.target.value)} />
+              </Field>
+              <Field label={t('settings.billing.commissionCap')} hint={t('settings.billing.commissionCapHint')}>
+                <Input type="number" min="0" max="50" dir="ltr" value={billing.commissionCapPercent ?? 50} onChange={(e) => patch('billing', 'commissionCapPercent', e.target.value)} />
+              </Field>
+            </div>
+            <p className="text-[10.5px] leading-5 text-slate-500">{t('settings.billing.commissionFootnote')}</p>
             <div className={cx(
               'flex items-start gap-2.5 rounded-xl border p-3.5 text-[11.5px] leading-6',
               billing.enabled
@@ -591,6 +702,241 @@ export default function Settings() {
             <SaveBar
               saving={savingSection === 'billing'}
               onSave={() => save.mutate({ section: 'billing', payload: billing })}
+            />
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {tab === 'payment' ? (
+        <SectionCard
+          icon={Landmark}
+          title={t('settings.tabs.payment')}
+          subtitle={t('settings.payment.subtitle')}
+          actions={(
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={Play}
+              loading={runAuto.isPending}
+              disabled={payAuto.enabled === false && pendingCount === 0}
+              onClick={() => runAuto.mutate()}
+              title={t('settings.payment.autoRunHint')}
+            >
+              {t('settings.payment.autoRun')}
+            </Button>
+          )}
+        >
+          <div className="space-y-5">
+            {/*
+              Read from the server, not from this half-saved form: payment.methods()
+              is exactly what the reseller's wallet renders. A switch here and the
+              button he sees are two different things until the fields behind them
+              are complete, and this strip is where that difference shows up.
+            */}
+            <div className="grid gap-2 sm:grid-cols-2">
+              <Rail
+                icon={ShieldCheck}
+                label={t('settings.payment.zarinpal')}
+                state={payLive.zarinpal?.ready ? 'on' : payLive.zarinpal?.enabled ? 'warn' : 'off'}
+                hint={payLive.zarinpal?.ready
+                  ? t('settings.payment.railZarinpalOn')
+                  : payLive.zarinpal?.reason === 'no_public_url'
+                    ? t('settings.payment.railNoPublicUrl')
+                    : t('settings.payment.railZarinpalOff')}
+              />
+              <Rail
+                icon={Send}
+                label={t('settings.payment.blue')}
+                state={payLive.blue?.enabled ? (payLive.blue.hasAmountPlaceholder ? 'on' : 'warn') : 'off'}
+                hint={payLive.blue?.enabled
+                  ? (payLive.blue.hasAmountPlaceholder ? t('settings.payment.railBlueOn') : t('settings.payment.railBlueNoPlaceholder'))
+                  : t('settings.payment.railBlueOff')}
+              />
+              <Rail
+                icon={CreditCard}
+                label={t('settings.payment.cards')}
+                state={payLive.cards?.length ? 'on' : 'off'}
+                hint={payLive.cards?.length
+                  ? t('settings.payment.railCardsOn', { n: formatNumber(payLive.cards.length, lang) })
+                  : t('settings.payment.railCardsOff')}
+              />
+              <Rail
+                icon={Info}
+                label={t('settings.payment.receipt')}
+                state="on"
+                hint={t('settings.payment.railReceipt')}
+              />
+            </div>
+
+            <div>
+              <p className="mb-1 text-[12px] font-semibold text-slate-200">{t('settings.payment.cardsTitle')}</p>
+              <p className="mb-3 text-[10.5px] leading-5 text-slate-500">{t('settings.payment.cardsHint')}</p>
+              {payCards.length ? (
+                <div className="space-y-2">
+                  {payCards.map((card, index) => (
+                    <div key={index} className="grid items-end gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 sm:grid-cols-[minmax(0,190px)_minmax(0,130px)_minmax(0,120px)_1fr_auto]">
+                      <Field label={t('settings.payment.cardNumber')}>
+                        <Input
+                          dir="ltr"
+                          inputMode="text"
+                          enterKeyHint="next"
+                          value={card.number || ''}
+                          onChange={(e) => patchCard(index, 'number', e.target.value.replace(/[^\d]/g, '').slice(0, 16))}
+                          placeholder="6037701234567891"
+                        />
+                      </Field>
+                      <Field label={t('settings.payment.cardBank')}>
+                        <Input value={card.bank || ''} onChange={(e) => patchCard(index, 'bank', e.target.value)} placeholder="ملی" />
+                      </Field>
+                      <Field label={t('settings.payment.cardHolder')}>
+                        <Input value={card.holder || ''} onChange={(e) => patchCard(index, 'holder', e.target.value)} />
+                      </Field>
+                      <Field label={t('settings.payment.cardNote')} hint={t('settings.payment.cardNoteHint')}>
+                        <Input value={card.note || ''} onChange={(e) => patchCard(index, 'note', e.target.value)} />
+                      </Field>
+                      <button
+                        type="button"
+                        onClick={() => removeCard(index)}
+                        className="mb-1 flex h-9 w-9 items-center justify-center rounded-xl border border-white/[0.08] text-slate-400 transition hover:border-rose-400/40 hover:text-rose-200"
+                        title={t('settings.payment.removeCard')}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-3.5 py-3 text-[11.5px] text-slate-500">{t('settings.payment.noCardYet')}</p>
+              )}
+              <Button variant="secondary" size="sm" icon={Plus} className="mt-3" onClick={addCard} disabled={payCards.length >= 12}>
+                {t('settings.payment.addCard')}
+              </Button>
+            </div>
+
+            <div className="space-y-4 border-t border-white/[0.06] pt-4">
+              <SwitchRow
+                label={t('settings.payment.zarinpal')}
+                hint={t('settings.payment.zarinpalSwitchHint')}
+                checked={payment.zarinpalEnabled}
+                onChange={(value) => patch('payment', 'zarinpalEnabled', value)}
+              />
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field
+                  label={t('settings.payment.merchantId')}
+                  hint={payment.hasZarinpalMerchantId ? t('settings.payment.secretSaved') : t('settings.payment.merchantHint')}
+                >
+                  <Input
+                    dir="ltr"
+                    type="password"
+                    autoComplete="new-password"
+                    value={payment.zarinpalMerchantId || ''}
+                    onChange={(e) => patch('payment', 'zarinpalMerchantId', e.target.value)}
+                    placeholder={payment.hasZarinpalMerchantId ? '••••••••••••••••' : '00000000-0000-0000-0000-000000000000'}
+                  />
+                </Field>
+                <SwitchRow
+                  label={t('settings.payment.sandbox')}
+                  hint={t('settings.payment.sandboxHint')}
+                  checked={payment.zarinpalSandbox}
+                  onChange={(value) => patch('payment', 'zarinpalSandbox', value)}
+                />
+              </div>
+
+              <SwitchRow
+                label={t('settings.payment.blue')}
+                hint={t('settings.payment.blueSwitchHint')}
+                checked={payment.blueEnabled}
+                onChange={(value) => patch('payment', 'blueEnabled', value)}
+              />
+              <div className="grid gap-4 sm:grid-cols-[minmax(0,180px)_1fr]">
+                <Field label={t('settings.payment.blueLabel')}>
+                  <Input value={payment.blueLabel || ''} onChange={(e) => patch('payment', 'blueLabel', e.target.value)} placeholder="بلو بانک" />
+                </Field>
+                <Field
+                  label={t('settings.payment.blueLink')}
+                  hint={payment.hasBlueLink ? t('settings.payment.secretSaved') : t('settings.payment.blueLinkHint')}
+                >
+                  <Input
+                    dir="ltr"
+                    type="password"
+                    autoComplete="off"
+                    value={payment.blueLink || ''}
+                    onChange={(e) => patch('payment', 'blueLink', e.target.value)}
+                    placeholder={payment.hasBlueLink ? 'https://••••••••••••' : 'https://bluebank.ir/pay/xxxxx?amount={amount}'}
+                  />
+                </Field>
+              </div>
+              <p className="text-[10.5px] leading-5 text-slate-500">{t('settings.payment.publicUrlHint')}</p>
+            </div>
+
+            {/*
+              v1.5.4, item 3: زمان‌بندی تایید خودکار. Bounded on purpose, and the
+              ceiling is what makes it saveable at all — the route refuses the
+              switch with maxAmount = 0, so the field carries that rule into the
+              form instead of letting him press save and read an error.
+            */}
+            <div className="space-y-4 border-t border-white/[0.06] pt-4">
+              <SwitchRow
+                label={t('settings.payment.autoSwitch')}
+                hint={pendingCount
+                  ? t('settings.payment.autoSwitchPending', { n: formatNumber(pendingCount, lang) })
+                  : t('settings.payment.autoSwitchHint')}
+                checked={payment.autoApproveEnabled}
+                onChange={(value) => patch('payment', 'autoApproveEnabled', value)}
+              />
+              <div className="grid gap-2 sm:grid-cols-2">
+                <SwitchRow
+                  label={t('settings.payment.autoReceipt')}
+                  hint={t('settings.payment.autoReceiptHint')}
+                  checked={payment.autoApproveReceipt}
+                  onChange={(value) => patch('payment', 'autoApproveReceipt', value)}
+                />
+                <SwitchRow
+                  label={t('settings.payment.autoCard')}
+                  hint={t('settings.payment.autoCardHint')}
+                  checked={payment.autoApproveCard}
+                  onChange={(value) => patch('payment', 'autoApproveCard', value)}
+                />
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <Field label={t('settings.payment.autoAfter')} hint="1 – 1440">
+                  <Input type="number" min="1" max="1440" dir="ltr" value={payment.autoApproveAfterMinutes ?? 15} onChange={(e) => patch('payment', 'autoApproveAfterMinutes', e.target.value)} />
+                </Field>
+                <Field label={t('settings.payment.autoMax')} hint={t('settings.payment.autoMaxHint')}>
+                  <Input type="number" min="0" dir="ltr" value={payment.autoApproveMaxAmount ?? 0} onChange={(e) => patch('payment', 'autoApproveMaxAmount', e.target.value)} />
+                </Field>
+                <Field label={t('settings.payment.autoDaily')} hint={t('settings.payment.autoDailyHint')}>
+                  <Input type="number" min="0" max="100" dir="ltr" value={payment.autoApproveDailyLimit ?? 0} onChange={(e) => patch('payment', 'autoApproveDailyLimit', e.target.value)} />
+                </Field>
+                <Field label={t('settings.payment.autoInterval')} hint="1 – 60">
+                  <Input type="number" min="1" max="60" dir="ltr" value={payment.autoApproveIntervalMinutes ?? 1} onChange={(e) => patch('payment', 'autoApproveIntervalMinutes', e.target.value)} />
+                </Field>
+              </div>
+              {payAuto.enabled ? (
+                <p className="rounded-xl border border-emerald-400/20 bg-emerald-500/[0.06] px-3.5 py-2.5 text-[11px] leading-6 text-emerald-100/90">
+                  {t('settings.payment.autoLive', {
+                    after: formatNumber(payAuto.afterMinutes, lang),
+                    max: formatNumber(payAuto.maxAmount, lang),
+                    every: formatNumber(payAuto.intervalMinutes, lang),
+                    daily: payAuto.dailyLimit ? formatNumber(payAuto.dailyLimit, lang) : t('common.unlimited'),
+                  })}
+                </p>
+              ) : (
+                <p className="rounded-xl border border-amber-400/20 bg-amber-500/[0.06] px-3.5 py-2.5 text-[11px] leading-6 text-amber-100/90">
+                  {t('settings.payment.autoOffNow')}
+                </p>
+              )}
+            </div>
+
+            <SaveBar
+              saving={savingSection === 'payment'}
+              onSave={() => save.mutate({ section: 'payment', payload: payment })}
+              extra={payLive.cards?.length ? (
+                <span className="hidden items-center gap-1.5 text-[10.5px] text-emerald-300/80 sm:inline-flex">
+                  <CreditCard className="h-3.5 w-3.5" />
+                  {t('settings.payment.railCardsOn', { n: formatNumber(payLive.cards.length, lang) })}
+                </span>
+              ) : null}
             />
           </div>
         </SectionCard>

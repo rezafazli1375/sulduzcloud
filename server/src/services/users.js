@@ -91,9 +91,22 @@ function listUsers({ search = '', status = '', role = '', page = 1, pageSize = 2
   const rows = db.prepare(
     `SELECT u.* FROM users u ${clause} ORDER BY u.role = 'admin' DESC, u.id DESC LIMIT ? OFFSET ?`
   ).all(...params, Number(pageSize), (Number(page) - 1) * Number(pageSize));
+  const referrerNames = new Map(
+    db.prepare('SELECT id, username FROM users WHERE id IN (SELECT DISTINCT referrer_id FROM users WHERE referrer_id > 0)')
+      .all()
+      .map((one) => [Number(one.id), String(one.username || '')])
+  );
   return {
     total,
-    rows: rows.map((row) => ({ ...sanitizeUser(row), stats: userStats(row.id) })),
+    // v1.5.4: the admin's reseller table shows WHO referred whom, so the name is
+    // resolved here in one query rather than the UI firing a request per row. A
+    // referrer who was deleted still gets his name printed — the commission that
+    // was paid to him is history, and history should not be anonymous.
+    rows: rows.map((row) => ({
+      ...sanitizeUser(row),
+      referrerName: referrerNames.get(Number(row.referrer_id || 0)) || '',
+      stats: userStats(row.id),
+    })),
   };
 }
 
@@ -152,6 +165,24 @@ function validateUserPayload(data, { partial = false } = {}) {
     out.status = data.status;
   }
   if (data.lang !== undefined) out.lang = data.lang === 'en' ? 'en' : 'fa';
+  // v1.5.4, item 6: پورسانت. The pair is stored on the referred reseller: WHO
+  // brought him, and at what rate. 0 for either means "use the fleet default",
+  // which is how the owner leaves most resellers; the number he sets here is
+  // clamped to 50 because a percentage above that is a mistake, not a deal.
+  if (data.referrer_id !== undefined || data.referrerId !== undefined) {
+    const raw = data.referrer_id ?? data.referrerId;
+    const n = Math.round(Number(raw || 0));
+    if (!Number.isFinite(n) || n < 0) throw new ApiError(422, 'invalid_referrer', 'referrer id must be a non-negative number');
+    out.referrer_id = n;
+  }
+  if (data.commission_percent !== undefined || data.commissionPercent !== undefined) {
+    const raw = data.commission_percent ?? data.commissionPercent;
+    const n = Math.round(Number(raw || 0));
+    if (!Number.isFinite(n) || n < 0 || n > 50) {
+      throw new ApiError(422, 'invalid_commission_percent', 'نرخ پورسانت باید بین ۰ تا ۵۰ باشد / Commission percent must be 0-50');
+    }
+    out.commission_percent = n;
+  }
   if (data.permissions !== undefined) out.permissions = normalizePermissions(data.permissions, out.role || data.role || 'reseller');
   for (const field of ['max_configs', 'max_total_gb', 'max_gb_per_config', 'max_days_per_config', 'balance']) {
     if (data[field] !== undefined) {
@@ -206,6 +237,7 @@ function reviveUser(id, clean, req) {
        username = ?, password_hash = ?, role = ?, name = ?, email = ?, phone = ?, telegram_id = ?, import_configs = ?,
        status = ?, lang = ?, permissions = ?, max_configs = ?, max_total_gb = ?, max_gb_per_config = ?,
        max_days_per_config = ?, allowed_inbounds = ?, fixed_inbound = ?, balance = ?, note = ?,
+       referrer_id = ?, commission_percent = ?,
        deleted_at = 0, token_version = token_version + 1, updated_at = ?
      WHERE id = ?`
   ).run(
@@ -230,6 +262,10 @@ function reviveUser(id, clean, req) {
     keep('fixed_inbound', Number(previous.fixed_inbound || 0)),
     keep('balance', previous.balance),
     keep('note', previous.note),
+    // v1.5.4: a revived account keeps the referral it was deleted with, unless
+    // this save names a different one.
+    referrerOf(keep('referrer_id', previous.referrer_id), id),
+    keep('commission_percent', previous.commission_percent),
     now,
     Number(id)
   );
@@ -240,6 +276,30 @@ function reviveUser(id, clean, req) {
     .run(Number(id), previous.deleted_at).changes;
   audit(req, 'user.revive', 'user', Number(id), { username: clean.username, role: keep('role', previous.role), restoredConfigs: restored });
   return db.prepare('SELECT * FROM users WHERE id = ?').get(Number(id));
+}
+
+/**
+ * v1.5.4, item 6: the referrer behind a reseller's `referrer_id`.
+ *
+ * A referral is a claim about where a customer-acquiring person came from, so it
+ * is checked rather than trusted: 0 (nobody) always passes, a missing or deleted
+ * referrer is refused rather than silently stored, and pointing at yourself is
+ * refused because it would mean a wallet paying itself out of every purchase.
+ *
+ * What is deliberately NOT checked is a cycle between two resellers who refer
+ * each other. That is a real arrangement, not a bug: a commission is a credit,
+ * credits never earn commissions (see configs.js commissionFor), so a two-way
+ * pair just pays each other on their own spending and nothing can loop.
+ */
+function referrerOf(value, selfId = null) {
+  const id = Math.round(Number(value || 0));
+  if (!Number.isFinite(id) || id <= 0) return 0;
+  if (selfId !== null && id === Number(selfId)) {
+    throw new ApiError(422, 'self_referral', 'یک نماینده نمی‌تواند معرف خودش باشد / A reseller cannot be his own referrer');
+  }
+  const row = getDb().prepare('SELECT id, username, deleted_at FROM users WHERE id = ?').get(id);
+  if (!row || row.deleted_at) throw new ApiError(422, 'unknown_referrer', 'نماینده معرف پیدا نشد / Referrer reseller not found');
+  return Number(row.id);
 }
 
 function createUser(data, req) {
@@ -260,8 +320,8 @@ function createUser(data, req) {
   const info = db.prepare(
     `INSERT INTO users (username, password_hash, role, name, email, phone, telegram_id, import_configs, status, lang, permissions,
       max_configs, max_total_gb, max_gb_per_config, max_days_per_config, allowed_inbounds, fixed_inbound,
-      balance, api_key, note, token_version, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+      balance, api_key, note, referrer_id, commission_percent, token_version, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   ).run(
     clean.username,
     hashPassword(clean.password),
@@ -283,6 +343,10 @@ function createUser(data, req) {
     Number(clean.balance || 0),
     null,
     clean.note || '',
+    // v1.5.4: a reseller created with his referrer already attached earns his
+    // first sale the commission — which is the point of writing it at creation.
+    referrerOf(clean.referrer_id, null),
+    Number(clean.commission_percent || 0),
     now,
     now
   );
@@ -291,8 +355,7 @@ function createUser(data, req) {
   return row;
 }
 
-function updateUser(id, data, req) {
-  const db = getDb();
+function updateUser(id, data, req) {  const db = getDb();
   const current = getUser(id);
   if (!current) throw new ApiError(404, 'not_found', 'User not found');
   const clean = validateUserPayload(data, { partial: true });
@@ -325,6 +388,11 @@ function updateUser(id, data, req) {
   for (const key of ['max_configs', 'max_total_gb', 'max_gb_per_config', 'max_days_per_config', 'balance']) {
     if (clean[key] !== undefined) assign(key, clean[key]);
   }
+  // v1.5.4: the referral pair. referrer_id is resolved through referrerOf, so
+  // pointing at a deleted account or at yourself is refused here rather than
+  // becoming a commission that silently never pays.
+  if (clean.referrer_id !== undefined) assign('referrer_id', referrerOf(clean.referrer_id, id));
+  if (clean.commission_percent !== undefined) assign('commission_percent', clean.commission_percent);
   // The fixed inbound is the guaranteed base of this reseller's packages, so it
   // must never end up outside an explicit allow list — whichever half of the
   // pair the admin edited. An empty list means "everything visible" anyway.

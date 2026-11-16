@@ -27,6 +27,7 @@ import {
   PageHeader,
   Pagination,
   SectionCard,
+  Select,
   Skeleton,
   Tabs,
   Textarea,
@@ -36,6 +37,19 @@ import { useToast } from '../../components/feedback.jsx';
 
 const STATUS_TONE = { pending: 'amber', approved: 'emerald', rejected: 'rose' };
 const STATUS_KEY = { pending: 'topups.pending', approved: 'topups.approved', rejected: 'topups.rejected' };
+
+// v1.5.4: money now arrives four ways, and the schedule can decide without a
+// person. The API sends a Persian `methodLabel` for the bot and the ledger; the
+// panel translates the code instead, so the English screen is not overwritten by
+// a server-side string.
+const METHOD_KEY = {
+  receipt: 'topups.mReceipt',
+  card: 'topups.mCard',
+  blue: 'topups.mBlue',
+  zarinpal: 'topups.mZarinpal',
+};
+const METHOD_TONE = { receipt: 'blue', card: 'violet', blue: 'cyan', zarinpal: 'emerald' };
+const METHOD_LIST = ['receipt', 'card', 'blue', 'zarinpal'];
 
 /** The receipt itself, proxied by the panel — the bot token never reaches here. */
 function ReceiptImage({ id, kind, className }) {
@@ -139,13 +153,42 @@ function DecideModal({ open, onClose, request, mode }) {
             <span className="text-slate-500">{t('topups.currentBalance')}</span>
             <b className="ms-2 text-slate-100">{formatMoney(request.balance || 0, lang)}</b>
           </div>
+          <div className="flex items-center rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2 text-[11.5px]">
+            <span className="text-slate-500">{t('topups.method')}</span>
+            <Badge tone={METHOD_TONE[request.method] || 'slate'} className="ms-2">
+              {t(METHOD_KEY[request.method] || 'topups.mReceipt')}
+            </Badge>
+          </div>
+          {request.cardNumber ? (
+            <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2 text-[11.5px]">
+              <span className="text-slate-500">{t('topups.cardNumber')}</span>
+              <b className="ms-2 font-mono text-slate-100" dir="ltr">{request.cardNumber}</b>
+            </div>
+          ) : null}
+          {request.reference ? (
+            <div className="rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2 text-[11.5px]">
+              <span className="text-slate-500">{t('topups.reference')}</span>
+              <b className="ms-2 font-mono text-slate-100" dir="ltr">{request.reference}</b>
+            </div>
+          ) : null}
         </div>
+        {request.autoApproved ? (
+          <p className="rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 text-[11px] leading-5 text-cyan-200">
+            {t('topups.autoNote')}
+          </p>
+        ) : null}
         {viewing ? (
           <div className="space-y-2 rounded-xl border border-white/[0.07] bg-white/[0.02] p-3 text-[11.5px]">
             <div className="flex items-center justify-between gap-2">
               <span className="text-slate-500">{t('common.status')}</span>
               <Badge tone={STATUS_TONE[request.status] || 'slate'} dot>
                 {t(STATUS_KEY[request.status] || 'topups.all')}
+              </Badge>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-slate-500">{t('topups.decision')}</span>
+              <Badge tone={request.autoApproved ? 'cyan' : 'slate'}>
+                {t(request.autoApproved ? 'topups.dAuto' : 'topups.dManual')}
               </Badge>
             </div>
             <div className="flex items-center justify-between gap-2">
@@ -201,6 +244,11 @@ export default function Topups() {
   const { can } = useAuth();
   const queryClient = useQueryClient();
   const [status, setStatus] = useState('pending');
+  // v1.5.4: two more ways to slice the same list — how the money came in, and
+  // whether a person or the schedule decided it. The nightly auto-approval
+  // notice points the admin here, so the filter has to exist.
+  const [method, setMethod] = useState('');
+  const [decision, setDecision] = useState('');
   const [page, setPage] = useState(1);
   const [decide, setDecide] = useState(null);
   // /admin/bot needs the settings permission; an admin who only manages users
@@ -208,8 +256,10 @@ export default function Topups() {
   const canBot = can('settings');
 
   const listQuery = useQuery({
-    queryKey: ['admin', 'topups', status, page],
-    queryFn: () => api.get(`/admin/topups?status=${status === 'all' ? '' : status}&page=${page}&pageSize=20`),
+    queryKey: ['admin', 'topups', status, method, decision, page],
+    queryFn: () => api.get(
+      `/admin/topups?status=${status === 'all' ? '' : status}&method=${method}&decision=${decision}&page=${page}&pageSize=20`
+    ),
     refetchInterval: 30000,
   });
 
@@ -246,7 +296,7 @@ export default function Topups() {
     { value: 'all', label: t('topups.all') },
   ]), [counts, lang, t]);
 
-  useEffect(() => { setPage(1); }, [status]);
+  useEffect(() => { setPage(1); }, [status, method, decision]);
 
   return (
     <>
@@ -267,6 +317,37 @@ export default function Topups() {
           bodyClass="p-0"
           actions={<Tabs tabs={tabs} active={status} onChange={setStatus} />}
         >
+          {/* v1.5.4: the receipts page is no longer only Telegram photos. Four
+              ways money arrives and two kinds of decision, so the admin needs a
+              way to look at one of them — the auto-approval notice tells him to
+              review "the approved by machine" rows by hand. */}
+          <div className="flex flex-wrap items-end gap-3 border-b border-white/[0.05] px-4 py-3">
+            <label className="text-[10.5px] text-slate-500">
+              <span className="mb-1 block">{t('topups.method')}</span>
+              <Select
+                value={method}
+                onChange={(e) => setMethod(e.target.value)}
+                className="min-w-[160px] py-1.5 text-[11.5px]"
+              >
+                <option value="">{t('topups.allMethods')}</option>
+                {METHOD_LIST.map((value) => (
+                  <option key={value} value={value}>{t(METHOD_KEY[value])}</option>
+                ))}
+              </Select>
+            </label>
+            <label className="text-[10.5px] text-slate-500">
+              <span className="mb-1 block">{t('topups.decision')}</span>
+              <Select
+                value={decision}
+                onChange={(e) => setDecision(e.target.value)}
+                className="min-w-[160px] py-1.5 text-[11.5px]"
+              >
+                <option value="">{t('topups.allDecisions')}</option>
+                <option value="auto">{t('topups.dAuto')}</option>
+                <option value="manual">{t('topups.dManual')}</option>
+              </Select>
+            </label>
+          </div>
           {listQuery.isLoading ? (
             <div className="space-y-2 p-4">
               <Skeleton className="h-24" />
@@ -282,6 +363,12 @@ export default function Topups() {
                     <Badge tone={STATUS_TONE[row.status] || 'slate'} dot>
                       {t(STATUS_KEY[row.status] || 'topups.all')}
                     </Badge>
+                    <Badge tone={METHOD_TONE[row.method] || 'slate'}>
+                      {t(METHOD_KEY[row.method] || 'topups.mReceipt')}
+                    </Badge>
+                    {row.autoApproved ? (
+                      <Badge tone="cyan">{t('topups.dAuto')}</Badge>
+                    ) : null}
                     <span className="text-[11px] text-slate-500">#{row.id}</span>
                     <Link to="/resellers" className="min-w-0 truncate text-[12.5px] font-semibold text-slate-100 hover:text-emerald-200">
                       {row.username || `#${row.userId}`}
@@ -304,6 +391,22 @@ export default function Topups() {
                       <>
                         <span>·</span>
                         <span>{row.fileKind === 'photo' ? t('topups.photo') : t('topups.document')}</span>
+                      </>
+                    ) : null}
+                    {row.cardNumber ? (
+                      <>
+                        <span>·</span>
+                        <span>
+                          {t('topups.cardNumber')}: <b className="font-mono text-slate-300" dir="ltr">{row.cardNumber}</b>
+                        </span>
+                      </>
+                    ) : null}
+                    {row.reference ? (
+                      <>
+                        <span>·</span>
+                        <span>
+                          {t('topups.reference')}: <b className="font-mono text-slate-300" dir="ltr">{row.reference}</b>
+                        </span>
                       </>
                     ) : null}
                     {row.status !== 'pending' ? (

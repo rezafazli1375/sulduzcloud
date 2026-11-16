@@ -52,6 +52,27 @@ function notifyAll(payload) {
   return count;
 }
 
+/**
+ * Unread notifications of ONE type for one user (v1.5.4, item 5).
+ *
+ * The reseller's sidebar badge asks for `broadcast` specifically, because that is
+ * the type the owner's own /broadcast endpoint writes. Counting every unread row
+ * would put a red number in front of him for system noise he has already read
+ * about in his tickets and invoices — the number he asked for is "messages from
+ * the owner that nobody has opened yet", and this is exactly that query.
+ *
+ * A deduped or refused insert (insertNotification returning null) never reaches
+ * this count, so a badge cannot double for one message.
+ */
+function unreadByType(userId, type = 'broadcast') {
+  const db = getDb();
+  return Number(
+    db
+      .prepare('SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND type = ? AND read_at = 0')
+      .get(Number(userId), String(type)).c || 0
+  );
+}
+
 function smtpTransport() {
   const smtp = getSetting('smtp');
   if (!smtp.enabled || !smtp.host) return null;
@@ -240,6 +261,11 @@ function listNotifications(userId, { page = 1, pageSize = 30, unreadOnly = false
   return {
     total,
     unread,
+    // v1.5.4, item 5: the red badge in front of «اعلان‌ها» in the reseller panel
+    // counts ONLY the owner's own broadcast messages, not every unread row. The
+    // sidebar polls this same endpoint, so the number arrives with the list it
+    // belongs to and one request stays one request.
+    unreadBroadcast: unreadByType(userId, 'broadcast'),
     rows: rows.map((r) => ({
       id: r.id,
       type: r.type,
@@ -268,6 +294,7 @@ module.exports = {
   notifyUser,
   notifyAdmins,
   notifyAll,
+  unreadByType,
   sendMail,
   sendSms,
   testEmail,

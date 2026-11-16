@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const config = require('./config');
+const brand = require('./brand');
 const { getDb } = require('./db');
 const { encryptSecret, decryptSecret, isEncrypted, maskSecret } = require('./crypto');
 const { safeJsonParse } = require('./utils');
@@ -11,7 +12,23 @@ const SECRET_FIELDS = {
   smtp: ['pass'],
   sms: ['apiKey'],
   telegram: ['botToken'],
+  // v1.5.4: a ZarinPal merchant id and a Blue Bank payment link are credentials of
+  // the owner's own money accounts. They are stored encrypted and handed back to
+  // the admin form masked, exactly like the bot token.
+  payment: ['zarinpalMerchantId', 'blueLink'],
 };
+
+// v1.5.4: fields the panel refuses to change, whoever asks. The brand name is the
+// one thing the owner wants identical on every install of this software, so it is
+// a constant in src/brand.js rather than a setting — and it is stripped from every
+// write, so even a direct API call cannot rename the panel.
+const LOCKED_FIELDS = {
+  general: ['panelName'],
+};
+
+function isLocked(section, field) {
+  return (LOCKED_FIELDS[section] || []).includes(field);
+}
 
 // v1.4.13 removed the SMS pattern/template feature. These keys can still be
 // present in a settings row written by an older panel; they are dropped on read
@@ -20,7 +37,8 @@ const LEGACY_SMS_KEYS = ['mode', 'pattern', 'patternVar1', 'patternVar2', 'patte
 
 const DEFAULTS = {
   general: {
-    panelName: 'Sulduz Cloud',
+    // Not editable: src/brand.js answers this one (v1.5.4).
+    panelName: brand.PANEL_NAME,
     tagline: 'پنل مدیریت نمایندگی‌های سرویس',
     description: 'سیستم مدیریت کانفیگ و نمایندگی',
     supportUrl: '',
@@ -80,6 +98,39 @@ const DEFAULTS = {
   billing: {
     enabled: false,
     currency: 'تومان',
+    // v1.5.4: پورسانت — the share of what one reseller pays that goes to the
+    // reseller who brought him. 0 keeps the whole feature off; a reseller may
+    // carry his own percentage (users.commission_percent), which wins here.
+    commissionPercent: 0,
+    commissionCapPercent: 50,
+  },
+  // v1.5.4: how a reseller puts money into his wallet.
+  //
+  //   cards         — the owner's own card numbers, shown to every reseller for
+  //                   فیش واریزی and کارت به کارت;
+  //   zarinpal*     — the ZarinPal REST API v4 (request → StartPay → callback →
+  //                   verify). The merchant id is a credential;
+  //   blueLink      — بلو بانک publishes no payment API, so this is the prepared
+  //                   link the owner made inside his own بلو account. `{amount}`
+  //                   in it is replaced with the amount in rials so the reseller
+  //                   only has to tap and confirm;
+  //   autoApprove*  — the scheduled release of pending receipts and
+  //                   card-to-card claims, see services/topups.js.
+  payment: {
+    cards: [],
+    zarinpalEnabled: false,
+    zarinpalMerchantId: '',
+    zarinpalSandbox: false,
+    blueEnabled: false,
+    blueLink: '',
+    blueLabel: 'بلو بانک',
+    autoApproveEnabled: false,
+    autoApproveReceipt: true,
+    autoApproveCard: true,
+    autoApproveAfterMinutes: 15,
+    autoApproveMaxAmount: 0,
+    autoApproveDailyLimit: 0,
+    autoApproveIntervalMinutes: 1,
   },
   backup: {
     auto: true,
@@ -114,6 +165,31 @@ const DEFAULTS = {
     loginRateLimit: 10,
   },
 };
+
+// v1.5.4: the owner can publish several of his own card numbers, so a reseller
+// picks the one he actually paid into and the receipt says so. A card number is
+// not a secret (it is what money is sent TO), so it is stored plainly and handed
+// to the reseller panel as it is.
+const MAX_CARDS = 12;
+
+function normalizeCards(value) {
+  const list = Array.isArray(value) ? value : [];
+  const out = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object') continue;
+    const number = String(entry.number || '').replace(/[\s-]/g, '');
+    if (!/^\d{10,24}$/.test(number)) continue;
+    if (out.some((card) => card.number === number)) continue;
+    out.push({
+      holder: String(entry.holder || '').trim().slice(0, 60),
+      number,
+      bank: String(entry.bank || '').trim().slice(0, 40),
+      note: String(entry.note || '').trim().slice(0, 120),
+    });
+    if (out.length >= MAX_CARDS) break;
+  }
+  return out;
+}
 
 function extractToken(raw) {
   if (!raw) return '';
@@ -168,6 +244,12 @@ function getSetting(key) {
   const raw = rawGet(key);
   const parsed = raw ? safeJsonParse(raw, {}) : {};
   const merged = { ...structuredCloneSafe(DEFAULTS[key]), ...decryptSection(key, parsed) };
+  // The brand name is code, not data (v1.5.4): whatever an old row says, the
+  // panel is called what src/brand.js says. Doing it on read means a database
+  // written by an earlier version — or edited by hand — cannot rename the panel
+  // either, and every consumer (meta, bot footer, reports, SMS) agrees.
+  if (key === 'general') merged.panelName = brand.PANEL_NAME;
+  if (key === 'payment') merged.cards = normalizeCards(merged.cards);
   if (key !== 'sms') return merged;
 
   // Per-event merge so an event added in a later version never wipes the
@@ -193,8 +275,27 @@ function structuredCloneSafe(value) {
 function setSetting(key, obj) {
   const current = getSetting(key);
   const next = { ...current, ...(obj || {}) };
+  for (const field of LOCKED_FIELDS[key] || []) next[field] = current[field];
   rawSet(key, encryptSection(key, next));
   return getSetting(key);
+}
+
+/**
+ * The one rule for a secret field a settings form has handed back.
+ *
+ * Secrets never leave the panel in the clear (see redactSection), so the admin
+ * form shows an empty box with "saved — leaving this empty keeps what is stored"
+ * under it. That means an empty — or all-bullets — submission is "I did not touch
+ * this field", not "erase it". updateSection below and every guard that reads the
+ * payment section before saving have to use this one rule, or the two disagree and
+ * a real credential makes the tab unsavable: the guard would see the form's own
+ * blank merchant id and answer "gateway on, no credentials" forever.
+ */
+function isUnchangedSecret(key, field, value) {
+  if (!(SECRET_FIELDS[key] || []).includes(field)) return false;
+  if (value === undefined || value === null) return true;
+  const text = String(value).trim();
+  return text === '' || text === maskSecret() || /^\u2022+$/.test(text);
 }
 
 function updateSection(key, patch, { keepSecrets = true } = {}) {
@@ -202,12 +303,11 @@ function updateSection(key, patch, { keepSecrets = true } = {}) {
   const next = { ...current };
   for (const [field, value] of Object.entries(patch || {})) {
     if (!(field in DEFAULTS[key])) continue;
-    const secret = (SECRET_FIELDS[key] || []).includes(field);
-    if (secret && keepSecrets && (value === undefined || value === null || value === '' || value === maskSecret())) {
-      continue;
-    }
+    if (isLocked(key, field)) continue;
+    if (keepSecrets && isUnchangedSecret(key, field, value)) continue;
     next[field] = value;
   }
+  if (key === 'payment') next.cards = normalizeCards(next.cards);
   rawSet(key, encryptSection(key, next));
   return getSetting(key);
 }
@@ -320,6 +420,7 @@ function allRedacted() {
     smtp: redactSection('smtp', getSetting('smtp')),
     sms: redactSection('sms', getSetting('sms')),
     billing: redactSection('billing', getSetting('billing')),
+    payment: redactSection('payment', getSetting('payment')),
     backup: redactSection('backup', getSetting('backup')),
     telegram: redactSection('telegram', getSetting('telegram')),
     security: redactSection('security', getSetting('security')),
@@ -330,12 +431,17 @@ module.exports = {
   DEFAULTS,
   SECRET_FIELDS,
   LEGACY_SMS_KEYS,
+  LOCKED_FIELDS,
+  MAX_CARDS,
+  isLocked,
+  normalizeCards,
   extractToken,
   ensureDefaults,
   migrateSmsShape,
   getSetting,
   setSetting,
   updateSection,
+  isUnchangedSecret,
   redactSection,
   publicMeta,
   allRedacted,

@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import React, { useEffect, useRef, useState } from 'react';
+import { useLocation } from 'react-router-dom';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowDownLeft,
   ArrowUpRight,
@@ -10,14 +11,18 @@ import {
   Wallet as WalletIcon,
 } from 'lucide-react';
 import { useAuth } from '../../lib/auth.jsx';
-import { useI18n } from '../../lib/i18n.jsx';
+import { translateError, useI18n } from '../../lib/i18n.jsx';
 import { api } from '../../lib/api.js';
 import { formatDate, formatMoney, formatNumber, relativeTime } from '../../lib/format.js';
+import { useToast } from '../../components/feedback.jsx';
 import {
   Badge,
+  Button,
   CopyButton,
   EmptyState,
   ErrorState,
+  Field,
+  Input,
   PageHeader,
   Pagination,
   SectionCard,
@@ -146,10 +151,267 @@ function BotTopup() {
   );
 }
 
+/**
+ * v1.5.4 — پرداخت واقعی. The owner asked for زرین‌پال, a ready بلو link and
+ * several card numbers for فیش / کارت به کارت, and all of them live here in one
+ * panel with one rule repeated on every tab: pressing a button here either opens
+ * the bank's own page or files a CLAIM. Only the wallet owner (the admin, or the
+ * schedule he configured) turns a claim into money — except زرین‌پال, whose
+ * server-to-server verify is real proof and does credit on its own.
+ *
+ * That distinction is written into the copy on purpose. A reseller who is told
+ * "پرداخت شما ثبت شد" for a receipt he has not sent yet will call the owner; a
+ * reseller who is told "در انتظار تایید مدیر" knows what to wait for.
+ */
+function PayMethods({ currency }) {
+  const { t, lang } = useI18n();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const [amount, setAmount] = useState('');
+  const [method, setMethod] = useState('');
+  const [cardNumber, setCardNumber] = useState('');
+  const [reference, setReference] = useState('');
+  const [note, setNote] = useState('');
+  const [blueLink, setBlueLink] = useState(null);
+
+  const { data: methods } = useQuery({
+    queryKey: ['payments', 'methods'],
+    queryFn: () => api.get('/reseller/payments/methods'),
+    staleTime: 60000,
+  });
+
+  const cards = methods?.cards || [];
+  const claimable = cards.length ? ['receipt', 'card'] : ['receipt'];
+  const options = [
+    ...(methods?.zarinpal?.enabled ? [{ key: 'zarinpal', label: t('pay.zarinpal'), ready: methods.zarinpal.ready, reason: methods.zarinpal.reason }] : []),
+    ...(methods?.blue?.enabled ? [{ key: 'blue', label: t('pay.blue', { name: methods.blue.label }), ready: true }] : []),
+    ...(cards.length ? [{ key: 'card', label: t('pay.card'), ready: true }] : []),
+    { key: 'receipt', label: t('pay.receipt'), ready: true },
+  ];
+
+  // Whichever tab is available first becomes the active one, and a tab that
+  // disappears (the owner switched off بلو) cannot stay selected.
+  const active = options.some((option) => option.key === method) ? method : (options[0]?.key || 'receipt');
+
+  useEffect(() => {
+    setCardNumber((current) => (cards.some((card) => card.number === current) ? current : (cards[0]?.number || '')));
+  }, [cards.length]);
+
+  const numericAmount = Number(String(amount).replace(/[^\d]/g, '') || 0);
+
+  const claim = useMutation({
+    mutationFn: (payload) => api.post('/reseller/payments/claim', payload),
+    onSuccess: (data) => {
+      toast.success(t('pay.claimedHint', { id: data?.request?.id || '' }), { title: t('pay.claimed') });
+      setReference('');
+      setNote('');
+      setBlueLink(null);
+      queryClient.invalidateQueries({ queryKey: ['wallet'] });
+      queryClient.invalidateQueries({ queryKey: ['payments', 'orders'] });
+      queryClient.invalidateQueries({ queryKey: ['notifications'] });
+    },
+    onError: (err) => toast.error(translateError(err, t), { title: t('common.failed') }),
+  });
+
+  const gateway = useMutation({
+    mutationFn: () => api.post('/reseller/payments/zarinpal/start', { amount: numericAmount }),
+    onSuccess: (data) => {
+      // Leaving the SPA is the point: the bank page must not be inside an iframe
+      // and the callback is a plain server-rendered page, not a route here.
+      if (data?.paymentUrl) window.location.assign(data.paymentUrl);
+    },
+    onError: (err) => toast.error(translateError(err, t), { title: t('common.failed') }),
+  });
+
+  const blue = useMutation({
+    mutationFn: () => api.get(`/reseller/payments/blue?amount=${numericAmount}`),
+    onSuccess: (data) => setBlueLink(data),
+    onError: (err) => toast.error(translateError(err, t), { title: t('common.failed') }),
+  });
+
+  const needAmount = () => {
+    if (numericAmount <= 0) {
+      toast.warning(t('pay.needAmount'));
+      return false;
+    }
+    return true;
+  };
+
+  if (!methods) return null;
+
+  return (
+    <SectionCard icon={CreditCard} title={t('pay.title')} subtitle={t('pay.subtitle')}>
+      <div className="grid gap-3 sm:grid-cols-[minmax(0,240px)_1fr]">
+        <Field label={t('pay.amount')} hint={t('pay.amountHint', { currency })}>
+          <Input
+            value={amount}
+            onChange={(event) => setAmount(event.target.value.replace(/[^\d]/g, ''))}
+            inputMode="text"
+            enterKeyHint="done"
+            dir="ltr"
+            placeholder="100000"
+          />
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {[50000, 100000, 200000, 500000, 1000000].map((step) => (
+              <button
+                key={step}
+                type="button"
+                onClick={() => setAmount(String(step))}
+                className="rounded-lg border border-white/[0.08] bg-white/[0.04] px-2 py-1 text-[10.5px] font-semibold text-slate-300 transition hover:border-emerald-400/40 hover:text-white"
+                dir="ltr"
+              >
+                {formatNumber(step, lang)}
+              </button>
+            ))}
+          </div>
+        </Field>
+
+        <div>
+          <div className="mb-3 flex flex-wrap gap-1.5">
+            {options.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                onClick={() => setMethod(option.key)}
+                className={cx(
+                  'rounded-xl border px-3 py-1.5 text-[11.5px] font-semibold transition',
+                  active === option.key
+                    ? 'border-emerald-400/50 bg-emerald-500/15 text-emerald-200'
+                    : 'border-white/[0.08] bg-white/[0.04] text-slate-300 hover:border-emerald-400/30 hover:text-white'
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          {active === 'zarinpal' ? (
+            <div className="space-y-3">
+              {options.find((option) => option.key === 'zarinpal')?.ready ? (
+                <>
+                  <p className="text-[11.5px] leading-6 text-slate-400">{t('pay.zarinpalHint')}</p>
+                  <Button variant="primary" onClick={() => { if (needAmount()) gateway.mutate(); }} loading={gateway.isPending}>
+                    {t('pay.payNow', { currency })}
+                  </Button>
+                </>
+              ) : (
+                <p className="text-[11.5px] leading-6 text-amber-300/90">{t('pay.zarinpalNotReady')}</p>
+              )}
+            </div>
+          ) : null}
+
+          {active === 'blue' ? (
+            <div className="space-y-3">
+              <p className="text-[11.5px] leading-6 text-slate-400">{t('pay.blueHint', { name: methods.blue?.label || 'بلو' })}</p>
+              {!blueLink ? (
+                <Button variant="secondary" onClick={() => { if (needAmount()) blue.mutate(); }} loading={blue.isPending}>
+                  {t('pay.blueGetLink')}
+                </Button>
+              ) : (
+                <div className="space-y-2 rounded-xl border border-white/[0.06] bg-white/[0.03] p-3">
+                  <p className="text-[11px] text-slate-400">
+                    {t('pay.amount')} <span className="font-semibold text-slate-100" dir="ltr">{formatNumber(blueLink.amount, lang)} {currency}</span>
+                    {' · '}<span dir="ltr">{t('pay.rial')} {formatNumber(blueLink.rial, lang)}</span>
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <a href={blueLink.link} target="_blank" rel="noreferrer" className="btn btn-primary inline-flex h-9 items-center gap-2 px-4 text-[11.5px]">
+                      <Send className="h-4 w-4" />
+                      {t('pay.blueOpen')}
+                    </a>
+                    <CopyButton value={blueLink.link} label={t('pay.blueCopy')} />
+                  </div>
+                  <p className="text-[10.5px] leading-5 text-slate-500">
+                    {blueLink.prefilled ? t('pay.bluePrefilled') : t('pay.blueManualAmount')}
+                  </p>
+                </div>
+              )}
+            </div>
+          ) : null}
+
+          {(active === 'card' || active === 'receipt') ? (
+            <div className="space-y-3">
+              {cards.length ? (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {cards.map((card) => (
+                    <button
+                      key={card.number}
+                      type="button"
+                      onClick={() => setCardNumber(card.number)}
+                      className={cx(
+                        'rounded-xl border p-3 text-start transition',
+                        cardNumber === card.number
+                          ? 'border-emerald-400/50 bg-emerald-500/10'
+                          : 'border-white/[0.07] bg-white/[0.03] hover:border-white/[0.16]'
+                      )}
+                    >
+                      <p className="font-mono text-[13px] tracking-wider text-white" dir="ltr">
+                        {card.number.replace(/(\d{4})(?=\d)/g, '$1 ')}
+                      </p>
+                      <p className="mt-1 truncate text-[10.5px] text-slate-400">{card.holder || '—'} · {card.bank || '—'}</p>
+                      {card.note ? <p className="mt-0.5 truncate text-[10px] text-slate-500">{card.note}</p> : null}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-[11.5px] leading-6 text-slate-400">{t('pay.noCards')}</p>
+              )}
+              <p className="text-[11px] leading-6 text-slate-500">
+                {active === 'card' ? t('pay.cardHint') : t('pay.receiptHint')}
+              </p>
+            </div>
+          ) : null}
+
+          {['receipt', 'card', 'blue'].includes(active) ? (
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <Field label={t('pay.reference')} hint={t('pay.referenceHint')}>
+                <Input value={reference} onChange={(event) => setReference(event.target.value)} dir="ltr" placeholder="1234567890123" />
+              </Field>
+              <Field label={t('pay.note')} hint={t('pay.noteHint')}>
+                <Input value={note} onChange={(event) => setNote(event.target.value)} placeholder={t('pay.notePlaceholder')} />
+              </Field>
+              <div className="sm:col-span-2">
+                <Button
+                  variant="primary"
+                  onClick={() => {
+                    if (!needAmount()) return;
+                    claim.mutate({ amount: numericAmount, method: active, cardNumber, reference, note });
+                  }}
+                  loading={claim.isPending}
+                >
+                  {t('pay.sendClaim')}
+                </Button>
+                <p className="mt-2 text-[10.5px] leading-5 text-slate-500">{t('pay.pendingAfterClaim')}</p>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      {claim.data ? (
+        <p className="mt-4 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.07] px-3 py-2 text-[11.5px] leading-6 text-emerald-200">
+          {t('pay.claimRecorded', { id: claim.data.request.id, amount: formatNumber(claim.data.request.amount, lang), currency })}
+        </p>
+      ) : null}
+    </SectionCard>
+  );
+}
+
 export default function Wallet() {
   const { t, lang } = useI18n();
   const { user, meta } = useAuth();
   const [page, setPage] = useState(1);
+  const payRef = useRef(null);
+
+  // v1.5.4, item 1: the header button is /wallet?topup=1. The page already
+  // renders the payment panel, so all the query has to do is bring it under his
+  // eyes instead of leaving him to scroll for it.
+  const search = useLocation().search;
+  useEffect(() => {
+    if (!new URLSearchParams(search).get('topup')) return undefined;
+    const node = payRef.current;
+    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return undefined;
+  }, [search]);
 
   const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['wallet', page],
@@ -203,6 +465,11 @@ export default function Wallet() {
           hint={t('common.page')}
           tone="rose"
         />
+      </div>
+
+      {/* v1.5.4: the real payment panel — gateway, بلو link, card numbers, receipt. */}
+      <div className="mb-4" ref={payRef}>
+        <PayMethods currency={currency} />
       </div>
 
       {/* v1.5.3: the one button that carries him into the bot's receipt chat. */}

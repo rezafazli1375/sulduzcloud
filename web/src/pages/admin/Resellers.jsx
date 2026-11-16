@@ -82,6 +82,8 @@ const EMPTY_FORM = {
   max_gb_per_config: 0,
   max_days_per_config: 0,
   balance: 0,
+  referrerId: 0,
+  commissionPercent: 0,
   note: '',
 };
 
@@ -108,6 +110,7 @@ function LimitBadge({ icon: Icon, value, suffix }) {
 
 function UserForm({ open, onClose, editing }) {
   const { t, lang } = useI18n();
+  const { can } = useAuth();
   const toast = useToast();
   const confirm = useConfirm();
   const queryClient = useQueryClient();
@@ -127,6 +130,34 @@ function UserForm({ open, onClose, editing }) {
     const row = (inboundsQuery.data?.rows || []).find((item) => Number(item.id) === Number(id));
     return row?.remark || `#${id}`;
   };
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // v1.5.4, item 6 — پورسانت. A referral is stored on the referred reseller, so
+  // the picker lists the resellers who could stand behind him (never himself).
+  // One request for the whole fleet is enough: the endpoint caps at 200 rows and
+  // an owner running more than that has bigger problems than a dropdown.
+  // ───────────────────────────────────────────────────────────────────────────
+  const referrersQuery = useQuery({
+    queryKey: ['admin', 'users', 'referrer-list'],
+    queryFn: () => api.get('/admin/users?role=reseller&pageSize=200'),
+    enabled: open && form.role === 'reseller',
+    staleTime: 30000,
+  });
+
+  // The fallback rate lives in the billing settings, and that endpoint is behind
+  // the «settings» permission — a users-only admin would get a 403 on every open
+  // of this form, so the hint is only fetched by someone allowed to read it.
+  const settingsQuery = useQuery({
+    queryKey: ['admin', 'settings', 'commission-default'],
+    queryFn: () => api.get('/admin/settings'),
+    enabled: open && form.role === 'reseller' && can('settings'),
+    staleTime: 60000,
+  });
+
+  const defaultCommission = Math.max(0, Math.min(50, Number(settingsQuery.data?.settings?.billing?.commissionPercent || 0)));
+  const ownCommission = Math.max(0, Math.min(50, Number(form.commissionPercent || 0)));
+  const effectiveCommission = ownCommission || defaultCommission;
+  const referrerOptions = (referrersQuery.data?.rows || []).filter((row) => Number(row.id) !== Number(editing?.id || 0));
 
   useEffect(() => {
     if (!open) return;
@@ -149,6 +180,8 @@ function UserForm({ open, onClose, editing }) {
         max_gb_per_config: editing.limits?.maxGbPerConfig || 0,
         max_days_per_config: editing.limits?.maxDaysPerConfig || 0,
         balance: editing.balance || 0,
+        referrerId: Number(editing.referrerId || 0),
+        commissionPercent: Number(editing.commissionPercent || 0),
         note: editing.note || '',
       });
     } else {
@@ -342,6 +375,13 @@ function UserForm({ open, onClose, editing }) {
     };
     if (form.password) payload.password = form.password;
     if (form.role === 'admin') payload.permissions = form.permissions;
+    // Commissions move on what a reseller PAYS, and an admin pays nothing, so
+    // the referral pair is only ever written for a reseller. A typed 60 is sent
+    // as typed and refused by the API with the reason, rather than half-saved.
+    if (form.role === 'reseller') {
+      payload.referrer_id = Number(form.referrerId || 0);
+      payload.commission_percent = Number(form.commissionPercent || 0);
+    }
     if (!editing) payload.balance = Number(form.balance || 0);
     save.mutate(payload);
   };
@@ -499,6 +539,69 @@ function UserForm({ open, onClose, editing }) {
               ) : null}
             </div>
             <p className="mt-1.5 text-[10.5px] leading-5 text-slate-500">{t('resellers.form.fixedInboundHint')}</p>
+          </div>
+        ) : null}
+
+        {/* ───────────────────────────────────────────────────────────────────
+            v1.5.4, item 6 — پورسانت. Two numbers on the referred reseller: WHO
+            brought him and at what rate. Rate 0 is not "no commission", it is
+            "whatever the panel default says", which is why the line under the
+            fields quotes the number that will actually be paid — and why that
+            line disappears (rather than lying) for an admin who cannot read the
+            billing settings.
+            ───────────────────────────────────────────────────────────────── */}
+        {form.role === 'reseller' ? (
+          <div className={cx(
+            'rounded-xl border px-3.5 py-3 transition',
+            effectiveCommission > 0 ? 'border-emerald-400/25 bg-emerald-500/[0.05]' : 'border-white/[0.07] bg-white/[0.02]'
+          )}>
+            <div className="flex items-center gap-2">
+              <Percent className="h-3.5 w-3.5 text-emerald-300" />
+              <p className="text-[12.5px] font-medium text-slate-200">{t('resellers.form.commissionCard')}</p>
+            </div>
+            <div className="mt-2.5 grid gap-3 sm:grid-cols-2">
+              <Field label={t('resellers.form.commissionReferrer')}>
+                <Select
+                  disabled={referrersQuery.isLoading}
+                  value={String(Number(form.referrerId) || 0)}
+                  onChange={(e) => setForm((prev) => ({ ...prev, referrerId: Number(e.target.value) }))}
+                >
+                  <option value="0">{t('resellers.form.commissionReferrerNone')}</option>
+                  {/* The saved referrer is shown even before his row arrives, so
+                      the box never reads «بی‌معرف» on a reseller who has one. */}
+                  {Number(form.referrerId) > 0 && !referrerOptions.some((row) => Number(row.id) === Number(form.referrerId)) ? (
+                    <option value={String(Number(form.referrerId))}>
+                      {referrersQuery.isLoading ? t('common.loading') : (editing?.referrerName ? `@${editing.referrerName}` : `#${form.referrerId}`)}
+                    </option>
+                  ) : null}
+                  {referrerOptions.map((row) => (
+                    <option key={row.id} value={row.id}>
+                      {row.name ? `${row.name} · @${row.username}` : `@${row.username}`}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label={t('resellers.form.commissionRate')} hint={t('resellers.form.commissionRateHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={50}
+                  step={1}
+                  dir="ltr"
+                  value={form.commissionPercent}
+                  onChange={(e) => setForm((prev) => ({ ...prev, commissionPercent: e.target.value }))}
+                />
+              </Field>
+            </div>
+            <p className="mt-2 text-[10.5px] leading-5 text-slate-500">{t('resellers.form.commissionHint')}</p>
+            {effectiveCommission > 0 ? (
+              <p className="mt-1.5 text-[10.5px] leading-5 text-emerald-200/80">
+                {t('resellers.form.commissionEffective', {
+                  percent: formatNumber(effectiveCommission, lang),
+                  source: ownCommission > 0 ? t('resellers.form.commissionOwn') : t('resellers.form.commissionDefault'),
+                })}
+              </p>
+            ) : null}
           </div>
         ) : null}
 
@@ -964,6 +1067,11 @@ function UserDetail({ userId, onClose, onEdit }) {
   const stats = data?.stats || {};
   const configs = data?.configs?.rows || [];
   const transactions = data?.transactions || [];
+  // v1.5.4, item 6: the two commission totals the owner wants when he sets a
+  // rate — what this reseller has received, and what his own spending has paid
+  // his referrer. Both come off the ledger, so they match the transactions below.
+  const commission = data?.commission || null;
+  const referrer = data?.referrer || null;
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
@@ -1177,6 +1285,44 @@ function UserDetail({ userId, onClose, onEdit }) {
                 </div>
               ) : null}
             </SectionCard>
+
+            {/* Panel v1.5.4, item 6: the money side of the referral. Nothing here
+                is editable — the rate lives in the edit form — this is the proof
+                the owner asks for before he agrees to one. */}
+            {user.role === 'reseller' && commission ? (
+              <SectionCard
+                title={t('resellers.detail.commissionCard')}
+                icon={Percent}
+                bodyClass="p-4"
+                actions={(
+                  <Badge tone={Number(commission.percent || 0) > 0 || Number(commission.fleetPercent || 0) > 0 ? 'emerald' : 'slate'}>
+                    {formatNumber(Number(commission.percent || 0) || Number(commission.fleetPercent || 0), lang)}٪
+                  </Badge>
+                )}
+              >
+                <div className="grid gap-x-6 sm:grid-cols-2">
+                  <InfoRow
+                    label={t('resellers.detail.commissionReferrer')}
+                    value={referrer ? (referrer.name ? `${referrer.name} · @${referrer.username}` : `@${referrer.username}`) : t('resellers.detail.commissionReferrerNone')}
+                  />
+                  <InfoRow
+                    label={t('resellers.detail.commissionRate')}
+                    value={Number(commission.percent || 0) > 0
+                      ? `${formatNumber(commission.percent, lang)}٪`
+                      : `${t('resellers.detail.commissionFromDefault')} ${formatNumber(commission.fleetPercent || 0, lang)}٪`}
+                  />
+                  <InfoRow
+                    label={t('resellers.detail.commissionEarned')}
+                    value={`${formatNumber(commission.earned || 0, lang)} · ${t('resellers.detail.commissionTimes', { n: formatNumber(commission.earnedCount || 0, lang) })}`}
+                  />
+                  <InfoRow
+                    label={t('resellers.detail.commissionPaid')}
+                    value={`${formatNumber(commission.paidByReferrer || 0, lang)} · ${t('resellers.detail.commissionTimes', { n: formatNumber(commission.paidCount || 0, lang) })}`}
+                  />
+                </div>
+                <p className="mt-2 text-[10.5px] leading-5 text-slate-500">{t('resellers.detail.commissionHint')}</p>
+              </SectionCard>
+            ) : null}
 
             <SectionCard
               title={t('resellers.detail.configs')}

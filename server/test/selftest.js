@@ -353,9 +353,22 @@ function startMockXui(inboundRows) {
     check('mutations require csrf header', noCsrf.status === 403 && noCsrf.json.error.code === 'csrf');
 
     const saved = await request('PATCH', '/api/admin/settings/general', {
-      cookies, csrf, body: { panelName: 'Self Test Panel', defaultLang: 'fa' },
+      cookies, csrf, body: { panelName: 'Self Test Panel', defaultLang: 'fa', tagline: 'در تست' },
     });
-    check('settings patch persists', saved.status === 200 && saved.json.data.saved.panelName === 'Self Test Panel');
+    // v1.5.4, item 4: the brand is pinned in code, so this one PATCH — which still
+    // saves everything else it was given — must not be able to rename the panel.
+    // The check keeps the shape of the old "patch persists" one on purpose: the
+    // fields around the locked name are what prove the lock is a lock and not a
+    // broken form.
+    const savedGeneral = saved.json?.data?.saved || {};
+    check('settings patch persists — only the pinned panel name is immune to it',
+      saved.status === 200 && savedGeneral.panelName === require('../src/brand').PANEL_NAME
+        && savedGeneral.defaultLang === 'fa' && savedGeneral.tagline === 'در تست',
+      `panelName=${savedGeneral.panelName} lang=${savedGeneral.defaultLang} tagline=${savedGeneral.tagline}`);
+    const showPinned = await request('GET', '/api/meta');
+    check('and the name the login page shows is the pinned one, not what was typed',
+      showPinned.json?.data?.panelName === require('../src/brand').PANEL_NAME,
+      `public=${showPinned.json?.data?.panelName}`);
 
     const badSection = await request('PATCH', '/api/admin/settings/nope', {
       cookies, csrf, body: { anything: 1 },
@@ -4210,7 +4223,14 @@ function startMockXui(inboundRows) {
       // whose shared quota is used up while its expiry is still far away.
       const nowR = Date.now();
       const byName = new Map(madeR.map((row) => [row.name, row.id]));
-      rptDb.prepare('UPDATE configs SET expiry_at = ? WHERE id = ?').run(nowR - 3600000, byName.get('RPT-ended'));
+      // «Ended today» is the panel day that is still running, so this fixture has
+      // to land inside it. It used to say "one hour ago", which just after Tehran
+      // midnight is YESTERDAY — the report then had nothing to count and this check
+      // went red for a reason that was the test's, not the panel's. The midpoint of
+      // the day so far is always past and always today, whatever the clock reads.
+      const dayStartR = require('../src/utils').zonedDayStartMs(nowR);
+      const endedAtR = dayStartR + Math.floor((nowR - dayStartR) / 2);
+      rptDb.prepare('UPDATE configs SET expiry_at = ? WHERE id = ?').run(endedAtR, byName.get('RPT-ended'));
       rptDb.prepare('UPDATE configs SET expiry_at = ? WHERE id = ?').run(nowR + 2 * DAYR, byName.get('RPT-soon'));
       rptDb.prepare(
         'UPDATE configs SET total_bytes = ?, up_bytes = ?, down_bytes = 0, expiry_at = ?, updated_at = ? WHERE id = ?'
@@ -4331,6 +4351,446 @@ function startMockXui(inboundRows) {
         },
       });
       if (rptTimerParked) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
+    }
+
+    // ═════════════════════════════════════════════════════════════════════ v1.5.4
+    //
+    // The four sentences of this release that only a running server can answer:
+    // پلن‌های آماده (item 7), the payment-settings guards (items 2 and 3), the
+    // gateway callback page that must never credit (item 2), and پورسانت paid out
+    // of a real wallet debit (item 6). The maths behind the sweep, the gateway and
+    // the commission percentage is test/payment.js; this block is about what the
+    // routes will accept from a browser, where a client can type anything.
+    {
+      const brandName = require('../src/brand').PANEL_NAME;
+      const pdb = new Database(path.join(DATA_DIR, 'panel.db'));
+      const cfgOf = (id) => pdb.prepare('SELECT * FROM configs WHERE id = ?').get(Number(id)) || {};
+      const txCount = (userId, type) => pdb
+        .prepare('SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND type = ?').get(Number(userId), String(type)).c;
+      const GB = 1024 ** 3;
+      const PLAN = { name: 'پلن آماده تست', description: 'دو کانال، حجم و زمان ثابت', gb: 20, days: 30, price: 600, inboundIds: [901, 902] };
+      const merchantFake = 'c8e8f1a2-1111-4abc-9def-0123456789ab';
+      const blueFake = 'https://blue.example/pay/selftest?amount={amount}';
+
+      try {
+        // ─────────────────────────────────────────────── writing a plan (item 7)
+        const noName = await request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN, name: '' } });
+        check('a plan without a name is refused, not stored as an empty row',
+          noName.status === 422 && noName.json?.error?.code === 'plan_name_required', `code=${noName.json?.error?.code}`);
+        const noChannel = await request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN, inboundIds: [] } });
+        check('a plan with no channel cannot be written — there would be nothing to build',
+          noChannel.status === 422 && noChannel.json?.error?.code === 'plan_needs_inbound', `code=${noChannel.json?.error?.code}`);
+        const ghostInbound = await request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN, inboundIds: [999999] } });
+        check('and it cannot name a channel the panel does not have',
+          ghostInbound.status === 422 && ghostInbound.json?.error?.code === 'inbound_not_found', `code=${ghostInbound.json?.error?.code}`);
+        const tooMany = await request('POST', '/api/admin/plans', {
+          cookies, csrf, body: { ...PLAN, inboundIds: [901, 902, 903, 904, 905, 906, 907] },
+        });
+        check('one plan is capped at six channels',
+          tooMany.status === 422 && tooMany.json?.error?.code === 'too_many_inbounds', `code=${tooMany.json?.error?.code}`);
+        const badGb = await request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN, gb: 0 } });
+        const badDays = await request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN, days: 0 } });
+        check('a plan of no volume or no duration is a typo, not a product',
+          badGb.json?.error?.code === 'invalid_plan_gb' && badDays.json?.error?.code === 'invalid_plan_days',
+          `${badGb.json?.error?.code} / ${badDays.json?.error?.code}`);
+
+        // A second server's channel, written straight to the table: the rule under
+        // test is about the plan, not about how the row got there.
+        pdb.prepare(
+          `INSERT INTO inbounds (id, server_id, xui_id, node_id, node_name, remark, protocol, tag, port, network,
+             security, listen, price_fixed, price_per_gb, price_per_day, enabled, visible, sub_sort_index, updated_at)
+           VALUES (?, ?, ?, 0, 'elsewhere', ?, 'vless', ?, 1000, 'tcp', 'none', '', 0, 10, 0, 1, 1, 10, ?)`
+        ).run(950, 9999, 950, 'Other panel', 'tag950', Date.now());
+        const mixed = await request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN, inboundIds: [901, 950] } });
+        check('a plan mixing two servers is refused while writing it, not while buying it',
+          mixed.status === 422 && mixed.json?.error?.code === 'plan_server_mismatch', `code=${mixed.json?.error?.code}`);
+        pdb.prepare('DELETE FROM inbounds WHERE id = 950').run();
+
+        const made = await request('POST', '/api/admin/plans', { cookies, csrf, body: PLAN });
+        const plan = made.json?.data?.plan || {};
+        const planId = Number(plan.id || 0);
+        check('the owner writes volume, duration, channels and HIS OWN price into one plan',
+          made.status === 201 && planId > 0 && plan.gb === 20 && plan.days === 30 && plan.price === 600
+            && JSON.stringify(plan.inboundIds) === JSON.stringify([901, 902]) && plan.inbounds.length === 2,
+          `id=${planId} price=${plan.price} inbounds=${JSON.stringify(plan.inboundIds)}`);
+
+        const hidden = await request('POST', '/api/admin/plans', {
+          cookies, csrf, body: { ...PLAN, name: 'پلن تمرینی', visible: false },
+        });
+        const hiddenId = Number(hidden.json?.data?.plan?.id || 0);
+        const adminPlans = await request('GET', '/api/admin/plans', { cookies });
+        const shopPlans = await request('GET', '/api/reseller/plans', { cookies: shopCookies });
+        const shopPlanIds = (shopPlans.json?.data?.plans || []).map((row) => Number(row.id));
+        check('the shop window a reseller sees is the visible plans, and only his',
+          adminPlans.json?.data?.plans?.some((row) => Number(row.id) === hiddenId) === true
+            && shopPlanIds.includes(planId) && !shopPlanIds.includes(hiddenId),
+          `reseller=${JSON.stringify(shopPlanIds)} hidden=${hiddenId}`);
+        const buyHidden = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopCookies, csrf: shopCsrf, body: { planId: hiddenId, customerName: 'مشتری پنهان' },
+        });
+        check('a plan that is off the shelf cannot be bought even by its id',
+          buyHidden.status === 409 && buyHidden.json?.error?.code === 'plan_not_available', `code=${buyHidden.json?.error?.code}`);
+
+        // The eye button on the plans table sends nothing but {"visible": false}.
+        // That is the one request shape a plan cannot answer by re-reading its own
+        // stored row carelessly: inbound_ids is JSON *text* in the database, and
+        // treating it as a list of ids turns '[1,2]' into one NaN, so the plan looks
+        // channel-less and the save is refused with plan_needs_inbound.
+        const offShelf = await request('PATCH', `/api/admin/plans/${planId}`, {
+          cookies, csrf, body: { visible: false },
+        });
+        const offRow = offShelf.json?.data?.plan || {};
+        check('flipping visibility alone is a save, not a request to rebuild the plan',
+          offShelf.status === 200 && offRow.visible === 0 && JSON.stringify(offRow.inboundIds) === JSON.stringify([901, 902]),
+          `status=${offShelf.status} code=${offShelf.json?.error?.code} inbounds=${JSON.stringify(offRow.inboundIds)}`);
+        const afterHideShop = await request('GET', '/api/reseller/plans', { cookies: shopCookies });
+        const hiddenIds = (afterHideShop.json?.data?.plans || []).map((row) => Number(row.id));
+        check('and hiding it really takes it out of the shop window',
+          !hiddenIds.includes(planId), `shop=${JSON.stringify(hiddenIds)}`);
+        const backOnShelf = await request('PATCH', `/api/admin/plans/${planId}`, {
+          cookies, csrf, body: { visible: true },
+        });
+        const backRow = backOnShelf.json?.data?.plan || {};
+        const afterShowShop = await request('GET', '/api/reseller/plans', { cookies: shopCookies });
+        check('one more click puts it back with the same channels and the same price',
+          backOnShelf.status === 200 && backRow.visible === 1 && backRow.price === 600 && backRow.gb === 20
+            && (afterShowShop.json?.data?.plans || []).some((row) => Number(row.id) === planId),
+          `status=${backOnShelf.status} price=${backRow.price} gb=${backRow.gb}`);
+        const partialEdit = await request('PATCH', `/api/admin/plans/${planId}`, {
+          cookies, csrf, body: { name: 'پلن ویرایش جزئی' },
+        });
+        const partialRow = partialEdit.json?.data?.plan || {};
+        check('a partial edit of one field leaves every other number of the plan alone',
+          partialEdit.status === 200 && partialRow.name === 'پلن ویرایش جزئی' && partialRow.days === 30
+            && partialRow.price === 600 && JSON.stringify(partialRow.inboundIds) === JSON.stringify([901, 902]),
+          `status=${partialEdit.status} days=${partialRow.days} price=${partialRow.price}`);
+
+        // ─────────────────────────────────── buying a plan: the price is the row's
+        const shopTopup = await request('POST', `/api/admin/users/${shopId}/balance`, {
+          cookies, csrf, body: { amount: 50000, description: 'شارژ پلن تست' },
+        });
+        const shopBefore = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        check('the test wallet is funded', shopTopup.status === 200 && shopBefore > 5000, `balance=${shopBefore}`);
+
+        const tariffQuote = await request('POST', '/api/reseller/configs/quote', {
+          cookies: shopCookies, csrf: shopCsrf, body: { inboundIds: [901, 902], gb: 20, days: 30 },
+        });
+        const tariffTotal = Number(tariffQuote.json?.data?.total || 0);
+        const planQuote = await request('POST', '/api/reseller/plans/quote', {
+          cookies: shopCookies, csrf: shopCsrf, body: { planId },
+        });
+        const quoted = planQuote.json?.data || {};
+        check('the plan quote prices the plan, and still shows what the tariff would have cost',
+          planQuote.status === 200 && quoted.price === 600 && quoted.tariff === tariffTotal
+            && quoted.saved === Math.max(0, tariffTotal - 600) && quoted.charged === true && quoted.sufficient === true,
+          `price=${quoted.price} tariff=${quoted.tariff} saved=${quoted.saved}`);
+
+        const forged = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopCookies, csrf: shopCsrf,
+          body: { planId, customerName: 'مشتری پلنی', price: 1, gb: 999, days: 999, inboundIds: [903], charge: 0 },
+        });
+        const forgedCfg = (forged.json?.data?.configs || [])[0] || {};
+        const shopAfterNew = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        check('a reseller may type a price, a volume and a channel list; none of them is read',
+          forged.status === 201 && forgedCfg.id > 0 && Number(cfgOf(forgedCfg.id).total_bytes) === 20 * GB
+            && shopAfterNew === shopBefore - 600,
+          `debit=${shopBefore - shopAfterNew} total_bytes=${cfgOf(forgedCfg.id).total_bytes}`);
+
+        // The renewal is the owner's sentence: «کل مصرف و زمان کاربر ریست بشه این
+        // پلن از نو برای اون مشتری اعمال شد». Usage is written straight to the
+        // ledger rows — what a monitor tick would have done — so that zeroing it is
+        // something the test can actually see happen.
+        const renewId = Number(forgedCfg.id);
+        pdb.prepare('UPDATE configs SET up_bytes = ?, down_bytes = ?, expiry_at = ? WHERE id = ?')
+          .run(3 * GB, 2 * GB, Date.now() - 86400000, renewId);
+        const preview = await request('POST', '/api/reseller/plans/renew/preview', {
+          cookies: shopCookies, csrf: shopCsrf, body: { planId, configId: renewId },
+        });
+        check('the renewal drawer shows the plan’s fixed numbers next to what the customer has now',
+          preview.status === 200 && preview.json?.data?.plan?.id === planId
+            && preview.json?.data?.usable === true && Number(preview.json?.data?.configs?.[0]?.usedGb) > 0,
+          `usable=${preview.json?.data?.usable} usedGb=${preview.json?.data?.configs?.[0]?.usedGb}`);
+        const renewed = await request('POST', '/api/reseller/plans/renew', {
+          cookies: shopCookies, csrf: shopCsrf, body: { planId, configId: renewId, gb: 999, days: 999, price: 1 },
+        });
+        const renewRow = cfgOf(renewId);
+        const shopAfterRenew = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        check('applying the plan again wipes his traffic and his expiry and gives him the plan',
+          renewed.status === 200 && Number(renewRow.up_bytes) + Number(renewRow.down_bytes) === 0
+            && Number(renewRow.total_bytes) === 20 * GB
+            && Number(renewRow.expiry_at) > Date.now() + 29 * 86400000
+            && shopAfterRenew === shopAfterNew - 600,
+          `used=${Number(renewRow.up_bytes) + Number(renewRow.down_bytes)} expiry=${renewRow.expiry_at} debit=${shopAfterNew - shopAfterRenew}`);
+        const poorPlan = await request('POST', '/api/admin/plans', {
+          cookies, csrf, body: { ...PLAN, name: 'پلن گران', price: 900000 },
+        });
+        const poorId = Number(poorPlan.json?.data?.plan?.id || 0);
+        const tooPoor = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopCookies, csrf: shopCsrf, body: { planId: poorId, customerName: 'بی‌پول' },
+        });
+        check('a plan he cannot afford is refused before x-ui is touched',
+          tooPoor.status === 402 && tooPoor.json?.error?.code === 'insufficient_balance',
+          `status=${tooPoor.status} code=${tooPoor.json?.error?.code}`);
+        const ghostPlan = await request('POST', '/api/reseller/plans/quote', { cookies: shopCookies, csrf: shopCsrf, body: { planId: 987654 } });
+        check('a plan id that is not in the shop says so', ghostPlan.status === 404, `status=${ghostPlan.status}`);
+        // `entity_id` is a TEXT column and audit.js stores it with String(), so the
+        // lookup must bind a string too — an integer bind never matches the row.
+        const planAudit = pdb.prepare(
+          "SELECT * FROM audit_logs WHERE action = 'plan.create' AND entity = 'plan' AND entity_id = ?"
+        ).get(String(planId));
+        check('every plan written is in the audit book with its price',
+          Boolean(planAudit) && String(planAudit.details || '').includes('"price":600'),
+          String(planAudit?.details || '').slice(0, 70));
+
+        // ──────────────────────────────────────────────── پورسانت from a real sale
+        const refUser = await request('POST', '/api/admin/users', {
+          cookies, csrf,
+          body: { username: 'payref', password: 'Pay-Ref-12345', name: 'معرف', role: 'reseller', max_configs: 10 },
+        });
+        const refId = Number(refUser.json?.data?.user?.id || 0);
+        // The referrer's wallet is read from the database, not from a second
+        // login: this suite is one browser session after another and
+        // `security.loginRateLimit` would answer 429 long before this line,
+        // turning a real payout into a balance of zero. The money is what the
+        // ledger says it is, so that is where the test looks.
+        const balOf = (userId) => Number(pdb.prepare('SELECT balance FROM users WHERE id = ?').get(Number(userId))?.balance || 0);
+        const shopHandle = String(pdb.prepare('SELECT username FROM users WHERE id = ?').get(shopId)?.username || '');
+        pdb.prepare('UPDATE users SET referrer_id = ? WHERE id = ?').run(refId, shopId);
+        const commissionOn = await request('PATCH', '/api/admin/settings/billing', {
+          cookies, csrf, body: { enabled: true, commissionPercent: 10, commissionCapPercent: 50 },
+        });
+        const refBefore = balOf(refId);
+        const cBuyFrom = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        const commissionBuy = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopCookies, csrf: shopCsrf, body: { planId, customerName: 'مشتری پورسانتی' },
+        });
+        const cBuyTo = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        const refAfter = balOf(refId);
+        check('the share of a sale is paid to the reseller who brought the buyer, in the same breath',
+          commissionOn.status === 200 && commissionBuy.status === 201
+            && cBuyFrom - cBuyTo === 600 && refAfter - refBefore === 60,
+          `buyer paid ${cBuyFrom - cBuyTo}, referrer got ${refAfter - refBefore}`);
+        check('and the payout is its own ledger line, not a silent number in a column',
+          txCount(refId, 'commission') === 1, `rows=${txCount(refId, 'commission')}`);
+        const refNotified = pdb.prepare("SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND type = 'success'").get(refId).c;
+        check('the referrer is told in his own panel that the money arrived', refNotified > 0, `notices=${refNotified}`);
+        const refTopup = await request('POST', `/api/admin/users/${refId}/balance`, {
+          cookies, csrf, body: { amount: 5000, description: 'شارژ مستقیم' },
+        });
+        check('crediting a wallet is not a sale: no commission is owed on a commission',
+          refTopup.status === 200 && txCount(refId, 'commission') === 1, `rows=${txCount(refId, 'commission')}`);
+        await request('PATCH', '/api/admin/settings/billing', { cookies, csrf, body: { commissionPercent: 0 } });
+        const offFrom = balOf(refId);
+        const offBuy = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopCookies, csrf: shopCsrf, body: { planId, customerName: 'مشتری بی‌پورسانت' },
+        });
+        const offTo = balOf(refId);
+        check('switching the percentage to zero really stops the payout',
+          offBuy.status === 201 && offTo === offFrom && txCount(refId, 'commission') === 1,
+          `delta=${offTo - offFrom}`);
+        const commissionLine = pdb.prepare(
+          "SELECT * FROM transactions WHERE user_id = ? AND type = 'commission' ORDER BY id DESC LIMIT 1"
+        ).get(refId) || {};
+        check('and the ledger line says who paid, in whose name and on what basis',
+          shopHandle.length > 0 && Number(commissionLine.amount) === 60
+            && String(commissionLine.description || '').includes(shopHandle)
+            && String(commissionLine.description || '').includes('600'),
+          `amount=${commissionLine.amount} desc=${String(commissionLine.description || '').slice(0, 60)}`);
+
+        // ────────────────────────────── the payment settings, from the owner’s form
+        const oneCard = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { cards: [{ number: '6037 9977 8899 1234', holder: 'فروشگاه تست' }] },
+        });
+        check('a card number is accepted with its spaces and stored as digits',
+          oneCard.status === 200 && (oneCard.json?.data?.saved?.cards || []).length === 1
+            && String(oneCard.json?.data?.saved?.cards?.[0]?.number || '') === '6037997788991234',
+          JSON.stringify(oneCard.json?.data?.saved?.cards));
+        const badCard = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { cards: [{ number: '6037-99xx-8899-1234', holder: 'x' }] },
+        });
+        check('a card number with letters in it is refused rather than saved empty',
+          badCard.status === 422 && badCard.json?.error?.code === 'invalid_cards', `code=${badCard.json?.error?.code}`);
+        const noMerchant = await request('PATCH', '/api/admin/settings/payment', { cookies, csrf, body: { zarinpalEnabled: true } });
+        check('the gateway cannot be switched on with no merchant id',
+          noMerchant.status === 422 && noMerchant.json?.error?.code === 'zarinpal_not_configured', `code=${noMerchant.json?.error?.code}`);
+        const badMerchant = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { zarinpalMerchantId: 'not-a-uuid' },
+        });
+        check('and a merchant id that is not a UUID is not a merchant id',
+          badMerchant.status === 422 && badMerchant.json?.error?.code === 'invalid_merchant_id', `code=${badMerchant.json?.error?.code}`);
+        const withMerchant = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { zarinpalMerchantId: merchantFake, zarinpalEnabled: true },
+        });
+        const savedPay = withMerchant.json?.data?.saved || {};
+        check('the credential is saved but never comes back out of the settings API',
+          withMerchant.status === 200 && savedPay.zarinpalMerchantId === '' && savedPay.hasZarinpalMerchantId === true,
+          `merchant="${savedPay.zarinpalMerchantId}" has=${savedPay.hasZarinpalMerchantId}`);
+        check('and it really is in the database encrypted, not in the clear',
+          !String(pdb.prepare("SELECT value FROM settings WHERE key = 'payment'").get().value).includes(merchantFake));
+        const noBlue = await request('PATCH', '/api/admin/settings/payment', { cookies, csrf, body: { blueEnabled: true } });
+        check('بلو cannot be offered before its link exists',
+          noBlue.status === 422 && noBlue.json?.error?.code === 'blue_not_configured', `code=${noBlue.json?.error?.code}`);
+        const badBlue = await request('PATCH', '/api/admin/settings/payment', { cookies, csrf, body: { blueLink: 'blue.example/x' } });
+        check('a link with no scheme is clipboard text, not a payment page',
+          badBlue.status === 422 && badBlue.json?.error?.code === 'invalid_blue_link', `code=${badBlue.json?.error?.code}`);
+        const blueOk = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { blueLink: blueFake, blueEnabled: true },
+        });
+        check('the بلو link is stored the same way — back to the form it comes out empty',
+          blueOk.status === 200 && blueOk.json?.data?.saved?.blueLink === ''
+            && blueOk.json?.data?.saved?.hasBlueLink === true);
+        const noCeiling = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { autoApproveEnabled: true, autoApproveMaxAmount: 0, autoApproveReceipt: true },
+        });
+        check('auto-approval cannot be released with no money ceiling',
+          noCeiling.status === 422 && noCeiling.json?.error?.code === 'auto_approve_ceiling_required', `code=${noCeiling.json?.error?.code}`);
+        const noMethod = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { autoApproveEnabled: true, autoApproveMaxAmount: 50000, autoApproveReceipt: false, autoApproveCard: false },
+        });
+        check('nor with neither method chosen',
+          noMethod.status === 422 && noMethod.json?.error?.code === 'auto_approve_no_method', `code=${noMethod.json?.error?.code}`);
+        const sweepOn = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { autoApproveEnabled: true, autoApproveMaxAmount: 50000, autoApproveReceipt: true, autoApproveAfterMinutes: 15 },
+        });
+        check('with a ceiling and one method the schedule is on',
+          sweepOn.status === 200 && sweepOn.json?.data?.saved?.autoApproveEnabled === true,
+          `status=${sweepOn.status}`);
+        // The admin tab posts the WHOLE payment object on every save, and the two
+        // secret boxes are always empty inside it — they come back redacted. So the
+        // guards above have to read a blank secret as "unchanged" exactly the way the
+        // write does, or the tab becomes unsavable for good the moment a real
+        // credential is stored: every later save, even one that only sets a ceiling,
+        // would be refused for a merchant id the panel already has.
+        const rawPayBefore = String(pdb.prepare("SELECT value FROM settings WHERE key = 'payment'").get().value);
+        const formShape = {
+          cards: [{ number: '6037997788991234', holder: 'فروشگاه تست' }],
+          zarinpalEnabled: true, zarinpalMerchantId: '', zarinpalSandbox: true,
+          blueEnabled: true, blueLink: '', blueLabel: 'بلو بانک',
+        };
+        const blankFormNoCeiling = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf,
+          body: { ...formShape, autoApproveEnabled: true, autoApproveMaxAmount: 0, autoApproveReceipt: true },
+        });
+        check('a save posting the redacted blanks is refused for its ceiling, not for a merchant id it already has',
+          blankFormNoCeiling.status === 422 && blankFormNoCeiling.json?.error?.code === 'auto_approve_ceiling_required',
+          `code=${blankFormNoCeiling.json?.error?.code}`);
+        const blankForm = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf,
+          body: { ...formShape, autoApproveEnabled: true, autoApproveMaxAmount: 50000, autoApproveReceipt: true },
+        });
+        const rawPayAfter = String(pdb.prepare("SELECT value FROM settings WHERE key = 'payment'").get().value);
+        // A save re-encrypts the section, and every secret is sealed with a fresh
+        // random IV, so the CIPHERTEXT of an untouched credential changes on every
+        // save. Comparing the stored bytes would have failed on correct behaviour.
+        // What has to survive is the plaintext the panel reads back — so the proof
+        // decrypts both rows and never looks at the seal.
+        const reveal = require('../src/crypto').decryptSecret;
+        const merchantKept = reveal(String(JSON.parse(rawPayAfter).zarinpalMerchantId || ''));
+        const blueKept = reveal(String(JSON.parse(rawPayAfter).blueLink || ''));
+        check('and the same save goes through without erasing either credential',
+          blankForm.status === 200 && blankForm.json?.data?.saved?.hasZarinpalMerchantId === true
+            && blankForm.json?.data?.saved?.hasBlueLink === true
+            && merchantKept === merchantFake && blueKept === blueFake
+            && !rawPayAfter.includes(merchantFake) && !rawPayAfter.includes(blueFake),
+          JSON.stringify({
+            status: blankForm.status, code: blankForm.json?.error?.code,
+            merchantKept: merchantKept === merchantFake, blueKept: blueKept === blueFake,
+            stillSealed: String(JSON.parse(rawPayAfter).zarinpalMerchantId || '').startsWith('enc1:'),
+            sealRotated: JSON.parse(rawPayAfter).zarinpalMerchantId
+              !== JSON.parse(rawPayBefore).zarinpalMerchantId,
+          }));
+        const methodsR = await request('GET', '/api/reseller/payments/methods', { cookies: shopCookies });
+        const methodsData = methodsR.json?.data || {};
+        check('the reseller’s wallet page is built from what the owner actually configured',
+          methodsR.status === 200 && (methodsData.cards || []).length === 1
+            && methodsData.blue?.enabled === true && methodsData.zarinpal?.enabled === true,
+          JSON.stringify({ cards: (methodsData.cards || []).length, blue: methodsData.blue?.enabled, zp: methodsData.zarinpal?.enabled }));
+        const blueLinkR = await request('GET', '/api/reseller/payments/blue?amount=500', { cookies: shopCookies });
+        check('his بلو link carries his amount, in the unit the bank page wants',
+          blueLinkR.status === 200 && String(blueLinkR.json?.data?.link || '').includes('amount=5000')
+            && blueLinkR.json?.data?.prefilled === true,
+          String(blueLinkR.json?.data?.link || ''));
+        const viaClaim = await request('POST', '/api/reseller/payments/claim', {
+          cookies: shopCookies, csrf: shopCsrf, body: { method: 'zarinpal', amount: 5000 },
+        });
+        check('the claim form is not a shortcut into the gateway',
+          viaClaim.status === 422 && viaClaim.json?.error?.code === 'use_gateway', `code=${viaClaim.json?.error?.code}`);
+        const wrongCard = await request('POST', '/api/reseller/payments/claim', {
+          cookies: shopCookies, csrf: shopCsrf, body: { method: 'card', amount: 5000, cardNumber: '1111111111111111' },
+        });
+        check('he cannot name a card the owner never typed',
+          wrongCard.status === 422 && wrongCard.json?.error?.code === 'unknown_card', `code=${wrongCard.json?.error?.code}`);
+        const hisClaim = await request('POST', '/api/reseller/payments/claim', {
+          cookies: shopCookies, csrf: shopCsrf, body: { method: 'card', amount: 5000, cardNumber: '6037-9977-8899-1234' },
+        });
+        const claimRow = hisClaim.json?.data?.request || hisClaim.json?.data || {};
+        check('a card-to-card claim waits for a person or the schedule, and says which',
+          hisClaim.status < 300 && String(claimRow.status || '') === 'pending' && Number(claimRow.amount) === 5000,
+          `status=${claimRow.status} id=${claimRow.id}`);
+
+        // ───────────────────────────────── the schedule, run from the admin screen
+        const oldClaimId = Number(claimRow.id || 0);
+        pdb.prepare('UPDATE topup_requests SET created_at = ?, updated_at = ? WHERE id = ?')
+          .run(Date.now() - 20 * 60000, Date.now() - 20 * 60000, oldClaimId);
+        const paidBefore = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        const runSweep = await request('POST', '/api/admin/topups/auto-approve/run', { cookies, csrf, body: {} });
+        const paidAfter = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        check('the admin can run the schedule himself and see what it released',
+          runSweep.status === 200 && paidAfter === paidBefore + 5000
+            && String(pdb.prepare('SELECT status FROM topup_requests WHERE id = ?').get(oldClaimId).status) === 'approved',
+          `approved=${runSweep.json?.data?.approved} balance=${paidBefore}→${paidAfter}`);
+        check('an automatic decision is booked to the system, never borrowed from an admin',
+          Number(pdb.prepare('SELECT decided_by FROM topup_requests WHERE id = ?').get(oldClaimId).decided_by) === 0);
+
+        // ─────────────────────────────────── the gateway callback: talk to the hand
+        const noAuthority = await request('GET', '/api/payments/zarinpal/callback', {});
+        check('a callback with no tracking code says so and pays nothing',
+          noAuthority.status === 400 && noAuthority.json?.ok !== true);
+        const forgedCallback = await request('GET', '/api/payments/zarinpal/callback?Authority=AUTH-FORGED', {});
+        check('a callback naming a code this panel never issued is refused — nothing is credited',
+          forgedCallback.status === 404 && /پیدا نشد/.test(forgedCallback.raw || ''),
+          `status=${forgedCallback.status}`);
+        const zpOrder = await request('POST', '/api/reseller/payments/claim', {
+          cookies: shopCookies, csrf: shopCsrf, body: { method: 'receipt', amount: 12000 },
+        });
+        const zpId = Number((zpOrder.json?.data?.request || zpOrder.json?.data || {}).id || 0);
+        pdb.prepare("UPDATE topup_requests SET method = 'zarinpal', reference = 'AUTH-SELFTEST' WHERE id = ?").run(zpId);
+        const balanceAtCancel = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        const cancelled = await request('GET', '/api/payments/zarinpal/callback?Authority=AUTH-SELFTEST&Status=FAIL', {});
+        const zpNow = pdb.prepare('SELECT status FROM topup_requests WHERE id = ?').get(zpId) || {};
+        const balanceAfterCancel = Number((await request('GET', '/api/auth/me', { cookies: shopCookies })).json?.data?.user?.balance || 0);
+        check('the bank saying “he did not pay” is believed: the order stays pending and no money moves',
+          cancelled.status === 200 && /انجام نشد/.test(cancelled.raw || '') && String(zpNow.status) === 'pending'
+            && balanceAfterCancel === balanceAtCancel,
+          `status=${zpNow.status} balance=${balanceAtCancel}→${balanceAfterCancel}`);
+
+        // ────────────────────────────── the brand on the wire, and the fresh schema
+        const renamed = await request('PATCH', '/api/admin/settings/general', {
+          cookies, csrf, body: { panelName: 'پنل دیگری' },
+        });
+        check('the settings route cannot rename the panel even for an admin',
+          renamed.status === 200 && renamed.json?.data?.saved?.panelName === brandName,
+          `panelName=${renamed.json?.data?.saved?.panelName}`);
+        check('and the name is not what the database says it is',
+          String(JSON.parse(pdb.prepare("SELECT value FROM settings WHERE key = 'general'").get().value).panelName) === brandName);
+        const tables = pdb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map((row) => row.name);
+        const planCols = pdb.prepare('PRAGMA table_info(plans)').all().map((row) => row.name);
+        check('a fresh install carries the two new tables this release needs',
+          tables.includes('plans') && tables.includes('topup_requests') && planCols.includes('price')
+            && planCols.includes('inbound_ids') && planCols.includes('visible') && planCols.includes('server_id'),
+          `tables=${tables.length} planCols=${planCols.length}`);
+        check('the plans table is the nineteenth, beside the eighteen of 1.5.3',
+          tables.length === 19, tables.join(','));
+
+        await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf,
+          body: { zarinpalEnabled: false, blueEnabled: false, autoApproveEnabled: false, autoApproveReceipt: false, autoApproveCard: false, cards: [] },
+        });
+        await request('PATCH', '/api/admin/settings/billing', { cookies, csrf, body: { commissionPercent: 0, commissionCapPercent: 50 } });
+        pdb.prepare('UPDATE users SET referrer_id = 0 WHERE id = ?').run(shopId);
+      } finally {
+        pdb.close();
+      }
     }
 
     const v1Bad = await request('GET', '/api/v1/me', { headers: { 'x-api-key': 'sc_invalid' } });

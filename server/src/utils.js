@@ -340,6 +340,12 @@ function sanitizeUser(row) {
     allowedInbounds: parseNumberArray(row.allowed_inbounds),
     fixedInbound: Number(row.fixed_inbound || 0),
     balance: Number(row.balance || 0),
+    // v1.5.4, item 6: پورسانت. The admin's reseller screen needs both numbers —
+    // who brought him, and at what rate — and a reseller reading his own profile
+    // is entitled to see the rate he is referred to. 0 means "the fleet default
+    // applies", which is what usersService.createCommissionText explains.
+    referrerId: Number(row.referrer_id || 0),
+    commissionPercent: Number(row.commission_percent || 0),
     note: row.note || '',
     apiKey: row.role === 'reseller' ? row.api_key || '' : undefined,
     lastLoginAt: Number(row.last_login_at || 0),

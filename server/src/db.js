@@ -85,6 +85,29 @@ CREATE TABLE IF NOT EXISTS inbounds (
   UNIQUE(server_id, xui_id)
 );
 
+-- v1.5.4: پلن آماده — a ready-made package the owner prices himself: a fixed
+-- volume, a fixed duration, one or two channels he picked, and HIS price instead
+-- of the per-gigabyte tariff. A reseller buys a plan either to open a new
+-- customer or to renew an existing one, and the renewal means what the owner
+-- said it means: the customer's usage and expiry are reset and this plan is
+-- applied to him from scratch.
+CREATE TABLE IF NOT EXISTS plans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  gb REAL NOT NULL DEFAULT 0,
+  days INTEGER NOT NULL DEFAULT 0,
+  price INTEGER NOT NULL DEFAULT 0,
+  inbound_ids TEXT NOT NULL DEFAULT '[]',
+  server_id INTEGER NOT NULL DEFAULT 0,
+  visible INTEGER NOT NULL DEFAULT 1,
+  sort INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  deleted_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_plans_visible ON plans(visible, deleted_at, sort);
+
 CREATE TABLE IF NOT EXISTS configs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -151,6 +174,16 @@ CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, create
 -- v1.5.2: a reseller's payment receipt, sent through the Telegram bot and decided
 -- by the admin. The wallet only moves when a row here reaches 'approved', and the
 -- decision is written once: approving twice cannot credit twice.
+--
+-- v1.5.4 widened the same row into "any way money comes in", because every one of
+-- them ends in the same two questions — how much, and is it really paid:
+--   method    receipt (a picture of a deposit) | card (card-to-card, the payer
+--             quotes his bank tracking code) | zarinpal | blue | manual (the bot
+--             or the admin charged the wallet directly);
+--   reference the gateway authority / ref_id, or the card-to-card tracking code;
+--   card_number which of the owner's published cards the money went to;
+--   auto_approved 1 when the scheduled sweep decided it, not a person — the admin
+--             has to be able to tell the two apart in his own list.
 CREATE TABLE IF NOT EXISTS topup_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -167,6 +200,11 @@ CREATE TABLE IF NOT EXISTS topup_requests (
   decided_at INTEGER NOT NULL DEFAULT 0,
   decision_note TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL DEFAULT 'bot',
+  method TEXT NOT NULL DEFAULT 'receipt',
+  reference TEXT NOT NULL DEFAULT '',
+  card_number TEXT NOT NULL DEFAULT '',
+  paid_at INTEGER NOT NULL DEFAULT 0,
+  auto_approved INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -331,6 +369,26 @@ function migrate(db) {
   // existing client but stays a row of ours ('panel'), which is what lets removing it
   // undo our own write instead of deleting something on the seller's panel.
   ensureColumn(db, 'configs', 'origin', "TEXT NOT NULL DEFAULT 'panel'");
+  // Panel v1.5.4 — the four new surfaces, all additive:
+  //
+  //   topup_requests.method/reference/card_number/paid_at/auto_approved
+  //       the row that used to hold only a Telegram receipt now holds any way
+  //       money comes in, and remembers whether a person or the schedule decided.
+  //       Old rows are receipts, which is exactly what they are.
+  //   users.referrer_id/commission_percent
+  //       پورسانت: who gets a slice of what this reseller pays, and how big.
+  //       Both default to "nobody, nothing", so no existing relationship and no
+  //       existing wallet changes when the panel upgrades.
+  for (const [column, ddl] of [
+    ['method', "TEXT NOT NULL DEFAULT 'receipt'"],
+    ['reference', "TEXT NOT NULL DEFAULT ''"],
+    ['card_number', "TEXT NOT NULL DEFAULT ''"],
+    ['paid_at', 'INTEGER NOT NULL DEFAULT 0'],
+    ['auto_approved', 'INTEGER NOT NULL DEFAULT 0'],
+  ]) ensureColumn(db, 'topup_requests', column, ddl);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_topups_pending ON topup_requests(status, method, created_at)');
+  ensureColumn(db, 'users', 'referrer_id', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'users', 'commission_percent', 'INTEGER NOT NULL DEFAULT 0');
   // Panel v1.4.16: every reseller can name one FIXED inbound. It is the base of
   // a package — pre-selected when a config is created and never removable — so a
   // package can never end up with zero inbounds and a customer can never be left

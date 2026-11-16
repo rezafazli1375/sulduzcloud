@@ -141,7 +141,7 @@ export default function Login() {
   const navigate = useNavigate();
   const isSetup = Boolean(setupRequired);
 
-  const [form, setForm] = useState({ username: '', password: '', name: '', confirm: '', panelName: '' });
+  const [form, setForm] = useState({ username: '', password: '', name: '', confirm: '' });
   const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -168,11 +168,12 @@ export default function Login() {
     setBusy(true);
     try {
       if (isSetup) {
+        // v1.5.4: no panelName. The brand is fixed in the code and /setup does
+        // not read the field, so the first-run request carries only the account.
         await setup({
           username: form.username.trim(),
           password: form.password,
           name: form.name.trim() || 'Owner',
-          panelName: form.panelName.trim() || undefined,
         });
       } else {
         await login(form.username.trim(), form.password);
@@ -217,16 +218,21 @@ export default function Login() {
           </div>
 
           <form onSubmit={submit} className="space-y-4">
+            {/*
+              v1.5.4, item 4: the brand is fixed in the code, so the first-run
+              screen no longer offers a name field. It used to, the value went to
+              /setup and the server threw it away — an input that cannot do
+              anything is worse than no input, so this now says what the name is
+              and why nobody gets to change it.
+            */}
             {isSetup ? (
-              <Field label={t('auth.panelName')}>
-                <Input
-                  value={form.panelName}
-                  onChange={update('panelName')}
-                  placeholder={meta?.panelName || 'Sulduz Cloud'}
-                  maxLength={60}
-                  autoComplete="organization"
-                />
-              </Field>
+              <div className="flex items-start gap-2.5 rounded-xl border border-white/[0.07] bg-white/[0.03] px-3.5 py-3">
+                <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300" />
+                <div className="min-w-0">
+                  <p className="text-[12px] font-semibold text-slate-100">{meta?.panelName || 'Sulduz Cloud'}</p>
+                  <p className="mt-0.5 text-[10.5px] leading-5 text-slate-500">{t('auth.brandLocked')}</p>
+                </div>
+              </div>
             ) : null}
 
             <Field label={isSetup ? t('resellers.form.username') : t('auth.username')} required>

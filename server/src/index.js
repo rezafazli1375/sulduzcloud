@@ -21,6 +21,7 @@ const telegram = require('./services/telegram');
 const bot = require('./services/bot');
 const reports = require('./services/reports');
 const usersService = require('./services/users');
+const topups = require('./services/topups');
 const { ApiError, dayKey, log, logError } = require('./utils');
 
 const app = express();
@@ -195,6 +196,48 @@ function startDailyReportTimer() {
   }, 60000).unref();
 }
 
+function startAutoApproveTimer() {
+  // v1.5.4, item 3: «زمان‌بندی تایید خودکار برای فیش‌های واریزی و کارت به کارت».
+  //
+  // The tick is cheap and reads its own settings every time, so a change the
+  // owner makes in the settings form takes effect on the next minute without a
+  // restart — the same rule the backup and report schedules follow, and the same
+  // one the reseller bot's switch learned in 1.5.2. runAutoApprove() re-checks
+  // every guard itself (switch on, ceiling set, methods chosen, age, per-reseller
+  // daily limit), so this function has no opinion about money and only about time.
+  let lastRun = 0;
+  setInterval(() => {
+    try {
+      const cfg = settings.getSetting('payment');
+      if (!cfg.autoApproveEnabled) return;
+      const everyMs = Math.min(60, Math.max(1, Number(cfg.autoApproveIntervalMinutes) || 1)) * 60000;
+      if (Date.now() - lastRun < everyMs) return;
+      lastRun = Date.now();
+      const summary = topups.runAutoApprove();
+      if (!summary.enabled) {
+        log(`[autoapprove] not running (${summary.reason}) — nothing checked`);
+        return;
+      }
+      if (!summary.approved && !summary.skipped) return;
+      log(`[autoapprove] checked ${summary.checked}, approved ${summary.approved}, skipped ${summary.skipped} (after ${summary.afterMinutes}m, ceiling ${summary.maxAmount}, methods ${summary.methods.join('+')})`);
+      // Only while the poller is actually up: the Telegram buttons exist precisely
+      // when it is, and a sweep must not open a socket on a panel whose bot is off.
+      if (bot.status().running) {
+        for (const item of summary.results || []) {
+          if (!item.approved) continue;
+          try {
+            bot.syncAdminMessage(topups.getRequest(item.id), 'approved', 'تایید خودکار').catch(() => {});
+          } catch (err) {
+            logError('[autoapprove] Telegram button update failed:', err.message);
+          }
+        }
+      }
+    } catch (err) {
+      logError('[autoapprove] sweep failed:', err.message);
+    }
+  }, 60000).unref();
+}
+
 function start() {
   getDb();
   settings.ensureDefaults();
@@ -204,6 +247,7 @@ function start() {
     monitor.start();
     startAutoBackupTimer();
     startDailyReportTimer();
+    startAutoApproveTimer();
     // v1.5.2: the reseller bot. It never blocks the boot — start() only checks
     // the webhook and then polls in the background, and a bot that is switched
     // off in settings stays idle without a single network call.

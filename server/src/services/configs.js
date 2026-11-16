@@ -243,6 +243,57 @@ function billingEnabled() {
   return Boolean(settings.getSetting('billing').enabled);
 }
 
+/**
+ * v1.5.4, item 6: پورسانت — a share of one reseller's spending going to the
+ * reseller who brought him.
+ *
+ * The owner's wording is «درصدی از خرید یک نماینده به نماینده دیگه برسه», so the
+ * rule is exactly that and nothing more elaborate:
+ *   - the money that earns a commission is a WALLET DEBIT for a sale (a package
+ *     built or renewed), which is why this hangs off chargeReseller and not off
+ *     the order routes — every charge in the panel already comes through here;
+ *   - who gets it is `users.referrer_id`, set per reseller by the admin;
+ *   - how much is `users.commission_percent` when that reseller has his own
+ *     agreed rate, otherwise the fleet default `billing.commissionPercent`;
+ *   - a percentage is never taken seriously above `billing.commissionCapPercent`
+ *     (and never above 50 at all), so a typo in a setting cannot hand away half
+ *     the fleet's revenue;
+ *   - billing off means no money moves, so no commission either.
+ *
+ * A commission is a CREDIT, and crediting does not earn a commission. That is
+ * what keeps two resellers who referred each other from looping forever, and it
+ * is why this returns a number instead of recursing.
+ */
+function commissionFor(buyer, amount) {
+  const paid = Math.round(Number(amount || 0));
+  if (!buyer || !(paid > 0)) return null;
+  const referrerId = Math.round(Number(buyer.referrer_id || 0));
+  if (!(referrerId > 0) || referrerId === Number(buyer.id)) return null;
+  const billing = settings.getSetting('billing');
+  const cap = Math.min(50, Math.max(0, Math.round(Number(billing.commissionCapPercent ?? 50))));
+  const own = Math.round(Number(buyer.commission_percent || 0));
+  const percent = Math.max(0, Math.min(cap, own > 0 ? own : Math.round(Number(billing.commissionPercent || 0))));
+  if (!(percent > 0)) return null;
+  const commission = Math.round((paid * percent) / 100);
+  if (!(commission > 0)) return null;
+  const db = getDb();
+  const referrer = db
+    .prepare("SELECT id, username, name, role, status, deleted_at FROM users WHERE id = ? AND deleted_at = 0 AND status = 'active'")
+    .get(referrerId);
+  // A referrer who was deleted or switched off simply stops earning; the sale
+  // itself is nobody's fault and must not fail because of him.
+  if (!referrer) return null;
+  return {
+    referrerId: Number(referrer.id),
+    referrerUsername: String(referrer.username || ''),
+    commission,
+    percent,
+    paid,
+    basis: own > 0 ? 'own' : 'fleet',
+    cap,
+  };
+}
+
 function chargeReseller(reseller, amount, description, type, req) {
   if (!billingEnabled() || !amount || amount <= 0) return null;
   const db = getDb();
@@ -252,13 +303,55 @@ function chargeReseller(reseller, amount, description, type, req) {
   }
   const next = Number(current.balance || 0) - amount;
   const now = Date.now();
+  // Worked out BEFORE the debit and paid INSIDE the same transaction: a sale must
+  // never happen without the commission it owed, and a broken referrer row must
+  // never block a customer's package. commissionFor() already dropped the second
+  // case by returning null for a referrer that is not there.
+  const commission = commissionFor(current, amount);
   const tx = db.transaction(() => {
     db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE id = ?').run(next, now, current.id);
     db.prepare(
       'INSERT INTO transactions (user_id, type, amount, balance_after, description, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
     ).run(current.id, type, -amount, next, description, req?.user?.id || 0, now);
+    if (commission) {
+      const refRow = db.prepare('SELECT balance FROM users WHERE id = ?').get(commission.referrerId);
+      const refBalance = Number(refRow?.balance || 0) + commission.commission;
+      db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE id = ?').run(refBalance, now, commission.referrerId);
+      db.prepare(
+        'INSERT INTO transactions (user_id, type, amount, balance_after, description, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).run(
+        commission.referrerId,
+        'commission',
+        commission.commission,
+        refBalance,
+        `پورسانت ${commission.percent}٪ از خرید ${current.username} (${commission.paid.toLocaleString('en-US')}) — ${description}`,
+        req?.user?.id || 0,
+        now
+      );
+      commission.balanceAfter = refBalance;
+    }
   });
   tx();
+  if (commission) {
+    // The referrer hears about it in his own panel, and the owner's audit trail
+    // gets the one line that says who paid whom — without this, a commission in
+    // the book is just a number nobody can explain afterwards.
+    notifyUser(commission.referrerId, {
+      type: 'success',
+      title: 'پورسانت واریز شد',
+      body: `${commission.percent}٪ از خرید نماینده ${current.username} — ${commission.commission.toLocaleString('en-US')} به کیف پول شما اضافه شد. موجودی: ${Number(commission.balanceAfter).toLocaleString('en-US')}`,
+      link: '/wallet',
+    });
+    audit(req, 'reseller.commission', 'user', commission.referrerId, {
+      from: Number(current.id),
+      fromUsername: String(current.username || ''),
+      amount: commission.commission,
+      percent: commission.percent,
+      basis: commission.basis,
+      paid: commission.paid,
+      balance: commission.balanceAfter,
+    });
+  }
   return next;
 }
 
@@ -853,6 +946,15 @@ async function createConfigs(input, req) {
     // Multi-inbound orders are billed once at the most expensive inbound's tariff.
     totalPrice = Math.max(totalPrice, price);
   }
+  // v1.5.4 — پلن آماده: when the order comes from a plan, the owner's own price
+  // replaces the tariff, full stop. Nothing in a request body can set it: the
+  // value is read from the `plans` row inside services/plans.js, and the reseller
+  // route that a customer-facing button posts to never forwards a price at all —
+  // exactly the rule v1.4.25 set for `charge`. Per-reseller discounts are NOT
+  // applied on top, because a price the owner wrote by hand is already his number.
+  const planPrice = Math.max(0, Math.round(Number(input.priceOverride || 0)));
+  const tariffPrice = totalPrice;
+  if (planPrice > 0) totalPrice = planPrice;
   // A subscription id only spans clients of one x-ui panel, so an order must
   // not mix inbounds from different servers.
   const orderServer = priced[0] ? Number(priced[0].server.id) : 0;
@@ -948,7 +1050,18 @@ async function createConfigs(input, req) {
     // Charge only after every client exists in x-ui; the whole order is rolled
     // back below when the wallet or the panel rejects it.
     if (willCharge && billingEnabled() && totalPrice > 0) {
-      chargeReseller(user, totalPrice, `ایجاد بسته ${inboundIds.length} اینباندی (${gb} GB مشترک / ${days} روز)`, 'purchase', req);
+      // A plan purchase says so in the reseller's book: the same money with a
+      // different label is the difference between «بسته ۳ اینباندی» and the plan
+      // he actually clicked, which is what he will look for months later.
+      chargeReseller(
+        user,
+        totalPrice,
+        planPrice > 0
+          ? `خرید پلن «${String(input.planName || '').slice(0, 60) || `#${Number(input.planId || 0)}`}» (${gb} GB / ${days} روز)`
+          : `ایجاد بسته ${inboundIds.length} اینباندی (${gb} GB مشترک / ${days} روز)`,
+        'purchase',
+        req
+      );
     }
   } catch (err) {
     await rollbackCreated(createdIds, createdEmails);
@@ -964,6 +1077,9 @@ async function createConfigs(input, req) {
     days,
     count: created.length,
     price: totalPrice,
+    tariff: tariffPrice,
+    planId: Number(input.planId || 0) || undefined,
+    planPrice: planPrice > 0 ? planPrice : undefined,
     charged: willCharge && billingEnabled() && totalPrice > 0,
     free: !willCharge,
   });
@@ -1354,7 +1470,7 @@ function packageRenewalPrice(row, { gb = 0, days = 0, price = 0, charge = true, 
   };
 }
 
-async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = false, charge } = {}, req, viewer) {
+async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = false, charge, planId = 0, planName = '' } = {}, req, viewer) {
   const { row } = configDetail(id, viewer);
   const addBytes = gbToBytes(Math.max(0, Number(gb || 0)));
   const addDays = Math.max(0, Math.round(Number(days || 0)));
@@ -1436,12 +1552,16 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
       // The ledger line says which kind of renewal this was: a replace is not a
       // top-up, and a reseller reading «+20GB» in his book for a package that
       // ended at 20GB would think the panel cheated him on the quota.
+      // v1.5.4: a plan renewal names the plan, because the money left the wallet
+      // for a thing he clicked by name, not for a size he typed.
       chargeReseller(
         reseller,
         amount,
-        outcome.replace
-          ? `تمدید جایگزین بسته ${targets.length} اینباندی (${gb}GB / ${addDays}d، مصرف صفر)`
-          : `تمدید بسته ${targets.length} اینباندی (+${gb}GB مشترک / +${addDays}d)`,
+        Number(planId) > 0
+          ? `اعمال پلن «${String(planName || '').slice(0, 60) || `#${Number(planId)}`}» (${gb}GB / ${addDays}d، مصرف و زمان ریست شد)`
+          : outcome.replace
+            ? `تمدید جایگزین بسته ${targets.length} اینباندی (${gb}GB / ${addDays}d، مصرف صفر)`
+            : `تمدید بسته ${targets.length} اینباندی (+${gb}GB مشترک / +${addDays}d)`,
         'renew',
         req
       );
@@ -1489,6 +1609,10 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
     // package and the meter is zeroed; 'add' is the old, untouched behaviour. The
     // audit has to say which one happened, because the two look identical in `gb`.
     mode: outcome.replace ? 'replace' : 'add',
+    // v1.5.4: a plan renewal records which plan was applied, so the audit can be
+    // read months later without opening the plans table.
+    planId: Number(planId || 0) || undefined,
+    planName: String(planName || '').slice(0, 60) || undefined,
     resultGb: bytesToGb(outcome.newTotal),
     resultExpiryAt: outcome.changeExpiry ? outcome.newExpiry : 0,
     amount,
@@ -3047,6 +3171,7 @@ function exportRows(filters, viewer) {
 
 module.exports = {
   createConfigs,
+  commissionFor,
   listConfigs,
   configDetail,
   detailView,

@@ -10,6 +10,7 @@ import {
   DatabaseBackup,
   Globe2,
   HelpCircle,
+  Layers,
   LayoutDashboard,
   LogOut,
   Menu,
@@ -41,6 +42,7 @@ const ADMIN_GROUPS = [
       { to: '/', end: true, label: 'nav.overview', icon: LayoutDashboard, perm: 'stats' },
       { to: '/resellers', label: 'nav.resellers', icon: Users, perm: 'users' },
       { to: '/configs', label: 'nav.configs', icon: Boxes, perm: 'configs' },
+      { to: '/plans', label: 'nav.plans', icon: Layers, perm: 'configs' },
       { to: '/inbounds', label: 'nav.inbounds', icon: Network, perm: 'inbounds' },
       { to: '/stats', label: 'nav.stats', icon: Activity, perm: 'stats' },
     ],
@@ -71,6 +73,7 @@ const RESELLER_GROUPS = [
     items: [
       { to: '/', end: true, label: 'nav.overview', icon: LayoutDashboard },
       { to: '/configs', label: 'nav.configs', icon: Boxes },
+      { to: '/plans', label: 'nav.plans', icon: Layers },
       { to: '/stats', label: 'nav.stats', icon: Activity },
       { to: '/tickets', label: 'nav.tickets', icon: MessageSquare },
       { to: '/wallet', label: 'nav.wallet', icon: CreditCard },
@@ -108,8 +111,23 @@ function Logo({ compact = false }) {
   );
 }
 
-function NavSection({ groupKey, items, onNavigate }) {
+function NavSection({ groupKey, items, onNavigate, showBroadcastBadge = false }) {
   const { t } = useI18n();
+
+  // v1.5.4, item 5: the red number in front of «اعلان‌ها». It counts ONLY the
+  // owner's own messages (type 'broadcast' — the /broadcast endpoint is the only
+  // thing that writes it), not every unread row, because the reseller asked to
+  // know when the OWNER wrote to him. The query shares the bell's cache key, so
+  // the badge and the dropdown are the same request, not two.
+  const { data } = useQuery({
+    queryKey: ['notifications', 'bell'],
+    queryFn: () => api.get('/notifications?pageSize=8'),
+    enabled: showBroadcastBadge,
+    refetchInterval: 30000,
+    staleTime: 15000,
+  });
+  const ownerUnread = Number(data?.unreadBroadcast || 0);
+
   return (
     <div className="mb-5">
       <p className="mb-2 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-600">{t(`nav.${groupKey}`)}</p>
@@ -126,6 +144,15 @@ function NavSection({ groupKey, items, onNavigate }) {
               <>
                 <item.icon className={cx('h-[18px] w-[18px] transition', isActive ? 'text-emerald-300' : 'text-slate-500')} />
                 <span className="truncate">{t(item.label)}</span>
+                {showBroadcastBadge && item.to === '/notifications' && ownerUnread > 0 ? (
+                  <span
+                    dir="ltr"
+                    title={t('notifications.ownerUnread')}
+                    className="ms-auto flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-gradient-to-r from-rose-500 to-red-600 px-1.5 text-[9.5px] font-bold text-white shadow-[0_0_12px_rgba(244,63,94,.85)]"
+                  >
+                    {ownerUnread > 99 ? '99+' : ownerUnread}
+                  </span>
+                ) : null}
               </>
             )}
           </NavLink>
@@ -323,6 +350,36 @@ function LiveBalance() {
           {t('wallet.receiptPending')} {formatNumber(data.pending, lang)}
         </span>
       ) : null}
+    </Link>
+  );
+}
+
+/**
+ * v1.5.4, item 1: «افزایش موجودی» next to the balance.
+ *
+ * The reseller asked for the top-up action where he already looks for his money,
+ * not two clicks deeper. This is a link to the wallet page with ?topup=1, which
+ * opens the payment section there — the button does not take money by itself, and
+ * it must not pretend to: every path still ends in a pending topup_requests row
+ * that the owner or the schedule decides.
+ *
+ * Renders for resellers only, for the same reason as the balance chip: an admin
+ * has no wallet of his own to top up.
+ */
+function TopUpButton() {
+  const { t } = useI18n();
+  const { isReseller } = useAuth();
+
+  if (!isReseller) return null;
+
+  return (
+    <Link
+      to="/wallet?topup=1"
+      title={t('wallet.topUp')}
+      className="flex h-9 items-center gap-1.5 rounded-xl border border-emerald-400/25 bg-emerald-500/10 px-2.5 text-[11.5px] font-semibold text-emerald-200 transition hover:border-emerald-400/50 hover:bg-emerald-500/20 hover:text-white"
+    >
+      <Plus className="h-[15px] w-[15px]" />
+      <span className="hidden sm:inline">{t('wallet.topUp')}</span>
     </Link>
   );
 }
@@ -529,7 +586,7 @@ export default function Shell() {
 
         <div className="flex-1 overflow-y-auto px-2.5 pt-5">
           {groups.map((group) => (
-            <NavSection key={group.key} groupKey={group.key} items={group.items} onNavigate={() => setSidebarOpen(false)} />
+            <NavSection key={group.key} groupKey={group.key} items={group.items} onNavigate={() => setSidebarOpen(false)} showBroadcastBadge={!isAdmin} />
           ))}
         </div>
 
@@ -565,6 +622,8 @@ export default function Shell() {
             ) : null}
             {/* v1.5.3: the reseller's wallet, always in reach; renders for him only. */}
             <LiveBalance />
+            {/* v1.5.4, item 1: the top-up button, right beside that balance. */}
+            <TopUpButton />
             <ThemeToggle />
             <LangToggle />
             <NotificationBell />

@@ -13,11 +13,13 @@ const inboundsService = require('../services/inbounds');
 const serversService = require('../services/servers');
 const configsService = require('../services/configs');
 const pricing = require('../services/pricing');
+const plansService = require('../services/plans');
 const statsService = require('../services/stats');
 const backupService = require('../services/backup');
 const telegram = require('../services/telegram');
 const bot = require('../services/bot');
 const topups = require('../services/topups');
+const payment = require('../services/payment');
 const reports = require('../services/reports');
 const monitor = require('../services/monitor');
 const ticketsService = require('../services/tickets');
@@ -158,10 +160,30 @@ router.get('/users/:id', auth.requirePerm('users'), (req, res) => {
   if (!user) throw new ApiError(404, 'not_found', 'User not found');
   const db = getDb();
   const transactions = db.prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20').all(user.id);
+  // v1.5.4: the two commission numbers an owner wants when he sets a rate — what
+  // this reseller has RECEIVED for referring people, and what his own spending
+  // has PAID OUT to whoever brought him. Both are read off the ledger rather than
+  // recomputed, so the figures agree with the transactions he can scroll through.
+  const earned = db.prepare("SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS c FROM transactions WHERE user_id = ? AND type = 'commission'").get(user.id);
+  const paid = db.prepare(
+    'SELECT COALESCE(SUM(t.amount),0) AS s, COUNT(*) AS c FROM transactions t WHERE t.type = ? AND t.user_id = (SELECT referrer_id FROM users WHERE id = ?)'
+  ).get('commission', user.id);
+  const referrer = Number(user.referrer_id || 0) > 0
+    ? db.prepare('SELECT id, username, name FROM users WHERE id = ?').get(Number(user.referrer_id))
+    : null;
   res.json({
     ok: true,
     data: {
       user: sanitizeUser(user),
+      referrer: referrer ? { id: Number(referrer.id), username: String(referrer.username || ''), name: String(referrer.name || '') } : null,
+      commission: {
+        earned: Number(earned.s || 0),
+        earnedCount: Number(earned.c || 0),
+        paidByReferrer: Number(paid.s || 0),
+        paidCount: Number(paid.c || 0),
+        percent: Number(user.commission_percent || 0),
+        fleetPercent: Math.max(0, Math.min(50, Math.round(Number(settings.getSetting('billing').commissionPercent || 0)))),
+      },
       stats: usersService.userStats(user.id),
       transactions: transactions.map((t) => ({
         id: t.id,
@@ -323,6 +345,33 @@ router.post('/pricing/quote', auth.requirePerm('configs'), (req, res) => {
     charge: Boolean(body.charge),
   });
   res.json({ ok: true, data: result });
+});
+
+// ---------------------------------------------------------------- plans (v1.5.4)
+//
+// Ready-made packages the owner prices himself: a volume, a duration, the
+// channels he picked and HIS price instead of the tariff. Authoring lives here;
+// buying lives on the reseller side, where no route reads a price from the body.
+
+router.get('/plans', auth.requirePerm('configs'), (req, res) => {
+  // An admin sees everything by default, including the hidden ones — he is the
+  // one who has to notice that a plan points at a channel that no longer exists.
+  res.json({ ok: true, data: { plans: plansService.listPlans({ viewer: req.user }) } });
+});
+
+router.post('/plans', auth.requirePerm('configs'), (req, res) => {
+  const plan = plansService.createPlan(req.body || {}, req);
+  res.status(201).json({ ok: true, data: { plan } });
+});
+
+router.patch('/plans/:id', auth.requirePerm('configs'), (req, res) => {
+  const plan = plansService.updatePlan(num(req.params.id), req.body || {}, req);
+  res.json({ ok: true, data: { plan } });
+});
+
+router.delete('/plans/:id', auth.requirePerm('configs'), (req, res) => {
+  const removed = plansService.deletePlan(num(req.params.id), req);
+  res.json({ ok: true, data: removed });
 });
 
 // ------------------------------------------------------------------ configs
@@ -826,6 +875,88 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
       throw new ApiError(422, 'telegram_not_configured', 'برای ربات نماینده‌ها ابتدا توکن ربات را ذخیره کنید / Save the bot token before switching the reseller bot on');
     }
   }
+  if (section === 'billing') {
+    // v1.5.4: پورسانت. A percentage is only ever a share of a real charge, so it
+    // is bounded where it is written rather than in the payout code: the fleet
+    // default can never exceed the cap the owner sets, and neither can go past
+    // half the price of a sale. A negative or absurd number here would turn the
+    // commission line into a way to inflate wallets.
+    if (clean.commissionPercent !== undefined) clean.commissionPercent = Math.min(50, Math.max(0, num(clean.commissionPercent, 0)));
+    if (clean.commissionCapPercent !== undefined) clean.commissionCapPercent = Math.min(50, Math.max(0, num(clean.commissionCapPercent, 50)));
+  }
+  if (section === 'payment') {
+    // v1.5.4: how money gets INTO a wallet, and whether the panel may release it
+    // without a person. Both sides of that need guards, because every field here
+    // either talks to a bank or credits one.
+    if (clean.cards !== undefined) {
+      const list = Array.isArray(clean.cards) ? clean.cards : [];
+      // normalizeCards drops anything malformed; refusing outright when nothing
+      // survived a real submission is more honest than silently saving an empty
+      // list and leaving the reseller with no card to pay into.
+      const normalized = settings.normalizeCards(list);
+      if (list.length && !normalized.length) {
+        throw new ApiError(422, 'invalid_cards', 'شماره کارت معتبر نیست (۱۶ رقم، بدون حروف) / Card numbers must be 16 digits');
+      }
+      clean.cards = normalized;
+    }
+    for (const key of ['zarinpalEnabled', 'zarinpalSandbox', 'blueEnabled', 'autoApproveEnabled', 'autoApproveReceipt', 'autoApproveCard']) {
+      if (clean[key] !== undefined) clean[key] = Boolean(clean[key]);
+    }
+    if (clean.blueLabel !== undefined) clean.blueLabel = String(clean.blueLabel).trim().slice(0, 40) || 'بلو بانک';
+    if (clean.zarinpalMerchantId !== undefined) {
+      const raw = String(clean.zarinpalMerchantId).trim();
+      if (raw && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
+        throw new ApiError(422, 'invalid_merchant_id', 'آیدی مرچنت زرین‌پال یک UUID معتبر نیست / The ZarinPal merchant id must be a valid UUID');
+      }
+      clean.zarinpalMerchantId = raw.toLowerCase();
+    }
+    if (clean.blueLink !== undefined) {
+      const raw = String(clean.blueLink).trim();
+      // The link carries the owner's own بلو payment token, which is why it is
+      // stored encrypted. A scheme check here is not security theatre: a link
+      // without one is a man's clipboard text, and handing it to a reseller as
+      // "this is the payment page" would be a lie.
+      if (raw && !/^https?:\/\//i.test(raw)) {
+        throw new ApiError(422, 'invalid_blue_link', 'لینک بلو باید با https:// شروع شود / The Blue Bank link must start with https://');
+      }
+      clean.blueLink = raw.slice(0, 600);
+    }
+    if (clean.autoApproveAfterMinutes !== undefined) clean.autoApproveAfterMinutes = Math.min(1440, Math.max(1, num(clean.autoApproveAfterMinutes, 15)));
+    if (clean.autoApproveIntervalMinutes !== undefined) clean.autoApproveIntervalMinutes = Math.min(60, Math.max(1, num(clean.autoApproveIntervalMinutes, 1)));
+    if (clean.autoApproveMaxAmount !== undefined) clean.autoApproveMaxAmount = Math.min(topups.MAX_AMOUNT, Math.max(0, Math.round(num(clean.autoApproveMaxAmount, 0))));
+    if (clean.autoApproveDailyLimit !== undefined) clean.autoApproveDailyLimit = Math.min(100, Math.max(0, Math.round(num(clean.autoApproveDailyLimit, 0))));
+    // Guard against saving a half-configured gateway or an unbounded sweep — the
+    // same rule the nightly report and the reseller bot follow, one setting
+    // section at a time.
+    //
+    // The merge has to skip a secret the form did not touch, because the form
+    // cannot echo it back: /admin/settings hands this tab an empty merchant id and
+    // an empty بلو link every time, with "saved — leaving this empty keeps what is
+    // stored" under each box. A plain overlay would put those blanks over the real
+    // values, and then the first guard below would refuse EVERY later save of this
+    // tab — including one that only sets the auto-approval ceiling — with
+    // "save the merchant id first". settings.isUnchangedSecret is the same rule
+    // updateSection uses to write, so guard and write agree.
+    const merged = { ...settings.getSetting('payment') };
+    for (const [field, value] of Object.entries(clean)) {
+      if (settings.isUnchangedSecret('payment', field, value)) continue;
+      merged[field] = value;
+    }
+    if (merged.zarinpalEnabled && !String(merged.zarinpalMerchantId || '').trim()) {
+      throw new ApiError(422, 'zarinpal_not_configured', 'ابتدا آیدی مرچنت زرین‌پال را ذخیره کنید / Save the ZarinPal merchant id before switching the gateway on');
+    }
+    if (merged.blueEnabled && !String(merged.blueLink || '').trim()) {
+      throw new ApiError(422, 'blue_not_configured', 'ابتدا لینک پرداخت بلو را وارد کنید / Paste the Blue Bank payment link before switching it on');
+    }
+    if (merged.autoApproveEnabled && Math.round(Number(merged.autoApproveMaxAmount || 0)) <= 0) {
+      throw new ApiError(422, 'auto_approve_ceiling_required',
+        'تایید خودکار بدون سقف مبلغ فعال نمی‌شود / Auto-approval needs a maximum amount before it can be switched on');
+    }
+    if (merged.autoApproveEnabled && !merged.autoApproveReceipt && !merged.autoApproveCard) {
+      throw new ApiError(422, 'auto_approve_no_method',
+        'حداقل یکی از دو روش (فیش واریزی یا کارت به کارت) را برای تایید خودکار انتخاب کنید / Pick at least one method for auto-approval');
+    }
+  }
   if (section === 'security') {
     if (clean.sessionDays !== undefined) clean.sessionDays = Math.min(90, Math.max(1, num(clean.sessionDays, 7)));
     if (clean.loginRateLimit !== undefined) clean.loginRateLimit = Math.min(100, Math.max(3, num(clean.loginRateLimit, 10)));
@@ -1094,6 +1225,10 @@ router.get('/topups', auth.requirePerm('users'), (req, res) => {
   const data = topups.listRequests({
     status: String(req.query.status || ''),
     userId: num(req.query.userId, 0),
+    // v1.5.4: which way the money came, and whether a person or the schedule
+    // decided it. Both are optional; anything unknown is refused by the service.
+    method: String(req.query.method || ''),
+    decision: String(req.query.decision || ''),
     page: num(req.query.page, 1),
     pageSize: num(req.query.pageSize, 30),
   });
@@ -1145,6 +1280,44 @@ router.post('/topups/:id/reject', auth.requirePerm('users'), asyncH(async (req, 
   bot.syncAdminMessage(result, 'rejected', req.user.username).catch(() => {});
   res.json({ ok: true, data: { request: result } });
 }));
+
+// v1.5.4: run the scheduled auto-approval by hand. The owner asked for a
+// schedule, and the schedule runs on its own timer (src/index.js); this endpoint
+// exists so he can see what the sweep WOULD do before he leaves money to it
+// overnight, and so a switch he just changed takes effect without waiting for
+// the next tick. Same function, same guards, same ledger — the only difference
+// is who pushed the button.
+router.post('/topups/auto-approve/run', auth.requirePerm('users'), (req, res) => {
+  const summary = topups.runAutoApprove();
+  for (const item of summary.results || []) {
+    if (!item.approved) continue;
+    const row = topups.getRequest(item.id);
+    if (row?.fileId || row?.source === 'bot') {
+      bot.syncAdminMessage(row, 'approved', 'تایید خودکار').catch(() => {});
+    }
+  }
+  audit(req, 'topup.auto_approve_run', 'topup', '', summary);
+  res.json({ ok: true, data: summary });
+});
+
+// What the payment methods look like from the reseller's side, with the same
+// reasons the panel gives: not what is switched on, but WHY something is off.
+router.get('/payment/status', auth.requirePerm('settings'), (req, res) => {
+  const methods = payment.methods();
+  const cfg = settings.getSetting('payment');
+  res.json({
+    ok: true,
+    data: {
+      methods,
+      autoApprove: {
+        switch: Boolean(cfg.autoApproveEnabled),
+        ...payment.autoApprove(),
+        intervalMinutes: Math.min(60, Math.max(1, Number(cfg.autoApproveIntervalMinutes) || 1)),
+      },
+      pending: topups.listRequests({ status: 'pending', page: 1, pageSize: 1 }).counts,
+    },
+  });
+});
 
 // The bot's own health: is it polling, did another consumer take the token, and
 // where do receipts go. A restart is offered because a 409 Conflict stops the

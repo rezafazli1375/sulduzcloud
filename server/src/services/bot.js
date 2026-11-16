@@ -545,18 +545,24 @@ function receiptsText(user) {
   const unit = esc(currency());
   const tone = { pending: '⏳', approved: '✅', rejected: '❌' };
   const lines = [
-    '🧾 <b>فیش‌های واریزی شما</b>',
+    '🧾 <b>واریزی‌های شما</b>',
     `نماینده: <code>${esc(user.username)}</code>`,
     `در انتظار: <b>${faNum(data.counts.pending)}</b> · تاییدشده: <b>${faNum(data.counts.approved)}</b> · ردشده: <b>${faNum(data.counts.rejected)}</b>`,
     '',
   ];
   if (!data.rows.length) {
-    lines.push('<i>هنوز فیشی ارسال نکرده‌اید. دکمهٔ «' + esc(BTN_TOPUP) + '» را بزنید.</i>');
+    lines.push('<i>هنوز واریزی‌ای ثبت نکرده‌اید. دکمهٔ «' + esc(BTN_TOPUP) + '» را بزنید.</i>');
   }
   for (const row of data.rows) {
-    lines.push(`${tone[row.status] || '•'} #${Number(row.id)} · <b>${faNum(row.amount)}</b> ${unit} · ${esc(faDate(row.createdAt, true))}`);
+    // v1.5.4: a row here is not always a Telegram picture any more — the panel
+    // also holds card-to-card claims and gateway orders, and in one list the
+    // reseller has to be able to tell which money he is looking at.
+    const method = esc(row.methodLabel || 'فیش واریزی');
+    lines.push(`${tone[row.status] || '•'} #${Number(row.id)} · ${method} · <b>${faNum(row.amount)}</b> ${unit} · ${esc(faDate(row.createdAt, true))}`);
+    if (row.reference) lines.push(`  کد رهگیری: <code>${esc(row.reference)}</code>`);
     if (row.status === 'approved') {
-      lines.push(`  <i>تایید شد${row.decidedByName ? ` توسط ${esc(row.decidedByName)}` : ''} · موجودی آن لحظه ${faNum(row.balance)} ${unit}</i>`);
+      const by = row.autoApproved ? 'به صورت خودکار' : row.decidedByName ? `توسط ${esc(row.decidedByName)}` : '';
+      lines.push(`  <i>تایید شد${by ? ` ${by}` : ''} · موجودی آن لحظه ${faNum(row.balance)} ${unit}</i>`);
     } else if (row.decisionNote) {
       lines.push(`  <i>یادداشت مدیر: ${esc(String(row.decisionNote).slice(0, 120))}</i>`);
     } else if (row.status === 'pending') {
@@ -802,9 +808,16 @@ async function startTopup(chatId, user) {
 /** The pending receipts, the way both /pending and the admin button show them. */
 function pendingListText(list) {
   const unit = esc(currency());
-  const lines = [`🧾 <b>فیش‌های در انتظار: ${faNum(list.counts.pending)}</b>`];
+  const lines = [`🧾 <b>واریزی‌های در انتظار: ${faNum(list.counts.pending)}</b>`];
   for (const row of list.rows) {
-    lines.push(`• #${Number(row.id)} · <code>${esc(row.username)}</code> · ${faNum(row.amount)} ${unit} · ${esc(faDate(row.createdAt, true))}`);
+    // v1.5.4: only a 'receipt' arrives as a picture in this chat. A card claim or
+    // a gateway order has no photo, so the line has to say what it is and quote
+    // whatever the reseller gave the bank as proof.
+    const method = esc(row.methodLabel || 'فیش واریزی');
+    lines.push(`• #${Number(row.id)} · <code>${esc(row.username)}</code> · ${method} · ${faNum(row.amount)} ${unit} · ${esc(faDate(row.createdAt, true))}`);
+    const proof = [row.cardNumber ? `کارت <code>${esc(row.cardNumber)}</code>` : '', row.reference ? `کد <code>${esc(row.reference)}</code>` : '']
+      .filter(Boolean).join(' · ');
+    if (proof) lines.push(`  ${proof}`);
   }
   if (!list.rows.length) lines.push('<i>موردی نیست.</i>');
   return lines.join('\n');

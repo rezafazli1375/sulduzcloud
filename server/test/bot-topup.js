@@ -271,7 +271,7 @@ async function main() {
 
   const rc = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, bot.BTN_RECEIPTS));
   check('«فیش‌های من» answers with his own receipt history, and says so when there is none yet',
-    rc.action === 'receipts' && textOf(lastTo(SHOP_TG)).includes('فیش‌های واریزی شما')
+    rc.action === 'receipts' && textOf(lastTo(SHOP_TG)).includes('واریزی‌های شما')
       && textOf(lastTo(SHOP_TG)).includes('در انتظار'),
     `action=${rc.action}`);
 
@@ -294,7 +294,7 @@ async function main() {
   for (const [payload, action, needle] of [
     ['balance', 'deep_balance', 'موجودی کیف پول'],
     ['packages', 'deep_packages', 'آمار اشتراک‌های شما'],
-    ['receipts', 'deep_receipts', 'فیش‌های واریزی شما'],
+    ['receipts', 'deep_receipts', 'واریزی‌های شما'],
     ['stats', 'deep_stats', 'آمار شما'],
   ]) {
     const deep = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, `/start ${payload}`));
@@ -523,8 +523,8 @@ async function main() {
   check('a button for a request that no longer exists is answered', ghost.reason === 'not_found', `reason=${ghost.reason}`);
 
   const pendingCmd = await bot.handleUpdate(says(UNLINKED_ADMIN_TG, ADMIN_CHAT, '/pending'));
-  check('/pending lists the waiting receipts in the admin chat',
-    pendingCmd.action === 'admin_pending' && textOf(lastTo(ADMIN_CHAT)).includes('فیش‌های در انتظار'),
+  check('/pending lists the waiting payments in the admin chat',
+    pendingCmd.action === 'admin_pending' && textOf(lastTo(ADMIN_CHAT)).includes('واریزی‌های در انتظار'),
     `action=${pendingCmd.action}`);
 
   // ------------------------------------------- v1.5.3: the admin's own keypad
