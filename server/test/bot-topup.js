@@ -44,6 +44,7 @@ global.fetch = blockedFetch;
 const { getDb, closeDb } = require('../src/db');
 const settings = require('../src/settings');
 const usersService = require('../src/services/users');
+const payment = require('../src/services/payment');
 const telegram = require('../src/services/telegram');
 const topups = require('../src/services/topups');
 const bot = require('../src/services/bot');
@@ -285,11 +286,39 @@ async function main() {
       && helpMsg.includes(SHOP_TG),
     `len=${helpMsg.length}`);
 
+  // ------------------------------------------------- v1.5.5: the card numbers
+  // The owner's item 2: «برای ثبت فیش واریزی مشتری از طریق ربات برای نماینده شماره
+  // کارت نشون نمیده که بدونه کدوم شماره کارت باید مبلغ واریز کنه / یک قسمتی برای
+  // فیش واریزی بزار که بشه شماره کارت برا این قسمت ثبت کرد». The panel now keeps
+  // the card list, and the bot reads it from the same place the wallet page does.
+  // Nothing is registered yet in this database, so the first tap has to be refused
+  // out loud: asking a man for a receipt with nowhere to send the money is a trap.
+  const bareHand = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, bot.BTN_TOPUP));
+  check('v1.5.5: while the panel holds no card number the bot refuses the receipt and says why, and opens no conversation',
+    bareHand.ok === false && bareHand.reason === 'no_cards'
+      && textOf(lastTo(SHOP_TG)).includes('شماره کارتی در پنل تعریف نشده')
+      && bot.stepOf(SHOP_TG) === null && topups.pendingCount(shop.id) === 0
+      && balanceOf(shop.id) === 1250000,
+    `reason=${bareHand.reason}`);
+
+  const OWNER_CARDS = [
+    { number: '6037991122334455', holder: 'اول', bank: 'بانک اول' },
+    { number: '6219861034567890', holder: 'دوم', bank: 'بانک دوم' },
+  ];
+  settings.setSetting('payment', { cards: OWNER_CARDS });
+  check('v1.5.5: the cards registered for فیش واریزی are the ones the payment service hands to the bot, in the order they were entered',
+    payment.receipt().cards.length === 2
+      && payment.receipt().cards.map((one) => one.number).join(',') === '6037991122334455,6219861034567890'
+      && payment.receipt().enabled === true && payment.receipt().ready === true
+      && payment.receipt().reason === '',
+    `cards=${payment.receipt().cards.length}`);
+
   // ---- the deep links the panel buttons open
   const deepTopup = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, '/start topup'));
-  check('the panel link ?start=topup lands straight in the top-up conversation',
+  check('the panel link ?start=topup lands straight in the top-up conversation, with the card numbers in the same message',
     deepTopup.step === 'amount' && bot.stepOf(SHOP_TG)?.step === 'amount'
-      && textOf(lastTo(SHOP_TG)).includes('افزایش موجودی با فیش واریزی'),
+      && textOf(lastTo(SHOP_TG)).includes('افزایش موجودی با فیش واریزی')
+      && textOf(lastTo(SHOP_TG)).includes('6037 9911 2233 4455'),
     `step=${bot.stepOf(SHOP_TG)?.step}`);
   for (const [payload, action, needle] of [
     ['balance', 'deep_balance', 'موجودی کیف پول'],
@@ -370,6 +399,17 @@ async function main() {
     opened.step === 'amount' && bot.stepOf(SHOP_TG)?.step === 'amount'
       && textOf(lastTo(SHOP_TG)).includes('مبلغ'),
     `step=${bot.stepOf(SHOP_TG)?.step}`);
+
+  // The complaint was never the conversation; it was a conversation that ended with
+  // «واریز کنید» and no number to pay. Every card the owner registered must be in
+  // this message, readable on a phone: grouped in fours, with bank and holder.
+  const topupPrompt = textOf(lastTo(SHOP_TG));
+  check('v1.5.5: the top-up prompt prints every registered card grouped in fours, with its bank and its holder',
+    opened.step === 'amount' && opened.cards === 2
+      && topupPrompt.includes('6037 9911 2233 4455') && topupPrompt.includes('6219 8610 3456 7890')
+      && topupPrompt.includes('بانک اول') && topupPrompt.includes('بانک دوم')
+      && topupPrompt.includes('به نام') && topupPrompt.includes('💳'),
+    `cards=${opened.cards} len=${topupPrompt.length}`);
 
   const amountStep = await bot.handleUpdate(says(SHOP_TG, SHOP_TG, '500000'));
   check('the amount is accepted and the picture is asked for — no request yet',

@@ -415,6 +415,26 @@ function emailFor(user) {
   return `${base}-${String(Date.now()).slice(-6)}`;
 }
 
+/**
+ * What the seller panel shows next to this customer (v1.5.5, his item 5).
+ *
+ * x-ui has no label of its own: the only free text a client carries is `comment`,
+ * and that is the column the node panel displays as the customer's description. So
+ * برچسب — the name the reseller gives a subscription — leads it, followed by who
+ * the customer is and how to reach him. One function, used by the create, the
+ * rebuild and the edit path, because three places writing the same sentence
+ * differently is how a node ends up disagreeing with the panel that owns it.
+ *
+ * 120 characters is x-ui's own field width; the label alone is capped at 80.
+ */
+function clientComment({ label, customerName, customerPhone } = {}) {
+  return [label, customerName, customerPhone]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .join(' | ')
+    .slice(0, 120);
+}
+
 // A Telegram id can appear anywhere in a client name: this panel writes
 // "<telegramId>-<random>", while seller panels prefix the plan ("german🇩🇪-<id>-<random>",
 // "SG-<id>-<random>"). Comparing whole digit runs keeps a longer id from matching
@@ -996,7 +1016,9 @@ async function createConfigs(input, req) {
   const subId = randomToken(16);
   const email = emailFor(user);
   const uuid = randomUUID();
-  const comment = [input.label, input.customerName, input.customerPhone].filter(Boolean).join(' | ').slice(0, 120);
+  const comment = clientComment({
+    label: input.label, customerName: input.customerName, customerPhone: input.customerPhone,
+  });
 
   try {
     const server = priced[0].server;
@@ -1970,24 +1992,227 @@ async function refreshPackage(id, req, viewer) {
   };
 }
 
+/**
+ * Edit the four text fields of a subscription.
+ *
+ * Until v1.5.5 this was a database-only function, which is why a reseller could
+ * rename a customer here and still see the old name in the node panel: x-ui has no
+ * label column, `comment` is the one free text it shows for a client, and nothing
+ * ever wrote it after the client was created. Now the same sentence the create and
+ * the rebuild build — برچسب first, then who the customer is — goes to the node with
+ * every edit that touches one of the three identity fields.
+ *
+ * label / customer / phone describe the PERSON, and one package is one person on one
+ * node, so all of its inbound rows carry the same three values; leaving the siblings
+ * behind is how a label appeared to "revert" after the representative row was
+ * deleted. `note` stays on the one row — it is the panel's remark about a channel,
+ * and the node has no slot for it.
+ *
+ * A node that cannot be reached must not cost a reseller the text he typed: the save
+ * stands, `recreatePackageClient` reads these same columns, and the response carries
+ * `commentSync` so the screen can say out loud that the node was not told.
+ */
 async function updateMeta(id, patch, req, viewer) {
   const { row } = configDetail(id, viewer);
-  const fields = [];
-  const values = [];
-  for (const [key, column, max] of [
-    ['label', 'label', 80],
-    ['customerName', 'customer_name', 80],
-    ['customerPhone', 'customer_phone', 32],
-    ['note', 'note', 500],
-  ]) {
-    if (patch[key] !== undefined) { fields.push(`${column} = ?`); values.push(String(patch[key] || '').slice(0, max)); }
+  const clean = {};
+  for (const [key, max] of [['label', 80], ['customerName', 80], ['customerPhone', 32], ['note', 500]]) {
+    if (patch[key] !== undefined) clean[key] = String(patch[key] || '').trim().slice(0, max);
   }
-  if (!fields.length) return hydrate(row);
-  fields.push('updated_at = ?');
-  values.push(Date.now(), row.id);
-  db().prepare(`UPDATE configs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
-  audit(req, 'config.update', 'config', row.id, Object.keys(patch));
-  return hydrate(getConfigRow(row.id));
+  if (!Object.keys(clean).length) return hydrate(row);
+
+  const identity = ['label', 'customerName', 'customerPhone'].some((key) => clean[key] !== undefined);
+  const comment = clientComment({
+    label: clean.label !== undefined ? clean.label : row.label,
+    customerName: clean.customerName !== undefined ? clean.customerName : row.customer_name,
+    customerPhone: clean.customerPhone !== undefined ? clean.customerPhone : row.customer_phone,
+  });
+
+  let commentSync = { pushed: false, reason: '' };
+  if (identity && String(row.email || '')) {
+    try {
+      // An empty patch apart from the comment, and no inbound list: updateClient()
+      // re-reads the live client, sends every other field back unchanged and keeps
+      // every channel he is already on.
+      await xui.updateClient(row.email, { comment }, [], serverOfConfig(row));
+      commentSync = { pushed: true, reason: '', comment };
+    } catch (err) {
+      commentSync = {
+        pushed: false,
+        reason: xui.isMissingClient(err) ? 'client_missing' : String(err.message || 'xui_error').slice(0, 200),
+      };
+    }
+  }
+
+  const now = Date.now();
+  const idFields = [];
+  const idValues = [];
+  for (const [key, column] of [['label', 'label'], ['customerName', 'customer_name'], ['customerPhone', 'customer_phone']]) {
+    if (clean[key] !== undefined) { idFields.push(`${column} = ?`); idValues.push(clean[key]); }
+  }
+  if (idFields.length) {
+    const update = db().prepare(`UPDATE configs SET ${idFields.join(', ')}, updated_at = ? WHERE id = ?`);
+    for (const member of packageRows(row)) update.run(...idValues, now, member.id);
+  }
+  if (clean.note !== undefined) {
+    db().prepare('UPDATE configs SET note = ?, updated_at = ? WHERE id = ?').run(clean.note, now, row.id);
+  }
+  audit(req, 'config.update', 'config', row.id, { ...Object.keys(clean), commentSync });
+  return { ...hydrate(getConfigRow(row.id)), commentSync };
+}
+
+/**
+ * v1.5.5, item 4: hand one customer over to another reseller.
+ *
+ * A package is the group CONFIG_GROUP_KEY_SQL builds, and that key carries
+ * user_id, so moving a customer means rewriting user_id on EVERY member row at
+ * once. Moving the one row the admin clicked would split the customer into two
+ * packages with two quotas — and the node would still be serving one link.
+ *
+ * The node is not touched: the client, his subscription link and his quota on the
+ * node panel belong to the customer, not to whoever sells him. usage_daily.user_id
+ * IS touched, because the ledger freezes the owner into every day it writes;
+ * without it the old reseller keeps a customer's traffic history he no longer has
+ * (stats.js and reports.js read that column, not configs.user_id).
+ *
+ * What deliberately does not move: transactions. The money the first reseller
+ * paid stays his, and the new owner is neither charged nor refunded for a customer
+ * the panel owner handed him.
+ */
+async function transferCustomer(id, payload = {}, req, viewer) {
+  if (viewer?.role !== 'admin') {
+    throw new ApiError(403, 'forbidden',
+      'فقط مدیر می‌تواند مشتری را به نماینده دیگری بدهد / Only the admin can move a customer between resellers');
+  }
+  const { row } = configDetail(id, viewer);
+  const db = getDb();
+  const members = packageRows(row);
+
+  const toId = Number(payload.toUserId || payload.userId || 0);
+  if (!toId) throw new ApiError(422, 'reseller_required', 'نمایندهٔ مقصد مشخص نشده است / Target reseller is required');
+  if (Number(row.user_id || 0) === toId) {
+    throw new ApiError(422, 'same_reseller', 'این مشتری همین حالا نزد همین نماینده است / This customer is already with that reseller');
+  }
+  const source = getResellerRow(row.user_id);
+  const target = getResellerRow(toId);
+  if (!target) throw new ApiError(404, 'user_not_found', 'نمایندهٔ مقصد پیدا نشد / Target reseller not found');
+  if (String(target.role) === 'admin') {
+    throw new ApiError(409, 'target_is_admin', 'مقصد باید یک نماینده باشد، نه مدیر / The target must be a reseller');
+  }
+  if (String(target.status) !== 'active') {
+    throw new ApiError(409, 'reseller_inactive', `نمایندۀ «${target.username}» غیرفعال است / That reseller is not active`);
+  }
+
+  // The two rules that would leave the customer in a state the new owner cannot
+  // manage: a channel he has no permission for, and his own caps. isUsableBy is
+  // the same predicate the create form and addInbound use, so a transfer never
+  // passes where an order would have been refused.
+  const allowed = usersService.allowedInboundIds(target);
+  const fixedId = usersService.fixedInboundId(target);
+  const blocked = [];
+  for (const member of members) {
+    const inbound = getInboundRow(member.inbound_id);
+    if (inboundsService.isUsableBy(inbound, { allowed, fixedId, isAdmin: false })) continue;
+    blocked.push({
+      configId: Number(member.id),
+      inboundId: Number(member.inbound_id),
+      inbound: inbound ? `${inbound.remark || `#${inbound.xui_id}`} · ${inbound.protocol}` : `#${member.inbound_id}`,
+    });
+  }
+  if (blocked.length) {
+    throw new ApiError(409, 'inbound_not_allowed',
+      `«${target.username}» به ${blocked.map((item) => item.inbound).join('، ')} دسترسی ندارد — اول از ویرایش نماینده اجازه بدهید / The target reseller has no permission for these channels — grant them first`);
+  }
+
+  // configs has UNIQUE(email, inbound_id), so a customer the target already holds
+  // on any of these channels would turn the rewrite into an SQLite constraint
+  // error halfway through the transaction. The index is the reason this is almost
+  // never seen — but a legacy install that carries two rows for one channel (see
+  // recreatePackageClient, which deletes exactly that leftover) has no working
+  // index, so the guard has to look at EVERY row of the pair and not just the
+  // first one back. Reading only the first would find the member's own row and
+  // call the clash "no clash".
+  const clash = db.prepare('SELECT id, user_id, deleted_at FROM configs WHERE email = ? AND inbound_id = ?');
+  const ownIds = new Set(members.map((item) => Number(item.id)));
+  const taken = [];
+  for (const member of members) {
+    for (const other of clash.all(String(member.email || ''), Number(member.inbound_id))) {
+      if (!ownIds.has(Number(other.id))) taken.push(Number(other.id));
+    }
+  }
+  if (taken.length) {
+    throw new ApiError(409, 'already_with_target',
+      `این مشتری از قبل در لیست «${target.username}» هست / This customer is already registered under that reseller`);
+  }
+
+  const packageGb = bytesToGb(Math.max(0, ...members.map((item) => Number(item.total_bytes || 0))));
+  try {
+    // count: one package. gb: its quota, so a total-traffic cap is honoured.
+    usersService.checkLimits(target, { gb: packageGb, days: 0, count: 1, gbEach: packageGb });
+  } catch (err) {
+    if (err instanceof ApiError && /^limit_/.test(String(err.code || ''))) {
+      throw new ApiError(403, err.code, `سقف «${target.username}» اجازهٔ این انتقال را نمی‌دهد: ${err.message}`);
+    }
+    throw err;
+  }
+
+  const dryRun = Boolean(payload.dryRun);
+  const preview = {
+    configId: Number(row.id),
+    email: String(row.email || ''),
+    label: String(row.label || ''),
+    customerName: String(row.customer_name || ''),
+    fromReseller: source ? source.username : String(row.user_id || ''),
+    toReseller: target.username,
+    rows: members.map((item) => Number(item.id)),
+    inbounds: members.map((item) => {
+      const inbound = getInboundRow(item.inbound_id);
+      return inbound ? `${inbound.remark || `#${inbound.xui_id}`} · ${inbound.protocol}` : `#${item.inbound_id}`;
+    }),
+    totalGb: Number(packageGb.toFixed(3)),
+    daysLeft: Number(row.expiry_at) > 0 ? Math.max(0, Math.ceil((Number(row.expiry_at) - Date.now()) / DAY_MS)) : 0,
+  };
+  if (dryRun) return { ...preview, dryRun: true, moved: 0, usageRows: 0 };
+
+  const now = Date.now();
+  const ownerUpdate = db.prepare('UPDATE configs SET user_id = ?, updated_at = ? WHERE id = ?');
+  const ledgerUpdate = db.prepare('UPDATE usage_daily SET user_id = ? WHERE config_id = ?');
+  let usageRows = 0;
+  db.transaction(() => {
+    for (const member of members) {
+      ownerUpdate.run(toId, now, Number(member.id));
+      usageRows += Number(ledgerUpdate.run(toId, Number(member.id)).changes || 0);
+    }
+  })();
+
+  // Both sides have to see why their numbers moved — his customer count, his
+  // traffic chart and the nightly Telegram report all change with this one click.
+  const line = `${preview.email}${preview.label ? ` — ${preview.label}` : ''} · ${preview.inbounds.length} کانال`;
+  notifyUser(toId, {
+    type: 'info',
+    title: 'مشتری به شما منتقل شد',
+    body: `از «${preview.fromReseller}»: ${line}`,
+    link: '/reseller/configs',
+  });
+  if (source) {
+    notifyUser(Number(source.id), {
+      type: 'info',
+      title: 'مشتری منتقل شد',
+      body: `به «${target.username}»: ${line}`,
+      link: '/reseller/configs',
+    });
+  }
+
+  audit(req, 'config.transfer', 'config', Number(row.id), {
+    email: preview.email,
+    fromUserId: Number(row.user_id || 0),
+    toUserId: toId,
+    configs: preview.rows,
+    totalGb: preview.totalGb,
+    usageRows,
+    reason: String(payload.note || '').slice(0, 200),
+  });
+
+  return { ...preview, dryRun: false, moved: members.length, usageRows };
 }
 
 /**
@@ -2844,7 +3069,9 @@ async function recreatePackageClient(id, req, viewer) {
   const totalBytes = members.reduce((max, item) => Math.max(max, Number(item.total_bytes || 0)), 0);
   const expiryAt = members.reduce((max, item) => Math.max(max, Number(item.expiry_at || 0)), 0);
   const enabled = members.some((item) => Number(item.enabled || 0) === 1);
-  const comment = [own.label, own.customer_name, own.customer_phone].filter(Boolean).join(' | ').slice(0, 120);
+  const comment = clientComment({
+    label: own.label, customerName: own.customer_name, customerPhone: own.customer_phone,
+  });
 
   let created = null;
   try {
@@ -3197,6 +3424,7 @@ module.exports = {
   resetUsage,
   refreshPackage,
   updateMeta,
+  transferCustomer,
   removeConfig,
   deletePackage,
   groupFor,

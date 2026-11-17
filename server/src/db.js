@@ -176,12 +176,15 @@ CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, create
 -- decision is written once: approving twice cannot credit twice.
 --
 -- v1.5.4 widened the same row into "any way money comes in", because every one of
--- them ends in the same two questions — how much, and is it really paid:
---   method    receipt (a picture of a deposit) | card (card-to-card, the payer
---             quotes his bank tracking code) | zarinpal | blue | manual (the bot
---             or the admin charged the wallet directly);
---   reference the gateway authority / ref_id, or the card-to-card tracking code;
---   card_number which of the owner's published cards the money went to;
+-- them ends in the same two questions — how much, and is it really paid. v1.5.5 took
+-- two of those ways away at the owner's request; the columns stay, because a wallet
+-- history is not deleted when a method is:
+--   method    receipt (a picture of a deposit) | zarinpal | manual (the bot or the
+--             admin charged the wallet directly). 'card' and 'blue' rows written by
+--             1.5.4 still read back with their Persian label and are never swept;
+--   reference the gateway authority / ref_id, or a bank tracking code;
+--   card_number which of the owner's published cards the money went to — since
+--             v1.5.5 that is the card a RECEIPT was paid into;
 --   auto_approved 1 when the scheduled sweep decided it, not a person — the admin
 --             has to be able to tell the two apart in his own list.
 CREATE TABLE IF NOT EXISTS topup_requests (

@@ -464,6 +464,23 @@ router.patch('/configs/:id', auth.requirePerm('configs'), asyncH(async (req, res
   res.json({ ok: true, data: { config } });
 }));
 
+// v1.5.5, item 4: give one customer to another reseller. The whole package moves,
+// so the admin is shown exactly what will move first: dryRun answers with the
+// preview and writes nothing, and the button posts the same body with dryRun off.
+router.post('/configs/:id/transfer', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const result = await configsService.transferCustomer(
+    num(req.params.id),
+    {
+      toUserId: num(req.body?.toUserId, 0),
+      note: String(req.body?.note || ''),
+      dryRun: Boolean(req.body?.dryRun),
+    },
+    req,
+    req.user,
+  );
+  res.json({ ok: true, data: result });
+}));
+
 router.post('/configs/:id/extend', auth.requirePerm('configs'), asyncH(async (req, res) => {
   const config = await configsService.extendConfig(
     num(req.params.id),
@@ -885,9 +902,16 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     if (clean.commissionCapPercent !== undefined) clean.commissionCapPercent = Math.min(50, Math.max(0, num(clean.commissionCapPercent, 50)));
   }
   if (section === 'payment') {
-    // v1.5.4: how money gets INTO a wallet, and whether the panel may release it
-    // without a person. Both sides of that need guards, because every field here
-    // either talks to a bank or credits one.
+    // How money gets INTO a wallet, and whether the panel may release it without a
+    // person. Both sides of that need guards, because every field here either talks
+    // to a bank or credits one. v1.5.5: two methods left, each with its own switch —
+    // فیش واریزی and ZarinPal.
+    //
+    // A form still open in a browser tab from 1.5.4 posts the retired fields back
+    // with every save. They would be dropped on write anyway (updateSection only
+    // accepts keys that are in DEFAULTS), but dropping them here keeps them out of
+    // the audit entry too, so the log says what the panel actually stored.
+    for (const key of settings.RETIRED_PAYMENT_KEYS) delete clean[key];
     if (clean.cards !== undefined) {
       const list = Array.isArray(clean.cards) ? clean.cards : [];
       // normalizeCards drops anything malformed; refusing outright when nothing
@@ -895,31 +919,19 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
       // list and leaving the reseller with no card to pay into.
       const normalized = settings.normalizeCards(list);
       if (list.length && !normalized.length) {
-        throw new ApiError(422, 'invalid_cards', 'شماره کارت معتبر نیست (۱۶ رقم، بدون حروف) / Card numbers must be 16 digits');
+        throw new ApiError(422, 'invalid_cards', 'شماره کارت معتبر نیست (۱۰ تا ۲۴ رقم، بدون حروف) / Card numbers must be 10-24 digits');
       }
       clean.cards = normalized;
     }
-    for (const key of ['zarinpalEnabled', 'zarinpalSandbox', 'blueEnabled', 'autoApproveEnabled', 'autoApproveReceipt', 'autoApproveCard']) {
+    for (const key of ['zarinpalEnabled', 'zarinpalSandbox', 'receiptEnabled', 'autoApproveEnabled', 'autoApproveReceipt']) {
       if (clean[key] !== undefined) clean[key] = Boolean(clean[key]);
     }
-    if (clean.blueLabel !== undefined) clean.blueLabel = String(clean.blueLabel).trim().slice(0, 40) || 'بلو بانک';
     if (clean.zarinpalMerchantId !== undefined) {
       const raw = String(clean.zarinpalMerchantId).trim();
       if (raw && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
         throw new ApiError(422, 'invalid_merchant_id', 'آیدی مرچنت زرین‌پال یک UUID معتبر نیست / The ZarinPal merchant id must be a valid UUID');
       }
       clean.zarinpalMerchantId = raw.toLowerCase();
-    }
-    if (clean.blueLink !== undefined) {
-      const raw = String(clean.blueLink).trim();
-      // The link carries the owner's own بلو payment token, which is why it is
-      // stored encrypted. A scheme check here is not security theatre: a link
-      // without one is a man's clipboard text, and handing it to a reseller as
-      // "this is the payment page" would be a lie.
-      if (raw && !/^https?:\/\//i.test(raw)) {
-        throw new ApiError(422, 'invalid_blue_link', 'لینک بلو باید با https:// شروع شود / The Blue Bank link must start with https://');
-      }
-      clean.blueLink = raw.slice(0, 600);
     }
     if (clean.autoApproveAfterMinutes !== undefined) clean.autoApproveAfterMinutes = Math.min(1440, Math.max(1, num(clean.autoApproveAfterMinutes, 15)));
     if (clean.autoApproveIntervalMinutes !== undefined) clean.autoApproveIntervalMinutes = Math.min(60, Math.max(1, num(clean.autoApproveIntervalMinutes, 1)));
@@ -930,14 +942,15 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     // section at a time.
     //
     // The merge has to skip a secret the form did not touch, because the form
-    // cannot echo it back: /admin/settings hands this tab an empty merchant id and
-    // an empty بلو link every time, with "saved — leaving this empty keeps what is
-    // stored" under each box. A plain overlay would put those blanks over the real
-    // values, and then the first guard below would refuse EVERY later save of this
-    // tab — including one that only sets the auto-approval ceiling — with
-    // "save the merchant id first". settings.isUnchangedSecret is the same rule
-    // updateSection uses to write, so guard and write agree.
-    const merged = { ...settings.getSetting('payment') };
+    // cannot echo it back: /admin/settings hands this tab an empty merchant id every
+    // time, with "saved — leaving this empty keeps what is stored" under the box. A
+    // plain overlay would put that blank over the real value, and then the first
+    // guard below would refuse EVERY later save of this tab — including one that
+    // only sets the auto-approval ceiling — with "save the merchant id first".
+    // settings.isUnchangedSecret is the same rule updateSection uses to write, so
+    // guard and write agree.
+    const storedPayment = { ...settings.getSetting('payment') };
+    const merged = { ...storedPayment };
     for (const [field, value] of Object.entries(clean)) {
       if (settings.isUnchangedSecret('payment', field, value)) continue;
       merged[field] = value;
@@ -945,16 +958,25 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     if (merged.zarinpalEnabled && !String(merged.zarinpalMerchantId || '').trim()) {
       throw new ApiError(422, 'zarinpal_not_configured', 'ابتدا آیدی مرچنت زرین‌پال را ذخیره کنید / Save the ZarinPal merchant id before switching the gateway on');
     }
-    if (merged.blueEnabled && !String(merged.blueLink || '').trim()) {
-      throw new ApiError(422, 'blue_not_configured', 'ابتدا لینک پرداخت بلو را وارد کنید / Paste the Blue Bank payment link before switching it on');
+    // His reason for asking for a switch was a button that offered nothing. Flipping
+    // فیش واریزی on with no card of his own in the list is exactly that, so it is
+    // refused at the switch rather than at the reseller's end. Only when THIS save
+    // turns it on: an install that runs receipts-off until he gets round to typing a
+    // card must stay savable — and so must the save that takes his last card away
+    // while receipts are already running. Reading the stored switch, instead of
+    // asking whether the list is empty, is what tells those two apart; the second
+    // one lands in `no_cards`, which the rail and the reseller's page both explain.
+    const receiptsWereOn = Boolean(storedPayment.receiptEnabled);
+    if (clean.receiptEnabled === true && !receiptsWereOn && !(merged.cards || []).length) {
+      throw new ApiError(422, 'receipt_not_configured', 'ابتدا حداقل یک شماره کارت برای فیش واریزی ثبت کنید / Add at least one card number before switching receipts on');
     }
     if (merged.autoApproveEnabled && Math.round(Number(merged.autoApproveMaxAmount || 0)) <= 0) {
       throw new ApiError(422, 'auto_approve_ceiling_required',
         'تایید خودکار بدون سقف مبلغ فعال نمی‌شود / Auto-approval needs a maximum amount before it can be switched on');
     }
-    if (merged.autoApproveEnabled && !merged.autoApproveReceipt && !merged.autoApproveCard) {
+    if (merged.autoApproveEnabled && !merged.autoApproveReceipt) {
       throw new ApiError(422, 'auto_approve_no_method',
-        'حداقل یکی از دو روش (فیش واریزی یا کارت به کارت) را برای تایید خودکار انتخاب کنید / Pick at least one method for auto-approval');
+        'تایید خودکار برای فیش واریزی انتخاب نشده است / Switch on auto-approval for deposit receipts');
     }
   }
   if (section === 'security') {

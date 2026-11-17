@@ -346,7 +346,7 @@ function LiveBalance() {
         {balance === null ? '—' : formatMoney(balance, lang, data.currency)}
       </span>
       {Number(data?.pending || 0) > 0 ? (
-        <span className="rounded-md bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-bold text-amber-200">
+        <span className="hidden rounded-md bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-bold text-amber-200 sm:inline-block">
           {t('wallet.receiptPending')} {formatNumber(data.pending, lang)}
         </span>
       ) : null}
@@ -541,6 +541,25 @@ export default function Shell() {
     setSidebarOpen(false);
   }, [location.pathname]);
 
+  // v1.5.5, item 3: on a phone the drawer covers the page, so the page behind it
+  // must stop scrolling and Escape must close it — the two things a desktop
+  // pointer gives you for free. Locking document overflow is what the panel's own
+  // Drawer (ui.jsx) already does for every modal here, so the sidebar behaves
+  // like the rest of the app instead of a half-open column.
+  useEffect(() => {
+    if (!sidebarOpen) return undefined;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKey = (event) => {
+      if (event.key === 'Escape') setSidebarOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = previous;
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [sidebarOpen]);
+
   const groups = useMemo(() => {
     if (!isAdmin) return RESELLER_GROUPS;
     return ADMIN_GROUPS.map((group) => ({
@@ -564,10 +583,21 @@ export default function Shell() {
         <div className="fixed inset-0 z-40 bg-[#02040a]/70 backdrop-blur-sm lg:hidden" onClick={() => setSidebarOpen(false)} aria-hidden="true" />
       ) : null}
 
+      {/*
+        v1.5.5, item 3 — why the column is shown with `display` and not with a
+        transform. The old rule slid it away with `max-lg:rtl:translate-x-full`,
+        and `max-lg:` is the ONLY media-range variant in the whole app: it compiles
+        to `@media (width <= 1023px)`, which Chrome below 104 and the WebView that
+        ships with older Androids throw away. On such a phone the closed state had
+        no rule at all, so the drawer sat over the page with nothing to hide it and
+        the button looked dead — the owner's «درست باز نمیشه و ناپدید…».
+        `hidden` / `lg:flex` are plain class toggles, so the drawer is either on
+        screen or not on screen, exactly like the panel's own Drawer component.
+      */}
       <aside
         className={cx(
-          'fixed inset-y-0 start-0 z-50 flex w-[268px] flex-col border-e border-white/[0.06] bg-[#060a14]/92 backdrop-blur-2xl transition-transform duration-300 lg:z-30 lg:translate-x-0',
-          sidebarOpen ? 'translate-x-0' : 'max-lg:ltr:-translate-x-full max-lg:rtl:translate-x-full'
+          'fixed inset-y-0 start-0 z-50 w-[268px] flex-col border-e border-white/[0.06] bg-[#060a14]/92 backdrop-blur-2xl lg:z-30 lg:flex',
+          sidebarOpen ? 'flex' : 'hidden'
         )}
       >
         <div className="flex h-[68px] items-center justify-between border-b border-white/[0.06] px-5">
@@ -584,6 +614,13 @@ export default function Shell() {
           </button>
         </div>
 
+        {/* On a phone the header has no room left for these two, so they live
+            here instead; from 640px up the header carries them again. */}
+        <div className="flex items-center gap-2 border-b border-white/[0.06] px-5 py-3 sm:hidden">
+          <ThemeToggle />
+          <LangToggle />
+        </div>
+
         <div className="flex-1 overflow-y-auto px-2.5 pt-5">
           {groups.map((group) => (
             <NavSection key={group.key} groupKey={group.key} items={group.items} onNavigate={() => setSidebarOpen(false)} showBroadcastBadge={!isAdmin} />
@@ -597,9 +634,10 @@ export default function Shell() {
         <header className="sticky top-0 z-30 flex h-[68px] items-center gap-3 border-b border-white/[0.06] bg-[#050811]/72 px-4 backdrop-blur-xl sm:px-6">
           <button
             type="button"
-            className="rounded-xl border border-white/[0.08] bg-white/[0.04] p-2 text-slate-300 transition hover:text-white lg:hidden"
+            className="shrink-0 rounded-xl border border-white/[0.08] bg-white/[0.04] p-2 text-slate-300 transition hover:text-white lg:hidden"
             onClick={() => setSidebarOpen(true)}
             aria-label="menu"
+            aria-expanded={sidebarOpen}
           >
             <Menu className="h-5 w-5" />
           </button>
@@ -610,7 +648,7 @@ export default function Shell() {
             <span className="truncate text-[13px] font-semibold text-slate-200">{currentLabel}</span>
           </div>
 
-          <div className="ms-auto flex items-center gap-2">
+          <div className="ms-auto flex min-w-0 items-center gap-2">
             {showQuickCreate ? (
               <Link
                 to="/configs?new=1"
@@ -624,8 +662,17 @@ export default function Shell() {
             <LiveBalance />
             {/* v1.5.4, item 1: the top-up button, right beside that balance. */}
             <TopUpButton />
-            <ThemeToggle />
-            <LangToggle />
+            {/*
+              v1.5.5, item 3: these two need ~96px of a 390px row that is already
+              full, and a flex row does not wrap what it cannot shrink — it pushes
+              the FIRST item off the edge, which in RTL is the menu button itself.
+              Below 640px they move into the drawer instead, so the button that
+              opens the menu is always on screen.
+            */}
+            <div className="hidden items-center gap-2 sm:flex">
+              <ThemeToggle />
+              <LangToggle />
+            </div>
             <NotificationBell />
             <UserMenu />
           </div>

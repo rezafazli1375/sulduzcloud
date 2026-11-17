@@ -12,10 +12,10 @@ const SECRET_FIELDS = {
   smtp: ['pass'],
   sms: ['apiKey'],
   telegram: ['botToken'],
-  // v1.5.4: a ZarinPal merchant id and a Blue Bank payment link are credentials of
-  // the owner's own money accounts. They are stored encrypted and handed back to
-  // the admin form masked, exactly like the bot token.
-  payment: ['zarinpalMerchantId', 'blueLink'],
+  // A ZarinPal merchant id is a credential of the owner's own money account. It is
+  // stored encrypted and handed back to the admin form masked, exactly like the bot
+  // token. (v1.5.5 dropped `blueLink` with the بلو gateway itself.)
+  payment: ['zarinpalMerchantId'],
 };
 
 // v1.5.4: fields the panel refuses to change, whoever asks. The brand name is the
@@ -34,6 +34,14 @@ function isLocked(section, field) {
 // present in a settings row written by an older panel; they are dropped on read
 // and rewritten once on boot so nothing pattern-shaped survives the upgrade.
 const LEGACY_SMS_KEYS = ['mode', 'pattern', 'patternVar1', 'patternVar2', 'patternVar3', 'patternNames', 'patterns'];
+
+// v1.5.5 removed two payment methods the owner decided he does not want: the بلو
+// prepared link and card-to-card (a receipt is still paid into one of his cards, he
+// just does not want "card to card" offered as a separate thing). The keys can still
+// sit in a `payment` row written by 1.5.4 — including an encrypted بلو link nobody
+// can reach any more — so they are dropped on read and rewritten on the next save,
+// the same way the removed SMS patterns were handled in v1.4.13.
+const RETIRED_PAYMENT_KEYS = ['blueEnabled', 'blueLink', 'blueLabel', 'autoApproveCard'];
 
 const DEFAULTS = {
   general: {
@@ -104,29 +112,26 @@ const DEFAULTS = {
     commissionPercent: 0,
     commissionCapPercent: 50,
   },
-  // v1.5.4: how a reseller puts money into his wallet.
+  // How a reseller puts money into his wallet. Since v1.5.5 there are two ways, and
+  // each one has its own switch so the owner can offer either, both, or neither:
   //
-  //   cards         — the owner's own card numbers, shown to every reseller for
-  //                   فیش واریزی and کارت به کارت;
-  //   zarinpal*     — the ZarinPal REST API v4 (request → StartPay → callback →
-  //                   verify). The merchant id is a credential;
-  //   blueLink      — بلو بانک publishes no payment API, so this is the prepared
-  //                   link the owner made inside his own بلو account. `{amount}`
-  //                   in it is replaced with the amount in rials so the reseller
-  //                   only has to tap and confirm;
-  //   autoApprove*  — the scheduled release of pending receipts and
-  //                   card-to-card claims, see services/topups.js.
+  //   receiptEnabled  — فیش واریزی: the reseller pays into one of `cards` and sends
+  //                     the receipt (from the panel or from the bot) for approval;
+  //   cards           — the owner's card numbers for those receipts, up to MAX_CARDS.
+  //                     The bot reads them out to the reseller (v1.5.5) so he knows
+  //                     which number to pay into. A card number is not a secret —
+  //                     it is what money is sent TO — so it is stored plainly;
+  //   zarinpal*       — the ZarinPal REST API v4 (request → StartPay → callback →
+  //                     verify). The merchant id is a credential;
+  //   autoApprove*    — the scheduled release of pending receipts, topups.js.
   payment: {
     cards: [],
+    receiptEnabled: true,
     zarinpalEnabled: false,
     zarinpalMerchantId: '',
     zarinpalSandbox: false,
-    blueEnabled: false,
-    blueLink: '',
-    blueLabel: 'بلو بانک',
     autoApproveEnabled: false,
     autoApproveReceipt: true,
-    autoApproveCard: true,
     autoApproveAfterMinutes: 15,
     autoApproveMaxAmount: 0,
     autoApproveDailyLimit: 0,
@@ -166,10 +171,12 @@ const DEFAULTS = {
   },
 };
 
-// v1.5.4: the owner can publish several of his own card numbers, so a reseller
-// picks the one he actually paid into and the receipt says so. A card number is
-// not a secret (it is what money is sent TO), so it is stored plainly and handed
-// to the reseller panel as it is.
+// The owner can publish several of his own card numbers. Since v1.5.5 they belong to
+// one thing only — فیش واریزی — and they answer two questions: which number does a
+// reseller pay into (the bot reads this list out, services/bot.js) and which one did
+// he actually use (topup_requests.card_number). A card number is not a secret (it is
+// what money is sent TO), so it is stored plainly and handed to the reseller panel
+// as it is.
 const MAX_CARDS = 12;
 
 function normalizeCards(value) {
@@ -188,6 +195,16 @@ function normalizeCards(value) {
     });
     if (out.length >= MAX_CARDS) break;
   }
+  return out;
+}
+
+// The retired payment keys are dropped everywhere the section is read or written, so
+// a row saved by 1.5.4 cannot hand a بلو link back to any consumer, and the next
+// save of that tab rewrites the row without them.
+function prunePaymentKeys(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const out = { ...obj };
+  for (const field of RETIRED_PAYMENT_KEYS) delete out[field];
   return out;
 }
 
@@ -249,7 +266,11 @@ function getSetting(key) {
   // written by an earlier version — or edited by hand — cannot rename the panel
   // either, and every consumer (meta, bot footer, reports, SMS) agrees.
   if (key === 'general') merged.panelName = brand.PANEL_NAME;
-  if (key === 'payment') merged.cards = normalizeCards(merged.cards);
+  if (key === 'payment') {
+    merged.cards = normalizeCards(merged.cards);
+    // بلو and card-to-card are gone (v1.5.5): never surface their retired keys.
+    return prunePaymentKeys(merged);
+  }
   if (key !== 'sms') return merged;
 
   // Per-event merge so an event added in a later version never wipes the
@@ -276,7 +297,7 @@ function setSetting(key, obj) {
   const current = getSetting(key);
   const next = { ...current, ...(obj || {}) };
   for (const field of LOCKED_FIELDS[key] || []) next[field] = current[field];
-  rawSet(key, encryptSection(key, next));
+  rawSet(key, encryptSection(key, key === 'payment' ? prunePaymentKeys(next) : next));
   return getSetting(key);
 }
 
@@ -308,7 +329,7 @@ function updateSection(key, patch, { keepSecrets = true } = {}) {
     next[field] = value;
   }
   if (key === 'payment') next.cards = normalizeCards(next.cards);
-  rawSet(key, encryptSection(key, next));
+  rawSet(key, encryptSection(key, key === 'payment' ? prunePaymentKeys(next) : next));
   return getSetting(key);
 }
 
@@ -351,6 +372,22 @@ function migrateSmsShape() {
   return true;
 }
 
+/**
+ * v1.5.5 removed the بلو link and card-to-card. A `payment` row written by 1.5.4
+ * still carries those four keys — one of them an encrypted credential — so the first
+ * boot after the upgrade rewrites the row without them. getSetting already refuses to
+ * surface them; this is what actually takes them out of the database.
+ */
+function migratePaymentShape() {
+  const raw = rawGet('payment');
+  if (!raw) return false;
+  const parsed = safeJsonParse(raw, {});
+  if (!RETIRED_PAYMENT_KEYS.some((field) => field in parsed)) return false;
+  // Secrets that remain are already stored encrypted: write the pruned object back.
+  rawSet('payment', prunePaymentKeys(parsed));
+  return true;
+}
+
 function ensureDefaults() {
   const db = getDb();
   const insert = db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)');
@@ -359,6 +396,7 @@ function ensureDefaults() {
   }
 
   if (migrateSmsShape()) console.log('[settings] SMS settings migrated to the text-only shape (patterns removed)');
+  if (migratePaymentShape()) console.log('[settings] payment settings migrated (بلو link and card-to-card removed)');
 
   // Seed the x-ui token from the protected file on first run.
   const xui = getSetting('xui');
@@ -431,13 +469,16 @@ module.exports = {
   DEFAULTS,
   SECRET_FIELDS,
   LEGACY_SMS_KEYS,
+  RETIRED_PAYMENT_KEYS,
   LOCKED_FIELDS,
   MAX_CARDS,
   isLocked,
   normalizeCards,
+  prunePaymentKeys,
   extractToken,
   ensureDefaults,
   migrateSmsShape,
+  migratePaymentShape,
   getSetting,
   setSetting,
   updateSection,

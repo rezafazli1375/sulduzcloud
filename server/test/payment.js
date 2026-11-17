@@ -1,8 +1,9 @@
 'use strict';
 
 /**
- * v1.5.4 — how money gets INTO a wallet, who may release it without a person
- * looking, what the panel is called, and what a referrer is owed.
+ * v1.5.4 built the money-in paths; v1.5.5 cut two of them and moved the card
+ * numbers into the one method that kept them. This suite covers both, because the
+ * rows a live panel already has were written by 1.5.4.
  *
  * The owner's sentences behind this file (verbatim):
  *   «درگاه پرداخت زرین پال هم اضافه کن به پنل و پرداخت با لینک آماده بلو بانک رو
@@ -10,6 +11,11 @@
  *   «قابلیت زمان بندی تایید خودکار برای فیش های واریزی و کارت به کارت»
  *   «اسم پنل ثابت و غیر قابل تغییر باشد»
  *   «قابلیت پورسانت باشه — درصدی از خرید یک نماینده به نماینده دیگه برسه»
+ *   — then, on 1.5.5:
+ *   «درگاه پرداخت بلوبانک و کارت به کارت حذف کن و همچنین دکمه روشن و خاموش کردن
+ *     درگاه هارو هم بزار»
+ *   «برای ثبت فیش واریزی مشتری از طریق ربات برای نماینده شماره کارت نشون نمیده
+ *     که بدونه کدوم شماره کارت باید مبلغ واریز کنه»
  *
  * Like bot-test, this suite runs IN PROCESS against a throwaway DATA_DIR: no
  * server is spawned and nothing is allowed to open a socket. `global.fetch` is a
@@ -93,7 +99,6 @@ const topups = require('../src/services/topups');
 const notify = require('../src/notify');
 
 const MERCHANT = 'c8e8f1a2-1111-4abc-9def-0123456789ab';
-const BLUE_PLACEHOLDER = 'https://blue.example/pay/sulduz?amount={amount}';
 const CARD_A = '6037991122334455';
 const CARD_B = '6219861034567890';
 const CARD_C = '5057851234567891';
@@ -142,13 +147,24 @@ async function main() {
   const actor = { user: { id: owner.id, role: 'admin' } };
 
   // ═══════════════════════════════ 1. the block as shipped ═══════════════════
-  console.log('\n── v1.5.4 payment defaults ──');
+  console.log('\n── v1.5.5 payment defaults ──');
   const fresh = payment.methods();
-  check('a fresh panel offers no card, no gateway and no بلو link',
-    fresh.cards.length === 0 && fresh.cardToCard === false
-      && fresh.zarinpal.enabled === false && fresh.blue.enabled === false
-      && fresh.blue.hasAmountPlaceholder === false,
-    `cards=${fresh.cards.length} zp=${fresh.zarinpal.enabled} blue=${fresh.blue.enabled}`);
+  // v1.5.5, item 1: the owner looked at the three ways 1.5.4 offered and asked for
+  // two of them to go — «درگاه پرداخت بلوبانک و کارت به کارت حذف کن». The shape
+  // this call returns is what the wallet page renders, so the retired entries must
+  // be ABSENT, not switched off: a key that is merely false still invites someone
+  // to render a button for it later.
+  check('a fresh panel offers a receipt and a gateway, and nothing else',
+    fresh.cards.length === 0 && fresh.zarinpal.enabled === false
+      && fresh.receipt.enabled === true && fresh.receipt.ready === false,
+    `cards=${fresh.cards.length} zp=${fresh.zarinpal.enabled} receipt=${fresh.receipt.enabled}`);
+  check('the بلو link and کارت به کارت are gone from the method list, not merely off',
+    !('blue' in fresh) && !('cardToCard' in fresh) && !('card' in fresh)
+      && Object.keys(fresh).sort().join(',') === 'cards,currency,receipt,zarinpal',
+    Object.keys(fresh).sort().join(','));
+  check('a receipt with no card number behind it says why it is not ready',
+    fresh.receipt.reason === 'no_cards' && fresh.receipt.hasCards === false,
+    `reason=${fresh.receipt.reason}`);
   check('and says WHY the gateway is missing instead of showing a dead button',
     fresh.zarinpal.reason === 'not_configured' && fresh.zarinpal.ready === false,
     `reason=${fresh.zarinpal.reason}`);
@@ -159,26 +175,25 @@ async function main() {
     sweepOff.enabled === false && sweepOff.maxAmount === 0 && sweepOff.dailyLimit === 0
       && sweepOff.afterMinutes === 15 && sweepOff.intervalMinutes === 1,
     `enabled=${sweepOff.enabled} max=${sweepOff.maxAmount}`);
-  check('the sweep is never pointed at a gateway payment, even by default',
-    sweepOff.methods.zarinpal === false && sweepOff.methods.blue === false
-      && sweepOff.methods.receipt === true && sweepOff.methods.card === true,
+  check('the sweep is pointed at the receipt alone — the gateway proves itself',
+    sweepOff.methods.receipt === true && sweepOff.methods.zarinpal === false
+      && Object.keys(sweepOff.methods).length === 2,
     JSON.stringify(sweepOff.methods));
 
   // ════════════════════════════ 2. credentials at rest ═══════════════════════
   console.log('\n── the owner’s bank credentials ──');
-  setPay({ zarinpalMerchantId: MERCHANT, blueLink: BLUE_PLACEHOLDER });
+  setPay({ zarinpalMerchantId: MERCHANT });
   const rawPayment = rawSetting('payment');
-  check('the merchant id and the بلو link are not written in the clear',
-    !rawPayment.includes(MERCHANT) && !rawPayment.includes('blue.example') && rawPayment.length > 20,
+  check('the merchant id is not written in the clear',
+    !rawPayment.includes(MERCHANT) && rawPayment.length > 20,
     `rawLen=${rawPayment.length}`);
-  check('yet the panel reads them back whole, because they are encrypted and not hashed',
-    pay().zarinpalMerchantId === MERCHANT && pay().blueLink === BLUE_PLACEHOLDER,
+  check('yet the panel reads it back whole, because it is encrypted and not hashed',
+    pay().zarinpalMerchantId === MERCHANT && pay().zarinpalEnabled === false,
     `merchantLen=${String(pay().zarinpalMerchantId || '').length}`);
   const redacted = settings.redactSection('payment', pay());
   check('the admin form is handed a mask, never the secret itself',
-    redacted.zarinpalMerchantId === '' && redacted.hasZarinpalMerchantId === true
-      && redacted.blueLink === '' && redacted.hasBlueLink === true,
-    `hasMerchant=${redacted.hasZarinpalMerchantId} hasBlue=${redacted.hasBlueLink}`);
+    redacted.zarinpalMerchantId === '' && redacted.hasZarinpalMerchantId === true,
+    `hasMerchant=${redacted.hasZarinpalMerchantId}`);
   check('saving the form again without retyping the merchant id keeps it',
     (() => {
       settings.updateSection('payment', { zarinpalEnabled: true, zarinpalSandbox: false, zarinpalMerchantId: '' });
@@ -192,6 +207,44 @@ async function main() {
       setPay({ zarinpalMerchantId: MERCHANT });
       return replaced === 'aaaaaaaa-2222-4333-8444-555566667777' && pay().zarinpalMerchantId === MERCHANT;
     })());
+  // v1.5.5, item 1: the four keys 1.5.4 wrote are retired. An install that upgrades
+  // in place still has them in its `payment` row — including a بلو link that is now
+  // an encrypted string nobody can reach — so the read must hide them and the boot
+  // migration must delete them, the way the removed SMS patterns were handled.
+  const RETIRED = ['blueEnabled', 'blueLink', 'blueLabel', 'autoApproveCard'];
+  db().prepare("UPDATE settings SET value = ? WHERE key = 'payment'").run(JSON.stringify({
+    cards: [{ number: CARD_A, holder: 'قدیمی' }],
+    receiptEnabled: true, zarinpalEnabled: false, zarinpalMerchantId: '', zarinpalSandbox: false,
+    autoApproveEnabled: false, autoApproveReceipt: true, autoApproveAfterMinutes: 15,
+    autoApproveMaxAmount: 0, autoApproveDailyLimit: 0, autoApproveIntervalMinutes: 1,
+    blueEnabled: true, blueLink: 'enc1:AGhvc3Qtbm8tbG9uZ2VyLXVzZWQ', blueLabel: 'بلو — فروشگاه', autoApproveCard: true,
+  }));
+  check('a payment row written by 1.5.4 answers without the retired keys',
+    RETIRED.every((field) => !(field in pay())),
+    RETIRED.filter((field) => field in pay()).join(',') || 'none');
+  check('its card list survives the upgrade — the owner keeps what he typed',
+    pay().cards.length === 1 && pay().cards[0].number === CARD_A,
+    `cards=${pay().cards.length}`);
+  check('the boot migration reports the row as needing work, then reports it clean',
+    (() => {
+      const first = settings.migratePaymentShape();
+      const stored = rawSetting('payment');
+      const second = settings.migratePaymentShape();
+      return first === true && second === false && RETIRED.every((field) => !stored.includes(field));
+    })(),
+    `retired=${RETIRED.filter((field) => rawSetting('payment').includes(field)).join(',') || 'none'}`);
+  check('and no write path puts a retired key back',
+    (() => {
+      setPay(Object.fromEntries(RETIRED.map((field) => [field, 'x'])));
+      const stored = rawSetting('payment');
+      return settings.updateSection('payment', { receiptEnabled: true }).blueEnabled === undefined
+        && !RETIRED.some((field) => field in pay())
+        && !stored.includes('blueLink');
+    })(),
+    RETIRED.filter((field) => field in pay()).join(',') || 'none');
+  // The checks above rewrote the whole row; put the gateway back the way the rest
+  // of the suite (and ZarinPal's own section) expects to find it.
+  setPay({ zarinpalMerchantId: MERCHANT, zarinpalEnabled: true });
 
   // ═══════════════════════════ 3. several card numbers ═══════════════════════
   console.log('\n── تعریف چند شماره کارت ──');
@@ -215,8 +268,13 @@ async function main() {
     messy.cards.map((card) => card.number).join(','));
   check('the same card typed twice is stored once',
     new Set(messy.cards.map((card) => card.number)).size === messy.cards.length);
-  check('a reseller is offered card-to-card the moment one card exists',
-    payment.methods().cardToCard === true && payment.methods().cards.length === 3);
+  // v1.5.5, item 2: since v1.5.4 the card list answers one question only — «کدام
+  // کارت؟» — and it is what the bot reads out to a reseller before he pays. A
+  // receipt method is ready the moment the owner has a number for him to use.
+  check('the receipt becomes ready the moment one card exists, and shows all of them',
+    payment.methods().receipt.ready === true && payment.methods().receipt.hasCards === true
+      && payment.methods().receipt.reason === '' && payment.methods().cards.length === 3,
+    `ready=${payment.methods().receipt.ready} cards=${payment.methods().cards.length}`);
   const many = settings.updateSection('payment', {
     cards: Array.from({ length: 15 }, (_unused, index) => ({ number: `61000000000000${String(index).padStart(2, '0')}` })),
   });
@@ -224,47 +282,47 @@ async function main() {
     many.cards.length === settings.MAX_CARDS, `${many.cards.length}/${settings.MAX_CARDS}`);
   setPay({ cards: [{ number: CARD_A, holder: 'اول' }, { number: CARD_B, holder: 'دوم' }] });
 
-  // ═══════════════════════════ 4. the بلو ready-made link ════════════════════
-  console.log('\n── لینک آماده بلو بانک ──');
-  setPay({ blueEnabled: true, blueLabel: 'بلو — فروشگاه' });
-  check('the بلو entry turns on only when the owner both pasted a link and switched it on',
-    payment.blue().enabled === true && payment.methods().blue.enabled === true,
-    `enabled=${payment.blue().enabled}`);
-  check('and it carries the label he typed, not a hard-coded one',
-    payment.blue().label === 'بلو — فروشگاه', payment.blue().label);
-  const link500 = payment.blueLinkFor(500);
-  check('the {amount} placeholder is filled in RIALS, the unit an Iranian bank page expects',
-    link500.link === 'https://blue.example/pay/sulduz?amount=5000'
-      && link500.rial === 5000 && link500.amount === 500 && link500.prefilled === true,
-    link500.link);
-  check('a link without the placeholder is still handed over, marked as not pre-filled',
+  // ═══════════ 4. the two retired methods refuse, in both directions ═════════
+  console.log('\n── روش‌های حذف‌شده: بلو و کارت به کارت ──');
+  const shop0 = makeUser('payearly', { balance: 0 });
+  const messageOf = (fn) => {
+    try { fn(); return ''; } catch (err) { return String(err?.message || ''); }
+  };
+  check('the payment service exports no بلو helper at all',
+    payment.blue === undefined && payment.blueLinkFor === undefined,
+    `blue=${typeof payment.blue} blueLinkFor=${typeof payment.blueLinkFor}`);
+  check('a کارت به کارت request is refused with a message that names the two ways left',
     (() => {
-      setPay({ blueLink: 'https://blue.example/pay/sulduz' });
-      const plain = payment.blueLinkFor(250);
-      setPay({ blueLink: BLUE_PLACEHOLDER });
-      return plain.link === 'https://blue.example/pay/sulduz' && plain.prefilled === false;
-    })());
-  check('{amount_toman} is answered in تومان for the rare link that expects it',
-    (() => {
-      setPay({ blueLink: 'https://blue.example/pay?t={amount_toman}&r={amount}' });
-      const both = payment.blueLinkFor(250);
-      setPay({ blueLink: BLUE_PLACEHOLDER });
-      return both.link === 'https://blue.example/pay?t=250&r=2500' && both.prefilled === true;
+      const code = codeOf(() => topups.createRequest({ userId: shop0.id, amount: 5000, method: 'card' }));
+      const text = messageOf(() => topups.createRequest({ userId: shop0.id, amount: 5000, method: 'card' }));
+      return code === 'method_removed' && text.includes('حذف شده')
+        && text.includes('فیش واریزی') && text.includes('درگاه');
     })(),
-    payment.blueLinkFor(1).link);
-  check('opening the بلو link records nothing — a link is not a payment',
+    String(codeOf(() => topups.createRequest({ userId: shop0.id, amount: 5000, method: 'card' }))));
+  check('and so is a بلو one, whether or not an old row still carries its link',
+    codeOf(() => topups.createRequest({ userId: shop0.id, amount: 30000, method: 'blue' })) === 'method_removed');
+  check('a method that never existed is still refused as unknown, not as removed',
+    codeOf(() => topups.createRequest({ userId: shop0.id, amount: 5000, method: 'paypal' })) === 'invalid_method');
+  check('neither retired method leaves a row behind',
+    Number(db().prepare("SELECT COUNT(*) AS c FROM topup_requests WHERE method IN ('card','blue')").get().c) === 0);
+  check('the receipt has its own switch, and with it off no receipt is accepted',
     (() => {
-      const rowsBefore = Number(db().prepare('SELECT COUNT(*) AS c FROM topup_requests').get().c);
-      payment.blueLinkFor(250000);
-      return Number(db().prepare('SELECT COUNT(*) AS c FROM topup_requests').get().c) === rowsBefore;
-    })());
-  check('switching بلو off makes its link refuse rather than lie',
+      setPay({ receiptEnabled: false });
+      const offCode = codeOf(() => topups.createRequest({ userId: shop0.id, amount: 5000, method: 'receipt' }));
+      setPay({ receiptEnabled: true });
+      const onCode = codeOf(() => topups.createRequest({ userId: shop0.id, amount: 5000, method: 'receipt' }));
+      return offCode === 'receipt_disabled' && onCode === null;
+    })(),
+    `on=${codeOf(() => topups.createRequest({ userId: shop0.id, amount: 5001, method: 'receipt' }))}`);
+  check('the gateway has its own switch too, and off means off on the reseller’s screen',
     (() => {
-      setPay({ blueEnabled: false });
-      const code = codeOf(() => payment.blueLinkFor(100));
-      setPay({ blueEnabled: true });
-      return code === 'blue_disabled';
-    })());
+      setPay({ zarinpalEnabled: false });
+      const built = payment.methods().zarinpal;
+      setPay({ zarinpalEnabled: true });
+      return built.enabled === false && built.ready === false && built.reason === 'not_configured'
+        && payment.methods().zarinpal.enabled === true;
+    })(),
+    `enabled=${payment.methods().zarinpal.enabled} reason=${payment.methods().zarinpal.reason}`);
 
   // ═══════════════════════════ 5. ZarinPal, step by step ════════════════════
   console.log('\n── درگاه زرین‌پال ──');
@@ -409,10 +467,10 @@ async function main() {
   setPay({ autoApproveEnabled: true, autoApproveMaxAmount: 0 });
   check('the switch cannot be released with no money ceiling — the sweep reports it',
     topups.runAutoApprove().reason === 'no_ceiling' && payment.autoApprove().enabled === false);
-  setPay({ autoApproveMaxAmount: 100000, autoApproveReceipt: false, autoApproveCard: false });
-  check('a sweep with neither method chosen releases nothing either',
+  setPay({ autoApproveMaxAmount: 100000, autoApproveReceipt: false });
+  check('a sweep with its one method unchecked releases nothing either',
     topups.runAutoApprove().reason === 'no_methods' && balanceOf(claimer.id) === 0);
-  setPay({ autoApproveReceipt: true, autoApproveCard: true, autoApproveAfterMinutes: 15 });
+  setPay({ autoApproveReceipt: true, autoApproveAfterMinutes: 15 });
   const tooYoung = topups.runAutoApprove();
   check('a receipt younger than the waiting period still waits for a person',
     tooYoung.checked === 0 && topups.getRequest(before.id).status === 'pending' && balanceOf(claimer.id) === 0,
@@ -420,14 +478,26 @@ async function main() {
   age(before.id, 16);
   const bigOne = topups.createRequest({ userId: claimer.id, amount: 500000, method: 'receipt' });
   age(bigOne.id, 20);
-  const cardClaim = topups.createRequest({ userId: claimer.id, amount: 30000, method: 'card', cardNumber: CARD_A, reference: 'TRK-9001' });
-  age(cardClaim.id, 30);
-  const blueClaim = topups.createRequest({ userId: claimer.id, amount: 30000, method: 'blue' });
-  age(blueClaim.id, 60);
+  // v1.5.5: an install that upgrades from 1.5.4 can still hold pending claims filed
+  // under the two retired methods. They cannot be created any more, but the money
+  // may genuinely have been sent, so the rows must survive untouched and — this is
+  // the part that matters — the schedule must never decide them on its own.
+  const legacy = makeUser('paylegacy', { balance: 0 });
+  const legacyAt = (minutes) => Date.now() - minutes * 60000;
+  const insertLegacy = (method, minutes, reference) => Number(db().prepare(
+    `INSERT INTO topup_requests (user_id, amount, status, file_kind, file_id, caption, chat_id, message_id,
+       admin_chat_id, admin_message_id, decided_by, decided_at, decision_note, source,
+       method, reference, card_number, paid_at, created_at, updated_at)
+     VALUES (?, 30000, 'pending', '', '', 'درخواست ۱٫۵٫۴', '', 0, '', 0, 0, 0, '', 'bot', ?, ?, '', 0, ?, ?)`
+  ).run(legacy.id, method, reference, legacyAt(minutes), legacyAt(minutes)).lastInsertRowid);
+  const legacyCard = insertLegacy('card', 30, 'TRK-9001');
+  const legacyBlue = insertLegacy('blue', 60, 'BLU-7001');
   const swept = topups.runAutoApprove();
   check('an old receipt under the ceiling is released, and the reseller’s wallet moves once',
-    swept.approved === 2 && swept.checked === 2 && balanceOf(claimer.id) === 34000,
+    swept.approved === 1 && swept.checked === 1 && balanceOf(claimer.id) === 4000,
     `approved=${swept.approved} checked=${swept.checked} balance=${balanceOf(claimer.id)}`);
+  check('the sweep only ever considers the method that still exists',
+    JSON.stringify(swept.methods) === '["receipt"]', String(swept.methods));
   // `?? -1`, not `|| -1`: the whole point of this check is that the number stored
   // is zero, and `0 || -1` is -1 — a helper that reads a legitimate 0 as a missing
   // row would fail exactly the case it is written to prove.
@@ -443,16 +513,25 @@ async function main() {
   check('a receipt above the ceiling is left for a person no matter how old it is',
     topups.getRequest(bigOne.id).status === 'pending',
     topups.getRequest(bigOne.id).status);
-  check('card-to-card is swept on its own switch and keeps its tracking code',
-    topups.getRequest(cardClaim.id).status === 'approved'
-      && topups.getRequest(cardClaim.id).reference === 'TRK-9001');
-  check('a بلو claim is NEVER auto-approved — a link on a screen proves nothing',
-    topups.getRequest(blueClaim.id).status === 'pending'
-      && !swept.results.some((row) => row.id === blueClaim.id),
-    `blue=${topups.getRequest(blueClaim.id).status}`);
+  check('a leftover کارت به کارت claim is NEVER swept — the schedule does not know that method',
+    topups.getRequest(legacyCard).status === 'pending'
+      && !swept.results.some((row) => row.id === legacyCard)
+      && balanceOf(legacy.id) === 0,
+    `card=${topups.getRequest(legacyCard).status}`);
+  check('and neither is a leftover بلو claim, even one older than the waiting period',
+    topups.getRequest(legacyBlue).status === 'pending'
+      && !swept.results.some((row) => row.id === legacyBlue),
+    `blue=${topups.getRequest(legacyBlue).status}`);
+  check('but a person can still settle the old claim, because the money may be real',
+    (() => {
+      const done = topups.approve(legacyCard, { actor: { id: owner.id, role: 'admin' }, source: 'admin' });
+      return done.status === 'approved' && done.reference === 'TRK-9001'
+        && balanceOf(legacy.id) === 30000 && done.method === 'card';
+    })(),
+    `balance=${balanceOf(legacy.id)}`);
   check('the admin is told what the schedule did, with the total it gave away',
     notices(owner.id).some((row) => row.type === 'info' && String(row.link) === '/topups'
-      && String(row.body).includes('34,000') && String(row.body).includes('2')),
+      && String(row.body).includes('4,000')),
     String((notices(owner.id).slice(-1)[0] || {}).body || '').slice(0, 80));
   const daily = makeUser('paydaily', { balance: 0 });
   const d1 = topups.createRequest({ userId: daily.id, amount: 1000, method: 'receipt' });
@@ -478,22 +557,30 @@ async function main() {
 
   // ════════════════════ 8. finding the rows back (filters) ══════════════════
   console.log('\n── فیلترهای دفتر فیش‌ها ──');
+  // The retired methods cannot be paid into any more, but an admin who is looking
+  // for a 1.5.4 claim still has to be able to FIND it — the filter list is wider
+  // than the create list on purpose.
   const byCard = topups.listRequests({ method: 'card' });
-  check('the admin can list one payment method apart from the others',
-    byCard.rows.length > 0 && byCard.rows.every((row) => row.method === 'card'),
+  check('the admin can list one payment method apart from the others, retired ones too',
+    byCard.rows.length === 1 && byCard.rows.every((row) => row.method === 'card'),
     `rows=${byCard.rows.length}`);
+  const byBlue = topups.listRequests({ method: 'blue' });
+  check('and a بلو row is still reachable, though no form can make a new one',
+    byBlue.rows.length === 1 && byBlue.rows[0].status === 'pending'
+      && codeOf(() => topups.createRequest({ userId: shop0.id, amount: 1000, method: 'blue' })) === 'method_removed',
+    `rows=${byBlue.rows.length} status=${(byBlue.rows[0] || {}).status}`);
   const byAuto = topups.listRequests({ decision: 'auto' });
   const byManual = topups.listRequests({ decision: 'manual' });
   check('and one tab shows the rows the schedule decided, another the ones a person did',
-    byAuto.rows.length === 3 && byAuto.rows.every((row) => row.autoApproved === true)
+    byAuto.rows.length === 2 && byAuto.rows.every((row) => row.autoApproved === true)
       && byManual.rows.every((row) => row.autoApproved === false),
     `auto=${byAuto.rows.length} manual=${byManual.rows.length}`);
   check('the counters follow the same filter, so a tab never lies about its own total',
     byCard.counts.pending + byCard.counts.approved + byCard.counts.rejected === byCard.total
       && byCard.total === byCard.rows.length,
     `total=${byCard.total} counts=${JSON.stringify(byCard.counts)}`);
-  const labelSet = new Set([...topups.listRequests({}).rows].map((row) => `${row.method}:${row.methodLabel}`));
-  check('every method labels itself in Persian on the admin’s screen',
+  const labelSet = new Set([...topups.listRequests({ pageSize: 100 }).rows].map((row) => `${row.method}:${row.methodLabel}`));
+  check('every row labels itself in Persian, the retired ones included',
     labelSet.has('receipt:فیش واریزی') && labelSet.has('card:کارت به کارت')
       && labelSet.has('zarinpal:زرین‌پال') && labelSet.has('blue:بلو بانک'),
     [...labelSet].join(' | '));
@@ -501,15 +588,23 @@ async function main() {
     codeOf(() => topups.listRequests({ method: 'paypal' })) === 'invalid_method'
       && codeOf(() => topups.listRequests({ decision: 'maybe' })) === 'invalid_decision'
       && codeOf(() => topups.listRequests({ status: 'paid' })) === 'invalid_status');
-  check('a card claim naming a card the owner never typed is rejected at the door',
-    codeOf(() => topups.createRequest({ userId: shop.id, amount: 5000, method: 'card', cardNumber: '1111111111111111' })) === 'unknown_card');
+  // v1.5.5, item 2: the card number a receipt names is now part of the receipt
+  // itself (the bot offers the owner’s list before he pays), so the same guard
+  // moves from the deleted کارت به کارت method onto فیش واریزی.
+  check('a receipt naming a card the owner never typed is rejected at the door',
+    codeOf(() => topups.createRequest({ userId: shop.id, amount: 5000, method: 'receipt', cardNumber: '1111111111111111' })) === 'unknown_card');
   check('the same card written with spaces or dashes is still recognised as his',
     (() => {
-      const ok = topups.createRequest({ userId: shop.id, amount: 5000, method: 'card', cardNumber: '6037 9911 2233 4455' });
-      return ok.cardNumber === CARD_A;
+      const ok = topups.createRequest({ userId: shop.id, amount: 5000, method: 'receipt', cardNumber: '6037 9911-2233 4455' });
+      return ok.cardNumber === CARD_A && ok.method === 'receipt';
     })());
   check('a gateway order is not held to the card list',
     !codeOf(() => topups.createRequest({ userId: shop.id, amount: 5000, method: 'zarinpal', cardNumber: '1111111111111111' })));
+  check('a receipt may be filed with no card named at all — the list is a help, not a demand',
+    (() => {
+      const bare = topups.createRequest({ userId: shop0.id, amount: 6000, method: 'receipt' });
+      return bare.cardNumber === '' && bare.status === 'pending';
+    })());
 
   // ═════════════════════ 9. the brand that cannot be renamed ═════════════════
   console.log('\n── نام ثابت پنل ──');
@@ -538,7 +633,7 @@ async function main() {
   check('everything else in that section is still editable — only the name is pinned',
     settings.setSetting('general', { tagline: 'استقلال' }).tagline === 'استقلال'
       && settings.getSetting('general').panelName === brand.PANEL_NAME);
-  check('this build is v1.5.4', config.version === '1.5.4', config.version);
+  check('this build is v1.5.5', config.version === '1.5.5', config.version);
 
   // ═══════════════════════════ 10. پورسانت maths ════════════════════════════
   console.log('\n── پورسانت معرفی ──');

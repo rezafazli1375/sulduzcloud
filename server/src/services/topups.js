@@ -36,19 +36,30 @@ const MAX_AMOUNT = 1_000_000_000;
 const MAX_PENDING_PER_USER = 10;
 const STATUSES = ['pending', 'approved', 'rejected'];
 
-// v1.5.4: every way money comes in is one of these. 'receipt' is what v1.5.2
-// invented the table for; 'card' and 'blue' are claims the schedule or a person
-// settles; 'zarinpal' is settled by the gateway itself.
-const METHODS = ['receipt', 'card', 'zarinpal', 'blue'];
+// Every way money comes in, since v1.5.5: a deposit receipt a person (or the
+// schedule) settles, and a gateway order ZarinPal settles itself. 1.5.4 also offered
+// کارت به کارت and a بلو link and the owner asked for both to go — they are no longer
+// creatable, `cleanMethod` refuses them, but a row already in the table keeps its
+// Persian label, because withdrawing the method and rewriting his wallet history are
+// two different things and he only asked for one.
+const METHODS = ['receipt', 'zarinpal'];
+const LEGACY_METHODS = ['card', 'blue'];
 const METHOD_LABEL = {
   receipt: 'فیش واریزی',
   card: 'کارت به کارت',
   zarinpal: 'زرین‌پال',
   blue: 'بلو بانک',
 };
+// What the admin list may be filtered by: the live methods and, for old data, the
+// retired ones.
+const FILTER_METHODS = [...METHODS, ...LEGACY_METHODS];
 
 function cleanMethod(value) {
   const method = String(value || 'receipt').trim().toLowerCase();
+  if (LEGACY_METHODS.includes(method)) {
+    throw new ApiError(422, 'method_removed',
+      'این روش پرداخت از پنل حذف شده است؛ فیش واریزی یا درگاه آنلاین را انتخاب کنید / This payment method has been removed from the panel');
+  }
   if (!METHODS.includes(method)) {
     throw new ApiError(422, 'invalid_method', `روش پرداخت ناشناخته است / Unknown payment method: ${method}`);
   }
@@ -130,6 +141,12 @@ function createRequest({
       'درخواست‌های در انتظار شما زیاد است؛ صبر کنید مدیر بررسی کند / Too many pending receipts — wait for the admin to review them');
   }
   const kind = cleanMethod(method);
+  // v1.5.5: the owner's switch. A wallet with فیش واریزی turned off takes no
+  // receipts — from the panel or from the bot, because both come through here.
+  if (kind === 'receipt' && !payment.receipt().enabled) {
+    throw new ApiError(409, 'receipt_disabled',
+      'ثبت فیش واریزی در این پنل غیرفعال است / Deposit receipts are disabled on this panel');
+  }
   const card = String(cardNumber || '').replace(/\D/g, '').slice(0, 24);
   // A claim that names one of the owner's own cards must name a real one: a typo
   // would otherwise send the money to a card nobody is watching, and the admin
@@ -177,7 +194,7 @@ function listRequests({
   // nightly sweep tells the admin to review "the auto ones" by hand afterwards.
   const wantedMethod = String(method || '').trim().toLowerCase();
   if (wantedMethod) {
-    if (!METHODS.includes(wantedMethod)) {
+    if (!FILTER_METHODS.includes(wantedMethod)) {
       throw new ApiError(422, 'invalid_method', `روش پرداخت ناشناخته است / Unknown payment method: ${wantedMethod}`);
     }
     where.push('t.method = ?');
@@ -294,15 +311,16 @@ function approve(id, { amount, note = '', actor = null, source = 'panel', auto =
 }
 
 /**
- * Scheduled auto-approval for receipts and card-to-card (v1.5.4, item 3).
+ * Scheduled auto-approval for deposit receipts (v1.5.4 item 3, narrowed in v1.5.5).
  *
  * The owner asked for a timer that approves payments nobody has looked at yet.
  * That is a switch that hands out money without a person, so every guard in
  * payment.autoApprove() is applied here, and a request only passes when ALL of
  * these are true at once:
  *   - it is older than `afterMinutes` (the waiting period he configured);
- *   - its method is one of the two he enabled — a gateway payment is never in
- *     this list, because ZarinPal confirms itself;
+ *   - its method is one he enabled — a gateway payment is never in this list,
+ *     because ZarinPal confirms itself, and a card-to-card or بلو row left over
+ *     from 1.5.4 is not either, because those methods no longer exist;
  *   - it is at or below `autoApproveMaxAmount`, a ceiling without which the
  *     switch cannot be turned on at all;
  *   - the reseller has not already hit his daily count of auto-approvals.
@@ -467,6 +485,8 @@ module.exports = {
   MAX_PENDING_PER_USER,
   STATUSES,
   METHODS,
+  LEGACY_METHODS,
+  FILTER_METHODS,
   METHOD_LABEL,
   cleanAmount,
   cleanMethod,

@@ -8,7 +8,6 @@ import {
   DatabaseBackup,
   Eye,
   Globe2,
-  Info,
   KeyRound,
   Landmark,
   Lock,
@@ -17,6 +16,7 @@ import {
   Play,
   Plug,
   Plus,
+  Receipt,
   RefreshCw,
   Save,
   Send,
@@ -148,6 +148,15 @@ export default function Settings() {
       toast.success(t('settings.saved'));
       if (variables.section === 'general') refresh?.();
       if (variables.section === 'backup') queryClient.invalidateQueries({ queryKey: ['backups'] });
+      // v1.5.5: the payment rows read the SERVER's model (payment.methods), not this
+      // form — that is what makes them honest about a gateway that is switched on but
+      // has nothing behind it. So a save has to re-read it. Without this the owner
+      // removes his last card number, saves, and the row still says «به نماینده نشان
+      // داده می‌شود» until he reloads the page: the same dead button, one floor up.
+      if (variables.section === 'payment') {
+        queryClient.invalidateQueries({ queryKey: ['payment-status'] });
+        queryClient.invalidateQueries({ queryKey: ['topups'] });
+      }
       if (result?.xuiTest) {
         if (result.xuiTest.ok) {
           toast.success(`${t('settings.xui.ok')} · ${result.xuiTest.latencyMs ?? 0}ms · ${result.xuiTest.inbounds ?? 0}`);
@@ -733,7 +742,7 @@ export default function Settings() {
               button he sees are two different things until the fields behind them
               are complete, and this strip is where that difference shows up.
             */}
-            <div className="grid gap-2 sm:grid-cols-2">
+            <div className="grid gap-2 sm:grid-cols-3">
               <Rail
                 icon={ShieldCheck}
                 label={t('settings.payment.zarinpal')}
@@ -744,13 +753,17 @@ export default function Settings() {
                     ? t('settings.payment.railNoPublicUrl')
                     : t('settings.payment.railZarinpalOff')}
               />
+              {/* v1.5.5: «فیش واریزی» is now a switch like the gateway, and it is only
+                  really on when the reseller has a card number to pay into. */}
               <Rail
-                icon={Send}
-                label={t('settings.payment.blue')}
-                state={payLive.blue?.enabled ? (payLive.blue.hasAmountPlaceholder ? 'on' : 'warn') : 'off'}
-                hint={payLive.blue?.enabled
-                  ? (payLive.blue.hasAmountPlaceholder ? t('settings.payment.railBlueOn') : t('settings.payment.railBlueNoPlaceholder'))
-                  : t('settings.payment.railBlueOff')}
+                icon={Receipt}
+                label={t('settings.payment.receipt')}
+                state={payLive.receipt?.ready ? 'on' : payLive.receipt?.enabled ? 'warn' : 'off'}
+                hint={payLive.receipt?.ready
+                  ? t('settings.payment.railReceiptOn')
+                  : payLive.receipt?.reason === 'no_cards'
+                    ? t('settings.payment.railReceiptNoCards')
+                    : t('settings.payment.railReceiptOff')}
               />
               <Rail
                 icon={CreditCard}
@@ -760,15 +773,32 @@ export default function Settings() {
                   ? t('settings.payment.railCardsOn', { n: formatNumber(payLive.cards.length, lang) })
                   : t('settings.payment.railCardsOff')}
               />
-              <Rail
-                icon={Info}
+            </div>
+
+            {/*
+              v1.5.5, his item 1: «دکمه روشن و خاموش کردن درگاه‌ها». Each remaining
+              way of topping up a wallet gets its own switch here, and only two
+              ways remain — the deposit receipt the owner checks himself and the
+              ZarinPal gateway. بلو and کارت به کارت are gone from this form
+              together with the settings fields behind them.
+            */}
+            <div className="space-y-4 border-t border-white/[0.06] pt-4">
+              <p className="text-[12px] font-semibold text-slate-200">{t('settings.payment.methodsTitle')}</p>
+              <SwitchRow
                 label={t('settings.payment.receipt')}
-                state="on"
-                hint={t('settings.payment.railReceipt')}
+                hint={t('settings.payment.receiptSwitchHint')}
+                checked={payment.receiptEnabled}
+                onChange={(value) => patch('payment', 'receiptEnabled', value)}
+              />
+              <SwitchRow
+                label={t('settings.payment.zarinpal')}
+                hint={t('settings.payment.zarinpalSwitchHint')}
+                checked={payment.zarinpalEnabled}
+                onChange={(value) => patch('payment', 'zarinpalEnabled', value)}
               />
             </div>
 
-            <div>
+            <div className="border-t border-white/[0.06] pt-4">
               <p className="mb-1 text-[12px] font-semibold text-slate-200">{t('settings.payment.cardsTitle')}</p>
               <p className="mb-3 text-[10.5px] leading-5 text-slate-500">{t('settings.payment.cardsHint')}</p>
               {payCards.length ? (
@@ -814,12 +844,7 @@ export default function Settings() {
             </div>
 
             <div className="space-y-4 border-t border-white/[0.06] pt-4">
-              <SwitchRow
-                label={t('settings.payment.zarinpal')}
-                hint={t('settings.payment.zarinpalSwitchHint')}
-                checked={payment.zarinpalEnabled}
-                onChange={(value) => patch('payment', 'zarinpalEnabled', value)}
-              />
+              <p className="text-[12px] font-semibold text-slate-200">{t('settings.payment.zarinpal')}</p>
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field
                   label={t('settings.payment.merchantId')}
@@ -841,31 +866,6 @@ export default function Settings() {
                   onChange={(value) => patch('payment', 'zarinpalSandbox', value)}
                 />
               </div>
-
-              <SwitchRow
-                label={t('settings.payment.blue')}
-                hint={t('settings.payment.blueSwitchHint')}
-                checked={payment.blueEnabled}
-                onChange={(value) => patch('payment', 'blueEnabled', value)}
-              />
-              <div className="grid gap-4 sm:grid-cols-[minmax(0,180px)_1fr]">
-                <Field label={t('settings.payment.blueLabel')}>
-                  <Input value={payment.blueLabel || ''} onChange={(e) => patch('payment', 'blueLabel', e.target.value)} placeholder="بلو بانک" />
-                </Field>
-                <Field
-                  label={t('settings.payment.blueLink')}
-                  hint={payment.hasBlueLink ? t('settings.payment.secretSaved') : t('settings.payment.blueLinkHint')}
-                >
-                  <Input
-                    dir="ltr"
-                    type="password"
-                    autoComplete="off"
-                    value={payment.blueLink || ''}
-                    onChange={(e) => patch('payment', 'blueLink', e.target.value)}
-                    placeholder={payment.hasBlueLink ? 'https://••••••••••••' : 'https://bluebank.ir/pay/xxxxx?amount={amount}'}
-                  />
-                </Field>
-              </div>
               <p className="text-[10.5px] leading-5 text-slate-500">{t('settings.payment.publicUrlHint')}</p>
             </div>
 
@@ -884,20 +884,18 @@ export default function Settings() {
                 checked={payment.autoApproveEnabled}
                 onChange={(value) => patch('payment', 'autoApproveEnabled', value)}
               />
-              <div className="grid gap-2 sm:grid-cols-2">
-                <SwitchRow
-                  label={t('settings.payment.autoReceipt')}
-                  hint={t('settings.payment.autoReceiptHint')}
-                  checked={payment.autoApproveReceipt}
-                  onChange={(value) => patch('payment', 'autoApproveReceipt', value)}
-                />
-                <SwitchRow
-                  label={t('settings.payment.autoCard')}
-                  hint={t('settings.payment.autoCardHint')}
-                  checked={payment.autoApproveCard}
-                  onChange={(value) => patch('payment', 'autoApproveCard', value)}
-                />
-              </div>
+              {/*
+                v1.5.5: only one method can still be swept. کارت به کارت was a
+                second switch here; a بلو or card row that predates this version
+                keeps its old label in the list but is never auto-approved,
+                because nothing verifies that money arrived.
+              */}
+              <SwitchRow
+                label={t('settings.payment.autoReceipt')}
+                hint={t('settings.payment.autoReceiptHint')}
+                checked={payment.autoApproveReceipt}
+                onChange={(value) => patch('payment', 'autoApproveReceipt', value)}
+              />
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <Field label={t('settings.payment.autoAfter')} hint="1 – 1440">
                   <Input type="number" min="1" max="1440" dir="ltr" value={payment.autoApproveAfterMinutes ?? 15} onChange={(e) => patch('payment', 'autoApproveAfterMinutes', e.target.value)} />

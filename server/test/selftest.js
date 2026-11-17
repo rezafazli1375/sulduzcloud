@@ -4370,6 +4370,9 @@ function startMockXui(inboundRows) {
       const GB = 1024 ** 3;
       const PLAN = { name: 'پلن آماده تست', description: 'دو کانال، حجم و زمان ثابت', gb: 20, days: 30, price: 600, inboundIds: [901, 902] };
       const merchantFake = 'c8e8f1a2-1111-4abc-9def-0123456789ab';
+      // v1.5.5 retired the بلو link. A browser tab still open from 1.5.4 posts it
+      // back with every save, so this is the value the route has to swallow without
+      // storing, echoing or auditing it.
       const blueFake = 'https://blue.example/pay/selftest?amount={amount}';
 
       try {
@@ -4598,6 +4601,24 @@ function startMockXui(inboundRows) {
           `amount=${commissionLine.amount} desc=${String(commissionLine.description || '').slice(0, 60)}`);
 
         // ────────────────────────────── the payment settings, from the owner’s form
+        // v1.5.5, item 1: «دکمه روشن و خاموش کردن درگاه هارو هم بزار». A switch that
+        // turns a method ON with nothing behind it is the dead button he complained
+        // about, so each switch is guarded by what it needs — receipts need a card.
+        // Turning anything OFF is never refused. The installed default is receipts-on
+        // with an empty list, which the rail and the bot both call out honestly, so
+        // the rule is about the edge the switch crosses: off → on.
+        const receiptOff = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { receiptEnabled: false },
+        });
+        check('switching a method off is saved and never guarded',
+          receiptOff.status === 200 && receiptOff.json?.data?.saved?.receiptEnabled === false,
+          `status=${receiptOff.status} code=${receiptOff.json?.error?.code}`);
+        const receiptNoCards = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { receiptEnabled: true },
+        });
+        check('the فیش واریزی switch refuses to come on while no card number is stored',
+          receiptNoCards.status === 422 && receiptNoCards.json?.error?.code === 'receipt_not_configured',
+          `code=${receiptNoCards.json?.error?.code} cards=${JSON.stringify((receiptNoCards.json?.data?.saved || {}).cards)}`);
         const oneCard = await request('PATCH', '/api/admin/settings/payment', {
           cookies, csrf, body: { cards: [{ number: '6037 9977 8899 1234', holder: 'فروشگاه تست' }] },
         });
@@ -4610,6 +4631,30 @@ function startMockXui(inboundRows) {
         });
         check('a card number with letters in it is refused rather than saved empty',
           badCard.status === 422 && badCard.json?.error?.code === 'invalid_cards', `code=${badCard.json?.error?.code}`);
+        // v1.5.5: the guard is about the SWITCH, not about the list. Once receipts are
+        // running the owner is entitled to take his last card number away — the method
+        // then reports itself not-ready and says why, instead of the form refusing to
+        // save and leaving a card on screen that no longer exists anywhere.
+        const onWithCard = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { receiptEnabled: true, cards: [{ number: '6037997788991234', holder: 'فروشگاه تست' }] },
+        });
+        check('receipts switch on in the same save that supplies the card',
+          onWithCard.status === 200 && onWithCard.json?.data?.saved?.receiptEnabled === true,
+          `status=${onWithCard.status} code=${onWithCard.json?.error?.code}`);
+        const lastCardGone = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { cards: [], receiptEnabled: true },
+        });
+        check('and emptying the card list while receipts run is saved, not refused',
+          lastCardGone.status === 200 && (lastCardGone.json?.data?.saved?.cards || []).length === 0,
+          `status=${lastCardGone.status} code=${lastCardGone.json?.error?.code}`);
+        const noCardMethod = await request('GET', '/api/admin/payment/status', { cookies, csrf });
+        check('the method then calls itself not-ready with its own reason',
+          noCardMethod.json?.data?.methods?.receipt?.ready === false
+            && noCardMethod.json?.data?.methods?.receipt?.reason === 'no_cards',
+          JSON.stringify(noCardMethod.json?.data?.methods?.receipt || {}));
+        await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { cards: [{ number: '6037997788991234', holder: 'فروشگاه تست' }] },
+        });
         const noMerchant = await request('PATCH', '/api/admin/settings/payment', { cookies, csrf, body: { zarinpalEnabled: true } });
         check('the gateway cannot be switched on with no merchant id',
           noMerchant.status === 422 && noMerchant.json?.error?.code === 'zarinpal_not_configured', `code=${noMerchant.json?.error?.code}`);
@@ -4627,25 +4672,33 @@ function startMockXui(inboundRows) {
           `merchant="${savedPay.zarinpalMerchantId}" has=${savedPay.hasZarinpalMerchantId}`);
         check('and it really is in the database encrypted, not in the clear',
           !String(pdb.prepare("SELECT value FROM settings WHERE key = 'payment'").get().value).includes(merchantFake));
-        const noBlue = await request('PATCH', '/api/admin/settings/payment', { cookies, csrf, body: { blueEnabled: true } });
-        check('بلو cannot be offered before its link exists',
-          noBlue.status === 422 && noBlue.json?.error?.code === 'blue_not_configured', `code=${noBlue.json?.error?.code}`);
-        const badBlue = await request('PATCH', '/api/admin/settings/payment', { cookies, csrf, body: { blueLink: 'blue.example/x' } });
-        check('a link with no scheme is clipboard text, not a payment page',
-          badBlue.status === 422 && badBlue.json?.error?.code === 'invalid_blue_link', `code=${badBlue.json?.error?.code}`);
-        const blueOk = await request('PATCH', '/api/admin/settings/payment', {
-          cookies, csrf, body: { blueLink: blueFake, blueEnabled: true },
+        const staleBlue = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf, body: { blueEnabled: true, blueLink: blueFake, blueLabel: 'بلو بانک', autoApproveCard: true },
         });
-        check('the بلو link is stored the same way — back to the form it comes out empty',
-          blueOk.status === 200 && blueOk.json?.data?.saved?.blueLink === ''
-            && blueOk.json?.data?.saved?.hasBlueLink === true);
+        check('a 1.5.4 tab posting the retired بلو keys saves fine and stores none of them',
+          staleBlue.status === 200
+            && staleBlue.json?.data?.saved?.blueEnabled === undefined
+            && staleBlue.json?.data?.saved?.blueLink === undefined
+            && staleBlue.json?.data?.saved?.hasBlueLink === undefined
+            && staleBlue.json?.data?.saved?.autoApproveCard === undefined,
+          JSON.stringify(Object.keys(staleBlue.json?.data?.saved || {}).filter((k) => /blue|card/i.test(k))));
+        check('the retired values never reach the database row either, not even as an empty box',
+          !/blueLink|blueEnabled|blueLabel|autoApproveCard/
+            .test(String(pdb.prepare("SELECT value FROM settings WHERE key = 'payment'").get().value)));
+        check('and the audit entry names only the keys the panel actually wrote',
+          (() => {
+            const row = pdb.prepare("SELECT details FROM audit_logs WHERE action = 'settings.update' ORDER BY id DESC LIMIT 1").get() || {};
+            const keys = JSON.parse(String(row.details || '{}')).keys || [];
+            return Array.isArray(keys) && !keys.some((k) => /blue|autoApproveCard/.test(String(k)));
+          })(),
+          String((pdb.prepare("SELECT details FROM audit_logs WHERE action = 'settings.update' ORDER BY id DESC LIMIT 1").get() || {}).details || '').slice(0, 120));
         const noCeiling = await request('PATCH', '/api/admin/settings/payment', {
           cookies, csrf, body: { autoApproveEnabled: true, autoApproveMaxAmount: 0, autoApproveReceipt: true },
         });
         check('auto-approval cannot be released with no money ceiling',
           noCeiling.status === 422 && noCeiling.json?.error?.code === 'auto_approve_ceiling_required', `code=${noCeiling.json?.error?.code}`);
         const noMethod = await request('PATCH', '/api/admin/settings/payment', {
-          cookies, csrf, body: { autoApproveEnabled: true, autoApproveMaxAmount: 50000, autoApproveReceipt: false, autoApproveCard: false },
+          cookies, csrf, body: { autoApproveEnabled: true, autoApproveMaxAmount: 50000, autoApproveReceipt: false },
         });
         check('nor with neither method chosen',
           noMethod.status === 422 && noMethod.json?.error?.code === 'auto_approve_no_method', `code=${noMethod.json?.error?.code}`);
@@ -4665,7 +4718,7 @@ function startMockXui(inboundRows) {
         const formShape = {
           cards: [{ number: '6037997788991234', holder: 'فروشگاه تست' }],
           zarinpalEnabled: true, zarinpalMerchantId: '', zarinpalSandbox: true,
-          blueEnabled: true, blueLink: '', blueLabel: 'بلو بانک',
+          receiptEnabled: true,
         };
         const blankFormNoCeiling = await request('PATCH', '/api/admin/settings/payment', {
           cookies, csrf,
@@ -4686,15 +4739,13 @@ function startMockXui(inboundRows) {
         // decrypts both rows and never looks at the seal.
         const reveal = require('../src/crypto').decryptSecret;
         const merchantKept = reveal(String(JSON.parse(rawPayAfter).zarinpalMerchantId || ''));
-        const blueKept = reveal(String(JSON.parse(rawPayAfter).blueLink || ''));
-        check('and the same save goes through without erasing either credential',
+        check('and the same save goes through without erasing the one credential that exists',
           blankForm.status === 200 && blankForm.json?.data?.saved?.hasZarinpalMerchantId === true
-            && blankForm.json?.data?.saved?.hasBlueLink === true
-            && merchantKept === merchantFake && blueKept === blueFake
-            && !rawPayAfter.includes(merchantFake) && !rawPayAfter.includes(blueFake),
+            && merchantKept === merchantFake && !rawPayAfter.includes(merchantFake)
+            && !rawPayAfter.includes(blueFake),
           JSON.stringify({
             status: blankForm.status, code: blankForm.json?.error?.code,
-            merchantKept: merchantKept === merchantFake, blueKept: blueKept === blueFake,
+            merchantKept: merchantKept === merchantFake,
             stillSealed: String(JSON.parse(rawPayAfter).zarinpalMerchantId || '').startsWith('enc1:'),
             sealRotated: JSON.parse(rawPayAfter).zarinpalMerchantId
               !== JSON.parse(rawPayBefore).zarinpalMerchantId,
@@ -4703,30 +4754,40 @@ function startMockXui(inboundRows) {
         const methodsData = methodsR.json?.data || {};
         check('the reseller’s wallet page is built from what the owner actually configured',
           methodsR.status === 200 && (methodsData.cards || []).length === 1
-            && methodsData.blue?.enabled === true && methodsData.zarinpal?.enabled === true,
-          JSON.stringify({ cards: (methodsData.cards || []).length, blue: methodsData.blue?.enabled, zp: methodsData.zarinpal?.enabled }));
+            && methodsData.receipt?.enabled === true && methodsData.receipt?.ready === true
+            && methodsData.zarinpal?.enabled === true,
+          JSON.stringify({ cards: (methodsData.cards || []).length, receipt: methodsData.receipt?.ready, zp: methodsData.zarinpal?.enabled }));
+        check('and it carries no بلو entry for the reseller to click',
+          !('blue' in methodsData) && !('cardToCard' in methodsData) && !('card' in methodsData),
+          Object.keys(methodsData).sort().join(','));
         const blueLinkR = await request('GET', '/api/reseller/payments/blue?amount=500', { cookies: shopCookies });
-        check('his بلو link carries his amount, in the unit the bank page wants',
-          blueLinkR.status === 200 && String(blueLinkR.json?.data?.link || '').includes('amount=5000')
-            && blueLinkR.json?.data?.prefilled === true,
-          String(blueLinkR.json?.data?.link || ''));
+        check('the old بلو endpoint answers 404 rather than a link to a dead page',
+          blueLinkR.status === 404, `status=${blueLinkR.status}`);
+        const cardRouteR = await request('POST', '/api/reseller/payments/claim', {
+          cookies: shopCookies, csrf: shopCsrf, body: { method: 'card', amount: 5000 },
+        });
+        check('card-to-card is closed as a route too, with the two live methods named',
+          cardRouteR.status === 422 && cardRouteR.json?.error?.code === 'method_removed'
+            && /فیش واریزی/.test(String(cardRouteR.json?.error?.message || '')),
+          `code=${cardRouteR.json?.error?.code} status=${cardRouteR.status}`);
         const viaClaim = await request('POST', '/api/reseller/payments/claim', {
           cookies: shopCookies, csrf: shopCsrf, body: { method: 'zarinpal', amount: 5000 },
         });
         check('the claim form is not a shortcut into the gateway',
           viaClaim.status === 422 && viaClaim.json?.error?.code === 'use_gateway', `code=${viaClaim.json?.error?.code}`);
         const wrongCard = await request('POST', '/api/reseller/payments/claim', {
-          cookies: shopCookies, csrf: shopCsrf, body: { method: 'card', amount: 5000, cardNumber: '1111111111111111' },
+          cookies: shopCookies, csrf: shopCsrf, body: { method: 'receipt', amount: 5000, cardNumber: '1111111111111111' },
         });
         check('he cannot name a card the owner never typed',
           wrongCard.status === 422 && wrongCard.json?.error?.code === 'unknown_card', `code=${wrongCard.json?.error?.code}`);
         const hisClaim = await request('POST', '/api/reseller/payments/claim', {
-          cookies: shopCookies, csrf: shopCsrf, body: { method: 'card', amount: 5000, cardNumber: '6037-9977-8899-1234' },
+          cookies: shopCookies, csrf: shopCsrf, body: { method: 'receipt', amount: 5000, cardNumber: '6037-9977-8899-1234' },
         });
         const claimRow = hisClaim.json?.data?.request || hisClaim.json?.data || {};
-        check('a card-to-card claim waits for a person or the schedule, and says which',
-          hisClaim.status < 300 && String(claimRow.status || '') === 'pending' && Number(claimRow.amount) === 5000,
-          `status=${claimRow.status} id=${claimRow.id}`);
+        check('a receipt that names one of his published cards is filed, and waits for a person',
+          hisClaim.status < 300 && String(claimRow.status || '') === 'pending' && Number(claimRow.amount) === 5000
+            && String(claimRow.cardNumber || '') === '6037997788991234' && claimRow.method === 'receipt',
+          `status=${claimRow.status} card=${claimRow.cardNumber} id=${claimRow.id}`);
 
         // ───────────────────────────────── the schedule, run from the admin screen
         const oldClaimId = Number(claimRow.id || 0);
@@ -4784,12 +4845,380 @@ function startMockXui(inboundRows) {
 
         await request('PATCH', '/api/admin/settings/payment', {
           cookies, csrf,
-          body: { zarinpalEnabled: false, blueEnabled: false, autoApproveEnabled: false, autoApproveReceipt: false, autoApproveCard: false, cards: [] },
+          body: { zarinpalEnabled: false, receiptEnabled: false, autoApproveEnabled: false, autoApproveReceipt: false, cards: [] },
         });
         await request('PATCH', '/api/admin/settings/billing', { cookies, csrf, body: { commissionPercent: 0, commissionCapPercent: 50 } });
         pdb.prepare('UPDATE users SET referrer_id = 0 WHERE id = ?').run(shopId);
       } finally {
         pdb.close();
+      }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════ v1.5.5
+    //
+    // Items 4 and 5 — the two that cannot be proven from one table alone.
+    //
+    // A package is the group CONFIG_GROUP_KEY_SQL builds, and that key carries
+    // user_id, so a transfer that rewrote only the row the admin clicked would
+    // leave ONE subscription with two owners and two quotas. Item 5 writes the
+    // برچسب where the node can see it: the x-ui client's own `comment`. The mock
+    // keeps every client it was handed, so `mockXui.clients` is the node's answer
+    // and panel.db is ours — the checks below read the same fact from both sides
+    // and refuse a release where they disagree.
+    {
+      const tdb = new Database(path.join(DATA_DIR, 'panel.db'));
+      const P25 = 'Move-Pass-12345';
+      const LABEL25 = 'برچسب جابه‌جایی';
+      const NAME25 = 'مشتری انتقالی';
+      const PHONE25 = '09120000000';
+      const LINE25 = (label) => `${label} | ${NAME25} | ${PHONE25}`;
+      const cfg25 = (id) => tdb.prepare('SELECT * FROM configs WHERE id = ?').get(Number(id)) || {};
+      const rowsOf25 = (email) => tdb.prepare('SELECT * FROM configs WHERE email = ? ORDER BY id').all(String(email));
+      const live25 = (userId) => Number(tdb.prepare(
+        'SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND deleted_at = 0'
+      ).get(Number(userId)).c);
+      const booked25 = (userId) => Number(tdb.prepare(
+        'SELECT COUNT(*) AS c FROM usage_daily WHERE user_id = ?'
+      ).get(Number(userId)).c);
+      const money25 = (userId) => Number(tdb.prepare('SELECT balance FROM users WHERE id = ?').get(Number(userId))?.balance || 0);
+      const tx25 = (userId) => Number(tdb.prepare('SELECT COUNT(*) AS c FROM transactions WHERE user_id = ?').get(Number(userId)).c);
+      const notes25 = (userId, title) => tdb.prepare(
+        'SELECT * FROM notifications WHERE user_id = ? AND title = ?'
+      ).all(Number(userId), String(title));
+      const onNode25 = (email) => String(mockXui.clients.get(String(email))?.comment || '');
+      const pushCalls25 = (email) => mockXui.calls.filter((call) => call.route === `/clients/update/${email}`).length;
+      const code25 = (res) => String(res.json?.error?.code || '');
+      const dayKey25 = (ts) => new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Tehran', year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date(ts));
+      const mkUser25 = async (username, extra = {}) => {
+        const created = await request('POST', '/api/admin/users', {
+          cookies, csrf, body: { username, password: P25, role: 'reseller', balance: 0, ...extra },
+        });
+        return { id: Number(created.json?.data?.user?.id || 0), status: created.status };
+      };
+      const login25 = async (username) => {
+        const res = await request('POST', '/api/auth/login', { body: { username, password: P25 } });
+        return { status: res.status, cookies: cookiesFrom(res.headers), csrf: res.json?.data?.csrf };
+      };
+      const move25 = (id, body, who) => request('POST', `/api/admin/configs/${id}/transfer`, {
+        ...(who || { cookies, csrf }), body,
+      });
+
+      let limit25 = 10;
+      let lifted25 = false;
+      let parked25 = false;
+      try {
+        // One browser session after another, all from 127.0.0.1: five reseller
+        // logins would sit in the limiter's basket and come back 429, which a
+        // later check would read as «the reseller cannot do it». Same lift-and-
+        // restore the other blocks use.
+        const secRead25 = await request('GET', '/api/admin/settings', { cookies });
+        limit25 = Number(secRead25.json?.data?.settings?.security?.loginRateLimit || 10);
+        lifted25 = (await request('PATCH', '/api/admin/settings/security', {
+          cookies, csrf, body: { loginRateLimit: 100 },
+        })).status === 200;
+        // A sync landing between two of these checks would rewrite the node's
+        // client and the counters under them.
+        parked25 = (await request('PATCH', '/api/admin/settings/monitor', {
+          cookies, csrf, body: { intervalSec: 3600 },
+        })).status === 200;
+
+        const src25 = await mkUser25('movesrc');
+        const dst25 = await mkUser25('movedst');
+        const capped25 = await mkUser25('movecapped', { max_configs: 1 });
+        const off25 = await mkUser25('moveoff');
+        const perm25 = await mkUser25('moveperm');
+        const clash25 = await mkUser25('moveclash');
+        const srcSess25 = await login25('movesrc');
+        const dstSess25 = await login25('movedst');
+        const permSess25 = await login25('moveperm');
+        const srcId25 = src25.id;
+        const dstId25 = dst25.id;
+        check('v1.5.5 the fixtures exist: six resellers, three of them signed in, the monitor parked',
+          [srcId25, dst25.id, capped25.id, off25.id, perm25.id, clash25.id].every((id) => id > 0)
+            && srcSess25.status === 200 && dstSess25.status === 200 && permSess25.status === 200
+            && lifted25 && parked25,
+          `src=${srcId25} dst=${dstId25} login=${srcSess25.status}/${dstSess25.status}/${permSess25.status}`);
+
+        // ───────────────────────────────── item 5: the برچسب the node has to carry
+        const build25 = await request('POST', '/api/admin/configs', {
+          cookies, csrf,
+          body: {
+            userId: srcId25, inboundIds: [901, 902], gb: 10, days: 30,
+            label: LABEL25, customerName: NAME25, customerPhone: PHONE25,
+          },
+        });
+        const built25 = build25.json?.data?.configs || [];
+        const pkgId25 = Number(built25[0]?.id || 0);
+        const pkgEmail25 = String(built25[0]?.email || '');
+        check('v1.5.5 a new package is ONE x-ui client whose comment is the label line',
+          build25.status === 201 && built25.length === 2
+            && built25.every((row) => String(row.email || '') === pkgEmail25)
+            && onNode25(pkgEmail25) === LINE25(LABEL25),
+          `rows=${built25.length} node="${onNode25(pkgEmail25)}"`);
+
+        const renamed25 = await request('PATCH', `/api/admin/configs/${pkgId25}`, {
+          cookies, csrf, body: { label: 'برچسب تازه' },
+        });
+        const sync25 = renamed25.json?.data?.config?.commentSync || {};
+        check('v1.5.5 renaming the label pushes the new line to the node and says that it did',
+          renamed25.status === 200 && sync25.pushed === true
+            && onNode25(pkgEmail25) === LINE25('برچسب تازه')
+            && pushCalls25(pkgEmail25) === 1,
+          `pushed=${sync25.pushed} node="${onNode25(pkgEmail25)}"`);
+        check('and every channel of the package carries the new label, not only the row clicked',
+          rowsOf25(pkgEmail25).length === 2
+            && rowsOf25(pkgEmail25).every((row) => String(row.label) === 'برچسب تازه'),
+          rowsOf25(pkgEmail25).map((row) => row.label).join(' / '));
+
+        // The node is told only when the IDENTITY changed. A remark about a
+        // channel has nowhere to go on x-ui, so this save must not call it at all.
+        const noteOnly25 = await request('PATCH', `/api/admin/configs/${pkgId25}`, {
+          cookies, csrf, body: { note: 'یادداشت مدیر' },
+        });
+        check('a note alone is not an identity change: it is saved and the node is not called',
+          noteOnly25.status === 200 && noteOnly25.json?.data?.config?.commentSync?.pushed === false
+            && pushCalls25(pkgEmail25) === 1 && String(cfg25(pkgId25).note) === 'یادداشت مدیر',
+          `pushed=${noteOnly25.json?.data?.config?.commentSync?.pushed} calls=${pushCalls25(pkgEmail25)}`);
+
+        // ─────────────────────────────── what an unreachable node must NOT cost
+        const clientBack25 = mockXui.clients.get(pkgEmail25);
+        mockXui.clients.delete(pkgEmail25);
+        const whileGone25 = await request('PATCH', `/api/admin/configs/${pkgId25}`, {
+          cookies, csrf, body: { label: 'برچسب غایب' },
+        });
+        const syncGone25 = whileGone25.json?.data?.config?.commentSync || {};
+        check('a client that is not on the node costs nobody the text he typed: the save stands',
+          whileGone25.status === 200 && syncGone25.pushed === false
+            && syncGone25.reason === 'client_missing' && String(cfg25(pkgId25).label) === 'برچسب غایب',
+          `pushed=${syncGone25.pushed} reason=${syncGone25.reason} label=${cfg25(pkgId25).label}`);
+
+        // Rebuild is the third door into the same sentence (item 5 names create,
+        // edit and — implicitly — the restore the owner already uses).
+        const rebuilt25 = await request('POST', `/api/admin/configs/${pkgId25}/recreate`, {
+          cookies, csrf, body: {},
+        });
+        check('and a rebuilt subscription carries the same label line as the panel still has',
+          rebuilt25.status === 200 && onNode25(pkgEmail25) === LINE25('برچسب غایب'),
+          `status=${rebuilt25.status} node="${onNode25(pkgEmail25)}"`);
+
+        // x-ui's own field width, not ours: three 80/80/32 fields would be 198.
+        const long25 = await request('PATCH', `/api/admin/configs/${pkgId25}`, {
+          cookies, csrf,
+          body: { label: 'ل'.repeat(90), customerName: 'ن'.repeat(90), customerPhone: '0'.repeat(40) },
+        });
+        const cappedComment25 = onNode25(pkgEmail25);
+        check('the line is cut to the width the node panel actually has, not past it',
+          long25.status === 200 && cappedComment25.length === 120
+            && rowsOf25(pkgEmail25).every((row) => String(row.label).length === 80),
+          `nodeLen=${cappedComment25.length} labelLen=${String(cfg25(pkgId25).label).length}`);
+        await request('PATCH', `/api/admin/configs/${pkgId25}`, {
+          cookies, csrf, body: { label: LABEL25, customerName: NAME25, customerPhone: PHONE25 },
+        });
+
+        // Someone else's customer is not editable through the reseller door, and
+        // an edit that got that far would have rewritten a node client he does not
+        // own. The label the owner just typed has to still be the one on the node.
+        const otherTry25 = await request('PATCH', `/api/reseller/configs/${pkgId25}`, {
+          cookies: permSess25.cookies, csrf: permSess25.csrf, body: { label: 'دست‌نخورده' },
+        });
+        check('a reseller cannot relabel another reseller’s customer, on the node or off it',
+          otherTry25.status >= 400 && onNode25(pkgEmail25) === LINE25(LABEL25),
+          `status=${otherTry25.status} code=${code25(otherTry25)} node="${onNode25(pkgEmail25)}"`);
+
+        // ────────────────────────────────────── item 4: moving the customer over
+        const asReseller25 = await move25(pkgId25, { toUserId: dstId25 }, srcSess25);
+        check('v1.5.5 only the admin can move a customer: the reseller’s own session is refused',
+          asReseller25.status === 403, `status=${asReseller25.status} code=${code25(asReseller25)}`);
+
+        const preview25 = await move25(pkgId25, { toUserId: dstId25, dryRun: true });
+        const pv25 = preview25.json?.data || {};
+        check('the dialog first asks what WILL move, and a dry run that moves nothing is the point',
+          preview25.status === 200 && pv25.dryRun === true && pv25.moved === 0
+            && (pv25.rows || []).length === 2 && (pv25.inbounds || []).length === 2
+            && pv25.totalGb === 10 && pv25.fromReseller === 'movesrc' && pv25.toReseller === 'movedst'
+            && Number(cfg25(pkgId25).user_id) === srcId25 && live25(dstId25) === 0,
+          JSON.stringify({ moved: pv25.moved, rows: (pv25.rows || []).length, gb: pv25.totalGb, owner: cfg25(pkgId25).user_id }));
+
+        // One reseller is switched off: «he cannot take a customer» is a
+        // different answer from «he does not exist», and the panel must say which.
+        const offR25 = await request('PATCH', `/api/admin/users/${off25.id}`, {
+          cookies, csrf, body: { status: 'disabled' },
+        });
+        const refusal25 = await Promise.all([
+          move25(pkgId25, {}),
+          move25(pkgId25, { toUserId: 999999 }),
+          move25(pkgId25, { toUserId: 1 }),
+          move25(pkgId25, { toUserId: off25.id }),
+        ]);
+        const codes25 = refusal25.map((res) => `${res.status}:${code25(res)}`);
+        check('four wrong targets are four different answers, and none of them moves a row',
+          offR25.status === 200 && codes25[0] === '422:reseller_required' && codes25[1] === '404:user_not_found'
+            && codes25[2] === '409:target_is_admin' && codes25[3] === '409:reseller_inactive'
+            && Number(cfg25(pkgId25).user_id) === srcId25,
+          codes25.join(' '));
+
+        // The permission rule is the one the create form already honours (v1.5.1):
+        // a VISIBLE channel is every reseller's, whatever his allow list says, so
+        // the only way a target can be blocked is a hidden channel he was never
+        // granted. Both of his channels go hidden, and the three answers below are
+        // the three states of that — no grant, half a grant, the whole grant.
+        const grant25 = async (ids) => (await request('PATCH', `/api/admin/users/${perm25.id}`, {
+          cookies, csrf, body: { allowed_inbounds: ids },
+        })).status === 200;
+        tdb.prepare('UPDATE inbounds SET visible = 0 WHERE id IN (901, 902)').run();
+        const granted0 = await grant25([903]);
+        const blocked25 = await move25(pkgId25, { toUserId: perm25.id });
+        check('a target with no grant for these channels is refused before anything is written',
+          granted0 && blocked25.status === 409 && code25(blocked25) === 'inbound_not_allowed'
+            && Number(cfg25(pkgId25).user_id) === srcId25,
+          `status=${blocked25.status} code=${code25(blocked25)}`);
+        const granted1 = await grant25([901]);
+        const half25 = await move25(pkgId25, { toUserId: perm25.id });
+        check('half the channels is still half the subscription: the whole move waits for the rest',
+          granted1 && half25.status === 409 && code25(half25) === 'inbound_not_allowed'
+            && Number(cfg25(pkgId25).user_id) === srcId25,
+          `msg=${String(half25.json?.error?.message || '').slice(0, 70)}`);
+        const granted2 = await grant25([901, 902]);
+        const grantedMove25 = await move25(pkgId25, { toUserId: perm25.id });
+        check('and a grant for both is enough, hidden or not — the same rule an order follows',
+          granted2 && grantedMove25.status === 200 && grantedMove25.json?.data?.moved === 2
+            && rowsOf25(pkgEmail25).every((row) => Number(row.user_id) === perm25.id),
+          `status=${grantedMove25.status} code=${code25(grantedMove25)}`);
+        tdb.prepare('UPDATE inbounds SET visible = 1 WHERE id IN (901, 902)').run();
+        const backToSrc25 = await move25(pkgId25, { toUserId: srcId25 });
+        check('putting the channels back in view puts the customer back where he started',
+          backToSrc25.status === 200 && Number(cfg25(pkgId25).user_id) === srcId25 && live25(perm25.id) === 0,
+          `status=${backToSrc25.status} owner=${cfg25(pkgId25).user_id}`);
+
+        // His caps are checked too, so a move cannot smuggle past max_configs.
+        const cappedBuild25 = await request('POST', '/api/admin/configs', {
+          cookies, csrf, body: { userId: capped25.id, inboundIds: [903], gb: 5, days: 10, customerName: 'سقف' },
+        });
+        const overLimit25 = await move25(pkgId25, { toUserId: capped25.id });
+        check('and a reseller at his config ceiling cannot be handed a customer either',
+          cappedBuild25.status === 201 && live25(capped25.id) === 1
+            && overLimit25.status === 403 && code25(overLimit25) === 'limit_configs'
+            && Number(cfg25(pkgId25).user_id) === srcId25,
+          `capped=${live25(capped25.id)} status=${overLimit25.status} code=${code25(overLimit25)}`);
+
+        // The ledger is the part a move must carry with it: stats.js and reports.js
+        // read usage_daily.user_id, not configs.user_id.
+        const memberIds25 = rowsOf25(pkgEmail25).map((row) => Number(row.id));
+        const book25 = tdb.prepare(
+          'INSERT INTO usage_daily (config_id, user_id, day, up_bytes, down_bytes) VALUES (?, ?, ?, ?, ?)'
+        );
+        for (const id of memberIds25) {
+          book25.run(id, srcId25, dayKey25(Date.now() - 86400000), 1024, 2048);
+          book25.run(id, srcId25, dayKey25(Date.now()), 4096, 8192);
+        }
+        const walletBefore25 = [money25(srcId25), money25(dstId25)];
+        const txBefore25 = [tx25(srcId25), tx25(dstId25)];        const nodeCallsBefore25 = mockXui.calls.length;
+        const moved25 = await move25(pkgId25, { toUserId: dstId25, note: 'انتقال دستی مدیر' });
+        const mv25 = moved25.json?.data || {};
+        check('v1.5.5 the real move rewrites EVERY row of the package at once, and only that',
+          moved25.status === 200 && mv25.moved === 2 && (mv25.rows || []).length === 2
+            && rowsOf25(pkgEmail25).length === 2
+            && rowsOf25(pkgEmail25).every((row) => Number(row.user_id) === dstId25)
+            && live25(srcId25) === 0 && live25(dstId25) === 2,
+          `moved=${mv25.moved} src=${live25(srcId25)} dst=${live25(dstId25)}`);
+        check('the traffic history follows the customer, so the old owner stops charting him',
+          mv25.usageRows === 4 && booked25(srcId25) === 0 && booked25(dstId25) === 4,
+          `usageRows=${mv25.usageRows} src=${booked25(srcId25)} dst=${booked25(dstId25)}`);
+        check('and one package stays ONE package: two channels, one quota, no split in half',
+          new Set(rowsOf25(pkgEmail25).map((row) => Number(row.total_bytes))).size === 1
+            && Number(rowsOf25(pkgEmail25)[0].total_bytes) === 10 * 1024 ** 3
+            && new Set(rowsOf25(pkgEmail25).map((row) => String(row.sub_id))).size === 1,
+          rowsOf25(pkgEmail25).map((row) => `${row.total_bytes}/${row.sub_id}`).join(' '));
+        check('no money moves with a customer: neither wallet pays, neither is paid, no ledger row',
+          walletBefore25.join(',') === '0,0'
+            && [money25(srcId25), money25(dstId25)].join(',') === walletBefore25.join(',')
+            && [tx25(srcId25), tx25(dstId25)].join(',') === txBefore25.join(',') && tx25(dstId25) === 0,
+          `src=${money25(srcId25)}/${tx25(srcId25)} dst=${money25(dstId25)}/${tx25(dstId25)}`);
+        check('the node is not touched at all — his subscription did not change hands, only his seller',
+          mockXui.calls.length === nodeCallsBefore25 && onNode25(pkgEmail25) === LINE25(LABEL25),
+          `calls=${mockXui.calls.length - nodeCallsBefore25} node="${onNode25(pkgEmail25)}"`);
+
+        const backAgain25 = await move25(pkgId25, { toUserId: dstId25 });
+        check('the same target twice is a mistake, not a second move',
+          backAgain25.status === 422 && code25(backAgain25) === 'same_reseller',
+          `code=${code25(backAgain25)}`);
+
+        const toNote25 = notes25(dstId25, 'مشتری به شما منتقل شد').slice(-1)[0] || {};
+        const fromNote25 = notes25(srcId25, 'مشتری منتقل شد').slice(-1)[0] || {};
+        check('both resellers are told in their own panel, with the customer named',
+          String(toNote25.body || '').includes(pkgEmail25)
+            && String(toNote25.body || '').includes('movesrc')
+            && String(fromNote25.body || '').includes('movedst')
+            && String(toNote25.link) === '/reseller/configs',
+          `to=${String(toNote25.body || '').slice(0, 60)} from=${String(fromNote25.body || '').slice(0, 60)}`);
+        const audit25 = tdb.prepare(
+          "SELECT * FROM audit_logs WHERE action = 'config.transfer' ORDER BY id DESC LIMIT 1"
+        ).get() || {};
+        const auditDetails25 = String(audit25.details || '');
+        check('the audit trail names both sides, every row that moved and the reason typed',
+          audit25.entity === 'config' && String(audit25.role) === 'admin'
+            && Number(audit25.user_id) === Number(me.json?.data?.user?.id)
+            && auditDetails25.includes(`"fromUserId":${srcId25}`) && auditDetails25.includes(`"toUserId":${dstId25}`)
+            && auditDetails25.includes('انتقال دستی مدیر') && /"usageRows":4/.test(auditDetails25),
+          `user=${audit25.user_id} role=${audit25.role} ${auditDetails25.slice(0, 110)}`);
+
+        const srcList25 = await request('GET', `/api/reseller/configs?search=${pkgEmail25}`, {
+          cookies: srcSess25.cookies, csrf: srcSess25.csrf,
+        });
+        const dstList25 = await request('GET', `/api/reseller/configs?search=${pkgEmail25}`, {
+          cookies: dstSess25.cookies, csrf: dstSess25.csrf,
+        });
+        const sees = (res) => res.status === 200 && String(res.raw || '').includes(pkgEmail25);
+        check('the lists on the two screens agree with the database: one sees him, the other does not',
+          sees(dstList25) === true && sees(srcList25) === false,
+          `src=${sees(srcList25)} dst=${sees(dstList25)}`);
+
+        // The UNIQUE(email, inbound_id) index is exactly what makes this state
+        // impossible through the API, so the duplicate that the guard exists for
+        // has to be built by hand — index down, row in, guard checked, row out,
+        // index back up.
+        let clashProof25 = '';
+        try {
+          tdb.exec('DROP INDEX IF EXISTS idx_configs_email_inbound');
+          tdb.prepare(
+            `INSERT INTO configs (user_id, inbound_id, email, sub_id, xui_sub_id, uuid, label, customer_name,
+               total_bytes, expiry_at, enabled, status, created_at, updated_at, deleted_at)
+             VALUES (?, 901, ?, '', '', '', '', '', ?, ?, 1, 'active', ?, ?, 0)`
+          ).run(clash25.id, pkgEmail25, 10 * 1024 ** 3, Date.now() + 30 * 86400000, Date.now(), Date.now());
+          const clashR25 = await move25(pkgId25, { toUserId: clash25.id });
+          clashProof25 = `${clashR25.status}:${code25(clashR25)}`;
+          check('a customer already registered on that channel under the target is refused, not merged',
+            clashR25.status === 409 && code25(clashR25) === 'already_with_target'
+              && memberIds25.every((id) => Number(cfg25(id).user_id) === dstId25),
+            clashProof25);
+        } finally {
+          tdb.prepare('DELETE FROM configs WHERE user_id = ? AND email = ?').run(clash25.id, pkgEmail25);
+          tdb.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_configs_email_inbound ON configs(email, inbound_id)');
+        }
+
+        const homeAgain25 = await move25(pkgId25, { toUserId: srcId25 });
+        check('and a move back is the same move the other way — the ledger goes with him again',
+          homeAgain25.status === 200 && homeAgain25.json?.data?.moved === 2
+            && rowsOf25(pkgEmail25).every((row) => Number(row.user_id) === srcId25)
+            && booked25(srcId25) === 4 && booked25(dstId25) === 0,
+          JSON.stringify(homeAgain25.json?.data || {}));
+
+        // Items 4 and 5 meeting: the new owner edits his own customer's label,
+        // and the node — which never changed hands — gets the new line.
+        const newOwnerRename25 = await request('PATCH', `/api/reseller/configs/${pkgId25}`, {
+          cookies: srcSess25.cookies, csrf: srcSess25.csrf, body: { label: 'برچسب نماینده' },
+        });
+        check('the reseller who now owns him can relabel him, and the node hears it',
+          newOwnerRename25.status === 200 && newOwnerRename25.json?.data?.config?.commentSync?.pushed === true
+            && onNode25(pkgEmail25) === LINE25('برچسب نماینده'),
+          `status=${newOwnerRename25.status} node="${onNode25(pkgEmail25)}"`);
+        const wireVersion25 = (await request('GET', '/api/health')).json?.version;
+        check('this build is v1.5.5 on the wire too', wireVersion25 === '1.5.5', `version=${wireVersion25}`);
+      } finally {
+        if (lifted25) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit25 } });
+        tdb.close();
       }
     }
 

@@ -405,30 +405,24 @@ router.get('/bot', asyncH(async (req, res) => {
 
 // --------------------------------------- v1.5.4: how a wallet gets filled
 //
-// Four ways in, and they are NOT the same kind of thing (services/payment.js
-// spells out why): the card numbers and the بلو link are things the reseller acts
-// on OUTSIDE this panel, so all the panel can record is his claim; ZarinPal is the
-// one route that can come back with proof of a real payment. Every path here
-// therefore ends in the same topup_requests table with the same rules — a pending
-// row, capped amount, the admin or the schedule deciding — and only topups.approve()
-// moves money. That is deliberate: two different screens offering two different
-// "pay now" buttons must not be able to credit the same order twice.
+// Two ways in since v1.5.5 (services/payment.js spells out why the بلو link and
+// card-to-card left), and they are NOT the same kind of thing: the owner's card
+// numbers are something the reseller acts on OUTSIDE this panel, so all the panel can
+// record is his claim; ZarinPal is the one route that can come back with proof of a
+// real payment. Every path here therefore ends in the same topup_requests table with
+// the same rules — a pending row, capped amount, the admin or the schedule deciding —
+// and only topups.approve() moves money. That is deliberate: two different screens
+// offering two different "pay now" buttons must not be able to credit the same order
+// twice.
 
 router.get('/payments/methods', (req, res) => {
   res.json({ ok: true, data: payment.methods() });
 });
 
-// The owner's prepared بلو link, with this reseller's amount filled in. Nothing is
-// written here: opening a link is not a payment, and a row for it would put an
-// unpaid claim in front of the admin. He comes back with /payments/claim once the
-// bank has actually taken the money, and quotes the tracking code he was shown.
-router.get('/payments/blue', (req, res) => {
-  const amount = topups.cleanAmount(num(req.query.amount, 0));
-  const link = payment.blueLinkFor(amount);
-  res.json({ ok: true, data: { ...link, currency: String(settings.getSetting('billing').currency || 'تومان') } });
-});
-
-// A claim: «I paid» — by receipt, card-to-card, or through the بلو link.
+// A claim: «I paid into your card, here is my receipt». The card he names has to be
+// one the owner published (topups.createRequest checks that), and his own
+// «فیش واریزی» switch is checked there too, so a disabled gateway refuses here, in
+// the bot, and in any other door into the same table.
 router.post('/payments/claim', asyncH(async (req, res) => {
   const body = req.body || {};
   const method = topups.cleanMethod(body.method);

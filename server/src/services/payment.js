@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * Payment methods (v1.5.4).
+ * Payment methods (v1.5.5).
  *
- * The owner asked for three ways for a reseller to put money in, and they are not
- * the same kind of thing, so this file keeps them straight:
+ * Two ways for a reseller to put money in, each with its own switch, because the
+ * owner looked at the three v1.5.4 offered him and asked for the بلو link and
+ * card-to-card to go:
  *
  *   1. ZarinPal — a real gateway with a server-to-server API. The panel asks for
  *      an authority, sends the reseller to ZarinPal's own page, and ZarinPal sends
@@ -13,19 +14,13 @@
  *      arriving at the callback with a hand-typed ?Status=OK has paid nothing;
  *      the verify for that authority simply fails and the row stays pending.
  *
- *   2. Blue Bank (بلو) — a neobank with NO public payment API (checked 2026-11:
- *      "لینک پرداخت" is a feature of the owner's own بلو account, not a service a
- *      panel can call). So what the panel offers is exactly what the owner asked
- *      for: a ready link. He creates it once inside his بلو app, pastes it here,
- *      and the panel fills the amount into it ({amount}) and hands it to the
- *      reseller. Nothing can confirm the payment, so a بلو row is a CLAIM and
- *      waits for the admin — or for the scheduled auto-approval, if he switched
- *      it on for it.
- *
- *   3. Card-to-card and deposit receipts — the owner's own card numbers (several,
- *      since he asked). The reseller picks the card he paid into, quotes his bank
- *      tracking code and uploads or describes the receipt. Same rule as بلو: a
- *      claim until a person, or the schedule, says otherwise.
+ *   2. Deposit receipt (فیش واریزی) — he pays into one of the owner's own card
+ *      numbers in `cards` and sends the receipt, from the panel or from the bot.
+ *      `receiptEnabled` is his switch for it, and since v1.5.5 the bot reads those
+ *      numbers out to him before he pays (services/bot.js startTopup), which is
+ *      what he asked for: without them a reseller has no idea where to send money.
+ *      Nothing can confirm the payment, so a receipt is a CLAIM and waits for the
+ *      admin — or for the scheduled auto-approval, if he switched it on for it.
  *
  * Money itself is never moved here. Every credit goes through services/topups.js
  * approve(), which is the single place the wallet moves for an incoming payment
@@ -70,13 +65,19 @@ function zarinpal() {
   };
 }
 
-function blue() {
+/**
+ * فیش واریزی as a method: switched on by the owner, and only worth offering once he
+ * has actually typed a card number — a receipt with nowhere to pay is a dead button,
+ * and this panel does not render those.
+ */
+function receipt() {
   const cfg = paymentSettings();
-  const link = String(cfg.blueLink || '').trim();
+  const list = cards();
   return {
-    enabled: Boolean(cfg.blueEnabled) && Boolean(link),
-    link,
-    label: String(cfg.blueLabel || 'بلو بانک').trim() || 'بلو بانک',
+    enabled: Boolean(cfg.receiptEnabled),
+    cards: list,
+    ready: Boolean(cfg.receiptEnabled) && list.length > 0,
+    reason: !cfg.receiptEnabled ? 'disabled' : list.length ? '' : 'no_cards',
   };
 }
 
@@ -90,15 +91,21 @@ function tomanToRial(amount) {
 
 /**
  * What the wallet page offers. The card list is the point of the call; the two
- * gateway entries say honestly WHY they are missing when they are off, so the
- * reseller is never shown a button that cannot work.
+ * entries say honestly WHY they are missing when they are off, so the reseller is
+ * never shown a button that cannot work.
  */
 function methods() {
   const zp = zarinpal();
-  const bb = blue();
+  const rp = receipt();
   const base = publicBaseUrl();
   return {
-    cards: cards(),
+    cards: rp.cards,
+    receipt: {
+      enabled: rp.enabled,
+      ready: rp.ready,
+      hasCards: rp.cards.length > 0,
+      reason: rp.reason,
+    },
     zarinpal: {
       enabled: zp.enabled,
       // Off until the panel has an address ZarinPal can send a man back to:
@@ -107,32 +114,7 @@ function methods() {
       ready: zp.enabled && Boolean(base),
       reason: !zp.enabled ? 'not_configured' : base ? '' : 'no_public_url',
     },
-    blue: {
-      enabled: bb.enabled,
-      label: bb.label,
-      hasAmountPlaceholder: bb.link.includes('{amount}'),
-    },
-    cardToCard: cards().length > 0,
     currency: String(getSetting('billing').currency || 'تومان'),
-  };
-}
-
-/**
- * The بلو link for one amount. `{amount}` is filled with the rial figure, because
- * that is the unit an Iranian bank page expects; without the placeholder the
- * owner's link is handed over unchanged and the amount is shown beside it for him
- * to type — which is still "a ready link", just one that cannot pre-fill.
- */
-function blueLinkFor(amount) {
-  const bb = blue();
-  if (!bb.enabled) throw new ApiError(409, 'blue_disabled', 'پرداخت با بلو در این پنل فعال نیست / Blue Bank payment is not enabled');
-  const rial = tomanToRial(amount);
-  return {
-    label: bb.label,
-    link: bb.link.replaceAll('{amount}', String(rial)).replaceAll('{amount_toman}', String(Math.round(Number(amount || 0)))),
-    amount: Math.round(Number(amount || 0)),
-    rial,
-    prefilled: bb.link.includes('{amount}') || bb.link.includes('{amount_toman}'),
   };
 }
 
@@ -209,8 +191,7 @@ async function zarinpalVerify({ authority, amount } = {}) {
 }
 
 /**
- * The scheduled auto-approval, as the owner asked for it: «زمان‌بندی تایید خودکار
- * برای فیش‌های واریزی و کارت به کارت».
+ * The scheduled auto-approval: «زمان‌بندی تایید خودکار».
  *
  * It is deliberately narrow, because this is a switch that gives money away
  * without anybody looking:
@@ -221,8 +202,10 @@ async function zarinpalVerify({ authority, amount } = {}) {
  *     is refused in the settings route, so no build of this panel can auto-credit
  *     an unbounded amount;
  *   - an optional daily ceiling per reseller bounds repeated claims;
- *   - the two kinds he named are switched separately, and a gateway payment is not
- *     in this list at all: ZarinPal confirms itself, it does not need a sweep.
+ *   - receipts are what it sweeps. A gateway payment is not in this list at all:
+ *     ZarinPal confirms itself, it does not need a sweep. Card-to-card had its own
+ *     switch until v1.5.5 removed the method; a `card` row written by 1.5.4 keeps
+ *     its history but is never swept, because it is no longer a method on the list.
  */
 function autoApprove() {
   const cfg = paymentSettings();
@@ -232,8 +215,6 @@ function autoApprove() {
     // What the admin asked for, method by method.
     methods: {
       receipt: Boolean(cfg.autoApproveReceipt),
-      card: Boolean(cfg.autoApproveCard),
-      blue: false,
       zarinpal: false,
     },
     afterMinutes: Math.min(1440, Math.max(1, Number(cfg.autoApproveAfterMinutes) || 15)),
@@ -250,11 +231,10 @@ module.exports = {
   paymentSettings,
   cards,
   zarinpal,
-  blue,
+  receipt,
   publicBaseUrl,
   tomanToRial,
   methods,
-  blueLinkFor,
   zarinpalRequest,
   zarinpalVerify,
   autoApprove,

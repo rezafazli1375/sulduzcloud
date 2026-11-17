@@ -198,6 +198,7 @@ function startDailyReportTimer() {
 
 function startAutoApproveTimer() {
   // v1.5.4, item 3: «زمان‌بندی تایید خودکار برای فیش‌های واریزی و کارت به کارت».
+  // v1.5.5 retired کارت به کارت, so the sweep can only ever be asked about receipts.
   //
   // The tick is cheap and reads its own settings every time, so a change the
   // owner makes in the settings form takes effect on the next minute without a

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Activity,
   AlertTriangle,
+  ArrowLeftRight,
   CalendarClock,
   Check,
   Copy,
@@ -44,6 +45,7 @@ import {
   Modal,
   QrModal,
   SectionCard,
+  Select,
   Skeleton,
   StatusBadge,
   UsageBar,
@@ -105,7 +107,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const base = isAdmin ? '/admin/configs' : '/reseller/configs';
   const currency = meta?.billing?.currency || '';
 
-  const [sheet, setSheet] = useState(null); // extend | quota | edit | identity | addInbound
+  const [sheet, setSheet] = useState(null); // extend | quota | edit | identity | addInbound | transfer
   const [qr, setQr] = useState(null);
   // `charge` is v1.4.25 and admin-only: an admin renewing on a reseller's behalf
   // does not spend the reseller's wallet unless he ticks it. The field is not
@@ -120,6 +122,10 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const [quotaForm, setQuotaForm] = useState({ gb: 0, days: 0, enabled: true });
   const [editForm, setEditForm] = useState({ label: '', customerName: '', customerPhone: '', note: '' });
   const [identityForm, setIdentityForm] = useState({ uuid: '', subId: '' });
+  // v1.5.5, item 4 (admin only): moving a customer rewrites the owner of EVERY
+  // row of his package, so the dialog never guesses what will move — it asks the
+  // server with dryRun and shows that answer before the button is allowed.
+  const [transferForm, setTransferForm] = useState({ toUserId: '', note: '' });
 
   const detail = useQuery({
     queryKey: ['config', configId],
@@ -156,6 +162,39 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     queryFn: () => api.get(isAdmin ? `/admin/inbounds?userId=${config?.userId || 0}` : '/reseller/inbounds'),
     enabled: open && sheet === 'addInbound',
   });
+
+  // v1.5.5, item 4: the two reads the transfer dialog needs. The reseller list is
+  // the same one «دریافت کانفیگ» uses, minus the current owner (the server refuses
+  // a transfer to himself, so he is not offered). The preview is a dryRun POST —
+  // the server answers with the rows, channels and quota that would move, and
+  // with the refusal if the target cannot hold this customer.
+  const resellersQuery = useQuery({
+    queryKey: ['transfer-resellers'],
+    queryFn: () => api.get('/admin/users?role=reseller&pageSize=200'),
+    enabled: open && sheet === 'transfer',
+  });
+  const transferTargets = (resellersQuery.data?.rows || []).filter((user) => Number(user.id) !== Number(config?.userId));
+  const transferPreview = useQuery({
+    queryKey: ['transfer-preview', configId, transferForm.toUserId],
+    queryFn: () => api.post(`/admin/configs/${configId}/transfer`, { toUserId: Number(transferForm.toUserId), dryRun: true }),
+    enabled: open && sheet === 'transfer' && Boolean(transferForm.toUserId),
+    staleTime: 0,
+    refetchOnMount: 'always',
+    retry: false,
+  });
+  // The preview is the gate: a target the server refuses stays refused on screen,
+  // so the button is never offered for a move that would fail on submit.
+  const transferPreviewData = transferPreview.data || null;
+  const transferAllowed = Boolean(transferPreviewData) && !transferPreview.isError;
+  // The sentence the server wrote is the one that answers WHY: which reseller and
+  // which of his ceilings. translateError maps a code to a short label («محدودیت
+  // تعداد کانفیگ»), which is right for a wallet form but too terse here — the admin
+  // is moving a customer between two shops and has to know what to fix. So the
+  // server's own text is used when there is one, and the mapped label only as a
+  // fallback (a network error has no message worth showing).
+  const transferProblem = transferPreview.error
+    ? (String(transferPreview.error.message || '').trim() || translateError(transferPreview.error, t))
+    : '';
 
   const billingOn = Boolean(meta?.billing?.enabled);
   const extendAmountGb = Number(extendForm.gb || 0);
@@ -293,7 +332,22 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
 
   const saveMeta = useMutation({
     mutationFn: (payload) => api.patch(`${base}/${configId}`, payload),
-    onSuccess: () => { toast.success(t('common.saved')); setSheet(null); refresh(); },
+    // v1.5.5: the label now also goes to the node panel as the client's comment.
+    // The save always stands, but if the node was not told the screen has to say so
+    // instead of letting him believe پنل ثنایی shows the new name.
+    onSuccess: (data) => {
+      const sync = data?.config?.commentSync;
+      if (sync && sync.pushed === false) {
+        toast.warning(
+          sync.reason === 'client_missing' ? t('configs.detail.commentNoClient') : t('configs.detail.commentFailed'),
+          { title: t('common.saved') },
+        );
+      } else {
+        toast.success(t('common.saved'));
+      }
+      setSheet(null);
+      refresh();
+    },
     onError,
   });
 
@@ -329,6 +383,29 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   const addInbound = useMutation({
     mutationFn: (payload) => api.post(`${base}/${configId}/inbounds`, payload),
     onSuccess: () => { toast.success(t('configs.group.added')); setSheet(null); refresh(); },
+    onError,
+  });
+
+  // The real move. The preview above already refused the cases the server would
+  // refuse, so this only has to report what actually changed; `moved` and
+  // `usageRows` come from the server rather than from anything counted here.
+  const transfer = useMutation({
+    mutationFn: () => api.post(`/admin/configs/${configId}/transfer`, {
+      toUserId: Number(transferForm.toUserId),
+      note: transferForm.note.trim(),
+    }),
+    onSuccess: (data) => {
+      toast.success(t('configs.transfer.done', {
+        to: data?.toReseller || '',
+        n: formatNumber(Number(data?.moved || 0), lang),
+      }));
+      setSheet(null);
+      setTransferForm({ toUserId: '', note: '' });
+      // Both lists change: this customer leaves one reseller's page and appears
+      // on another's, and the counters on the resellers table move with him.
+      refresh();
+      queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
+    },
     onError,
   });
 
@@ -584,6 +661,16 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                 <Button variant="ghost" size="xs" icon={Fingerprint} onClick={() => setSheet('identity')}>{t('configs.actions.identity')}</Button>
                 {isAdmin ? (
                   <Button variant="ghost" size="xs" icon={CreditCard} onClick={() => setSheet('quota')}>{t('configs.quota.title')}</Button>
+                ) : null}
+                {isAdmin ? (
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    icon={ArrowLeftRight}
+                    onClick={() => { setTransferForm({ toUserId: '', note: '' }); setSheet('transfer'); }}
+                  >
+                    {t('configs.transfer.action')}
+                  </Button>
                 ) : null}
                 <Button variant="ghost" size="xs" icon={RefreshCw} onClick={() => detail.refetch()} loading={detail.isFetching}>{t('configs.detail.syncLinks')}</Button>
               </div>
@@ -1012,6 +1099,88 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
             {t('configs.identity.warning')}
           </p>
         </div>
+      </Modal>
+
+      {/* v1.5.5, item 4: the admin moves a whole customer, not one row. Nothing is
+          written until the server's dryRun has answered, and what it answered is
+          what is shown — rows, channels and quota. */}
+      <Modal
+        open={sheet === 'transfer'}
+        onClose={() => setSheet(null)}
+        title={t('configs.transfer.title')}
+        subtitle={t('configs.transfer.hint')}
+        size="md"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setSheet(null)}>{t('common.cancel')}</Button>
+            <Button
+              variant="danger"
+              loading={transfer.isPending}
+              disabled={!transferForm.toUserId || !transferAllowed || transferPreview.isFetching}
+              onClick={() => transfer.mutate()}
+            >
+              {t('configs.transfer.confirm')}
+            </Button>
+          </>
+        }
+      >
+        <Field label={t('configs.transfer.to')} required>
+          {resellersQuery.isLoading ? (
+            <Skeleton className="h-9 w-full" />
+          ) : (
+            <Select value={transferForm.toUserId} onChange={(e) => setTransferForm((prev) => ({ ...prev, toUserId: e.target.value }))}>
+              <option value="">{t('configs.transfer.pick')}</option>
+              {transferTargets.map((user) => (
+                <option key={user.id} value={user.id}>
+                  {user.name ? `${user.name} (@${user.username})` : `@${user.username}`}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+
+        {!transferForm.toUserId ? (
+          <p className="mt-3 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2 text-[11px] leading-5 text-slate-400">
+            {t('configs.transfer.pickHint')}
+          </p>
+        ) : transferPreview.isFetching ? (
+          <div className="mt-3 space-y-2">
+            <Skeleton className="h-6 w-full" />
+            <Skeleton className="h-6 w-2/3" />
+          </div>
+        ) : transferProblem ? (
+          <p className="mt-3 flex items-start gap-2 rounded-xl border border-rose-400/25 bg-rose-500/[0.07] px-3 py-2 text-[11px] leading-5 text-rose-100">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{transferProblem}</span>
+          </p>
+        ) : transferPreviewData ? (
+          <div className="mt-3 rounded-xl border border-white/[0.07] bg-white/[0.02] px-3">
+            <div className="grid gap-x-6 sm:grid-cols-2">
+              <InfoRow label={t('configs.transfer.from')} value={`@${transferPreviewData.fromReseller || '—'}`} />
+              <InfoRow label={t('configs.transfer.toShort')} value={`@${transferPreviewData.toReseller || '—'}`} />
+              <InfoRow label={t('configs.transfer.rows')} value={formatNumber((transferPreviewData.rows || []).length, lang)} />
+              <InfoRow label={t('configs.transfer.gb')} value={`${formatNumber(transferPreviewData.totalGb || 0, lang)} GB`} />
+            </div>
+            <p className="border-t border-white/[0.06] py-2 text-[11px] leading-5 text-slate-400">
+              {(transferPreviewData.inbounds || []).join(' · ') || '—'}
+            </p>
+          </div>
+        ) : null}
+
+        <div className="mt-3">
+          <Field label={t('configs.transfer.note')} hint={t('configs.transfer.noteHint')}>
+            <Input
+              value={transferForm.note}
+              maxLength={200}
+              onChange={(e) => setTransferForm((prev) => ({ ...prev, note: e.target.value }))}
+              placeholder={t('configs.transfer.notePlaceholder')}
+            />
+          </Field>
+        </div>
+
+        <p className="mt-3 rounded-xl border border-sky-400/20 bg-sky-500/[0.06] px-3 py-2 text-[10.5px] leading-5 text-sky-100/85">
+          {t('configs.transfer.explainer')}
+        </p>
       </Modal>
 
       <Modal

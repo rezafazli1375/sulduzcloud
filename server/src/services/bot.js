@@ -44,6 +44,7 @@ const { getDb } = require('../db');
 const settings = require('../settings');
 const telegram = require('./telegram');
 const topups = require('./topups');
+const payment = require('./payment');
 const usersService = require('./users');
 const stats = require('./stats');
 const { ApiError, log, logError } = require('../utils');
@@ -555,8 +556,9 @@ function receiptsText(user) {
   }
   for (const row of data.rows) {
     // v1.5.4: a row here is not always a Telegram picture any more — the panel
-    // also holds card-to-card claims and gateway orders, and in one list the
-    // reseller has to be able to tell which money he is looking at.
+    // also holds gateway orders, and v1.5.5 rows still carry the card-to-card and
+    // بلو labels of money paid before those two methods were retired. In one list
+    // the reseller has to be able to tell which money he is looking at.
     const method = esc(row.methodLabel || 'فیش واریزی');
     lines.push(`${tone[row.status] || '•'} #${Number(row.id)} · ${method} · <b>${faNum(row.amount)}</b> ${unit} · ${esc(faDate(row.createdAt, true))}`);
     if (row.reference) lines.push(`  کد رهگیری: <code>${esc(row.reference)}</code>`);
@@ -580,14 +582,15 @@ function helpText(user, botName = '') {
     `${BTN_BALANCE} — موجودی کیف پول و آخرین تراکنش‌ها`,
     `${BTN_PACKAGES} — اشتراک‌های فعال، در حال اتمام، حجم‌تمام‌شده و منقضی`,
     `${BTN_TOPUP} — افزایش موجودی با ارسال فیش واریزی`,
-    `${BTN_RECEIPTS} — وضعیت همهٔ فیش‌هایی که فرستاده‌اید`,
+    `${BTN_RECEIPTS} — وضعیت همهٔ واریزی‌هایی که فرستاده‌اید`,
     `${BTN_STATS} — آمار مصرف و ترافیک مشتریان شما`,
     '',
     '<b>روش افزایش موجودی</b>',
     `۱) دکمهٔ «${BTN_TOPUP}» را بزنید (یا دستور /topup).`,
-    '۲) مبلغ واریزی را به تومان بفرستید؛ مثلا <code>500000</code>.',
-    '۳) عکس یا فایل فیش واریزی را بفرستید.',
-    '۴) فیش برای مدیر ارسال می‌شود؛ پس از تایید او موجودی شما افزایش پیدا می‌کند و همین‌جا خبر می‌گیرید.',
+    '۲) شماره کارت‌های مدیر همین‌جا نمایش داده می‌شود؛ مبلغ را به یکی از آن‌ها واریز کنید.',
+    '۳) مبلغ واریزی را به تومان بفرستید؛ مثلا <code>500000</code>.',
+    '۴) عکس یا فایل فیش واریزی را بفرستید.',
+    '۵) فیش برای مدیر ارسال می‌شود؛ پس از تایید او موجودی شما افزایش پیدا می‌کند و همین‌جا خبر می‌گیرید.',
     '',
     botName
       ? `از پنل هم می‌توانید: بخش کیف پول دکمهٔ «افزایش موجودی از طریق ربات» شما را مستقیم به این چت می‌آورد — <code>t.me/${esc(botName)}?start=topup</code>`
@@ -790,11 +793,58 @@ async function finishReceipt(chatId, user, state, message) {
   return { ok: true, request, delivery };
 }
 
+/**
+ * The owner's card numbers, formatted for a chat (v1.5.5, his item 2). They always
+ * existed — in تنظیمات → پرداخت, and the panel wallet showed them — but the bot did
+ * not, so a reseller who only ever tops up in Telegram was told "send a receipt" with
+ * no idea where the money should go. Grouped in fours because a 16-digit run cannot
+ * be read off a phone screen and typed into a banking app in one go.
+ */
+function cardLines(list) {
+  const lines = [];
+  for (const card of list || []) {
+    const grouped = String(card.number || '').replace(/(.{4})(?=.)/g, '$1 ');
+    lines.push(`💳 <code>${esc(grouped)}</code>${card.bank ? ` — ${esc(card.bank)}` : ''}`);
+    if (card.holder) lines.push(`   به نام <b>${esc(card.holder)}</b>`);
+    if (card.note) lines.push(`   ${esc(card.note)}`);
+  }
+  return lines;
+}
+
 async function startTopup(chatId, user) {
+  const rp = payment.receipt();
+  // His switch (v1.5.5): receipts off means the bot does not collect them either.
+  // topups.createRequest refuses the same thing further down; saying it here is what
+  // saves a man from photographing a receipt for nothing.
+  if (!rp.enabled) {
+    clearStep(chatId);
+    await replyMenu(chatId, [
+      '🚫 <b>ثبت فیش واریزی در این پنل غیرفعال است</b>',
+      '',
+      'مدیر روش واریز فیش را خاموش کرده است. برای روشن کردنش به او مراجعه کنید.',
+    ].join('\n'));
+    return { ok: false, reason: 'receipt_disabled' };
+  }
+  const lines = cardLines(rp.cards);
+  if (!lines.length) {
+    // No card typed yet: the flow could technically still record a receipt, but the
+    // admin would be approving money nobody knows where to send. Refuse and say why.
+    clearStep(chatId);
+    await replyMenu(chatId, [
+      '⚠️ <b>شماره کارتی در پنل تعریف نشده است</b>',
+      '',
+      'مدیر هنوز شماره کارتی برای فیش واریزی ثبت نکرده (تنظیمات ← پرداخت).',
+      'وقتی ثبت کرد، همین‌جا «افزایش موجودی» را دوباره بزنید.',
+    ].join('\n'));
+    return { ok: false, reason: 'no_cards' };
+  }
   setStep(chatId, { step: 'amount', amount: 0, fileKind: '', fileId: '' });
   const unit = esc(currency());
   await reply(chatId, [
-    `🧾 <b>افزایش موجودی با فیش واریزی</b>`,
+    '🧾 <b>افزایش موجودی با فیش واریزی</b>',
+    '',
+    'مبلغ را به یکی از این کارت‌ها واریز کنید:',
+    ...lines,
     '',
     `۱) مبلغ واریزی را به ${unit} بفرستید؛ مثلا <code>500000</code>.`,
     '۲) سپس عکس یا فایل فیش را بفرستید.',
@@ -802,7 +852,7 @@ async function startTopup(chatId, user) {
     'می‌توانید اول عکس فیش را بفرستید و بعد مبلغ را بنویسید.',
     `برای بی‌خیال شدن «${BTN_CANCEL}» یا /cancel را بزنید.`,
   ].join('\n'), { reply_markup: cancelKeyboard() });
-  return { ok: true, step: 'amount' };
+  return { ok: true, step: 'amount', cards: rp.cards.length };
 }
 
 /** The pending receipts, the way both /pending and the admin button show them. */
@@ -810,9 +860,9 @@ function pendingListText(list) {
   const unit = esc(currency());
   const lines = [`🧾 <b>واریزی‌های در انتظار: ${faNum(list.counts.pending)}</b>`];
   for (const row of list.rows) {
-    // v1.5.4: only a 'receipt' arrives as a picture in this chat. A card claim or
-    // a gateway order has no photo, so the line has to say what it is and quote
-    // whatever the reseller gave the bank as proof.
+    // v1.5.4: only a 'receipt' arrives as a picture in this chat. A gateway order
+    // has no photo (and neither has a legacy card/بلو row from before 1.5.5), so
+    // the line has to say what it is and quote whatever proof was given.
     const method = esc(row.methodLabel || 'فیش واریزی');
     lines.push(`• #${Number(row.id)} · <code>${esc(row.username)}</code> · ${method} · ${faNum(row.amount)} ${unit} · ${esc(faDate(row.createdAt, true))}`);
     const proof = [row.cardNumber ? `کارت <code>${esc(row.cardNumber)}</code>` : '', row.reference ? `کد <code>${esc(row.reference)}</code>` : '']

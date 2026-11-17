@@ -38,10 +38,14 @@ import { useToast } from '../../components/feedback.jsx';
 const STATUS_TONE = { pending: 'amber', approved: 'emerald', rejected: 'rose' };
 const STATUS_KEY = { pending: 'topups.pending', approved: 'topups.approved', rejected: 'topups.rejected' };
 
-// v1.5.4: money now arrives four ways, and the schedule can decide without a
-// person. The API sends a Persian `methodLabel` for the bot and the ledger; the
-// panel translates the code instead, so the English screen is not overwritten by
-// a server-side string.
+// v1.5.4: money arrived four ways, and the schedule could decide without a person.
+// The API sends a Persian `methodLabel` for the bot and the ledger; the panel
+// translates the code instead, so the English screen is not overwritten by a
+// server-side string.
+//
+// v1.5.5 retired کارت به کارت and بلو — nobody can file one any more — but their
+// rows stay in this table, so both codes keep a label and a filter here. Dropping
+// them would render a man's paid-for money as an unknown line.
 const METHOD_KEY = {
   receipt: 'topups.mReceipt',
   card: 'topups.mCard',
