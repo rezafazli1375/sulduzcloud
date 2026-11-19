@@ -10,6 +10,7 @@ import ErrorBoundary from './components/ErrorBoundary.jsx';
 import Shell from './components/Shell.jsx';
 
 import Login from './pages/auth/Login.jsx';
+import Activate from './pages/auth/Activate.jsx';
 import Overview from './pages/Overview.jsx';
 import Configs from './pages/Configs.jsx';
 import Plans from './pages/Plans.jsx';
@@ -26,6 +27,7 @@ import Topups from './pages/admin/Topups.jsx';
 import NodeSearch from './pages/admin/NodeSearch.jsx';
 import Backups from './pages/admin/Backups.jsx';
 import Audit from './pages/admin/Audit.jsx';
+import Trash from './pages/admin/Trash.jsx';
 import Settings from './pages/admin/Settings.jsx';
 import Wallet from './pages/reseller/Wallet.jsx';
 import ApiPage from './pages/reseller/ApiPage.jsx';
@@ -106,6 +108,15 @@ function ScrollToTop() {
 }
 
 function AppRoutes() {
+  const { needsActivation, activation, bootstrap, loading } = useAuth();
+
+  // v2.1.0: an install that has never been activated shows its male key and
+  // nothing else. This is checked before the routes, not inside them, because
+  // behind the gate every API call except /meta, /health and /activation answers
+  // 423 — a login form drawn here would be a form that cannot work.
+  if (loading) return <BootScreen />;
+  if (needsActivation) return <Activate activation={activation} onUnlocked={bootstrap} />;
+
   return (
     <>
       <ScrollToTop />
@@ -128,6 +139,8 @@ function AppRoutes() {
           <Route path="broadcasts" element={<Protected adminOnly perm="broadcasts"><Broadcasts /></Protected>} />
           <Route path="topups" element={<Protected adminOnly perm="users"><Topups /></Protected>} />
           <Route path="node-search" element={<Protected adminOnly perm="configs"><NodeSearch /></Protected>} />
+          {/* v2.1.0: the Trash — the undo for a deleted package (perm: configs). */}
+          <Route path="trash" element={<Protected adminOnly perm="configs"><Trash /></Protected>} />
           <Route path="backups" element={<Protected adminOnly perm="backups"><Backups /></Protected>} />
           <Route path="audit" element={<Protected adminOnly perm="audit"><Audit /></Protected>} />
           <Route path="settings" element={<Protected adminOnly perm="settings"><Settings /></Protected>} />

@@ -23,11 +23,15 @@ const {
   spreadAcrossDays,
   CONFIG_GROUP_KEY_SQL,
   CONFIG_GROUP_USED_SQL,
+  clientComment,
 } = require('../utils');
 const { audit, systemAudit } = require('../audit');
 const { notifyUser } = require('../notify');
 const telegram = require('./telegram');
 const qrcode = require('./qrcode');
+// v2.1.0: the Trash snapshot. trash.js never requires this file (it takes the rows
+// the delete path is already holding), so this one-way edge cannot dead-lock.
+const trash = require('./trash');
 
 const DAY_MS = 86400000;
 
@@ -423,19 +427,13 @@ function emailFor(user) {
  * x-ui has no label of its own: the only free text a client carries is `comment`,
  * and that is the column the node panel displays as the customer's description. So
  * برچسب — the name the reseller gives a subscription — leads it, followed by who
- * the customer is and how to reach him. One function, used by the create, the
- * rebuild and the edit path, because three places writing the same sentence
- * differently is how a node ends up disagreeing with the panel that owns it.
+ * the customer is and how to reach him. Since v2.1.0 the builder lives in
+ * utils.clientComment, because the trash restore writes the same client from
+ * another module; three places writing the same sentence differently is how a node
+ * ends up disagreeing with the panel that owns it.
  *
  * 120 characters is x-ui's own field width; the label alone is capped at 80.
  */
-function clientComment({ label, customerName, customerPhone } = {}) {
-  return [label, customerName, customerPhone]
-    .map((part) => String(part || '').trim())
-    .filter(Boolean)
-    .join(' | ')
-    .slice(0, 120);
-}
 
 // A Telegram id can appear anywhere in a client name: this panel writes
 // "<telegramId>-<random>", while seller panels prefix the plan ("german🇩🇪-<id>-<random>",
@@ -2666,6 +2664,20 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
     }
   }
   const db = getDb();
+  // v2.1.0 — the Trash keeps the record of a customer who really goes away.
+  // A hard remove erases the row, so it is always recorded. A soft remove of ONE
+  // channel of a package that still has other channels is not a deleted customer
+  // (his other rows carry him, and «افزودن اینباند» puts the channel back), so it
+  // is not recorded — that would fill the Trash with rows of live subscriptions.
+  const leavesNothing = members.filter((item) => Number(item.id) !== Number(row.id)).length === 0;
+  if (hard || leavesNothing) {
+    trash.snapshot([row], {
+      head: row,
+      mode: hard ? 'hard' : 'soft',
+      reason: hard ? 'hard_remove' : 'channel_last',
+      req,
+    });
+  }
   if (hard) {
     db.prepare('DELETE FROM configs WHERE id = ?').run(row.id);
     db.prepare('DELETE FROM usage_daily WHERE config_id = ?').run(row.id);
@@ -2744,6 +2756,16 @@ async function deletePackage(id, req, viewer, opts = {}) {
   }
 
   const now = Date.now();
+  // v2.1.0: the whole customer is recorded in the Trash before his rows go, with
+  // every channel he stood on, so «همون اشتراک قبلیشو میخوام» can be answered
+  // weeks later with the same email, uuid and subscription token he had.
+  trash.snapshot(members, {
+    head: row,
+    mode: 'soft',
+    reason: String(opts.reason || 'package'),
+    req,
+    by: opts.auto ? 'cleanup' : '',
+  });
   const softDelete = db.prepare('UPDATE configs SET deleted_at = ?, enabled = 0, updated_at = ? WHERE id = ?');
   for (const member of members) softDelete.run(now, now, Number(member.id));
 

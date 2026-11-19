@@ -9,10 +9,12 @@
  *
  *   npm run selftest
  */
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
+const https = require('https');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 
@@ -73,6 +75,64 @@ function cookiesFrom(headers) {
     jar[pair.slice(0, idx)] = pair.slice(idx + 1);
   }
   return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+/**
+ * The same request against an explicit port, for the v2.1.0 listener tests.
+ *
+ * Two differences from `request()` on purpose. `agent: false` — Node 19+ keeps
+ * connections alive per host, so after the panel moves to another port a request
+ * through a pooled agent could still be answered by the socket it had to the OLD
+ * port, which is exactly the thing these checks must not fake. And a refused
+ * connection resolves instead of rejecting: «the port nobody listens on any more
+ * answers ECONNREFUSED» is a result this suite asserts, not a crash.
+ */
+function onPort(port, method, urlPath, { body, cookies, csrf, headers = {}, tls = false } = {}) {
+  return new Promise((resolve) => {
+    const payload = body ? JSON.stringify(body) : null;
+    const lib = tls ? https : http;
+    const opts = {
+      host: '127.0.0.1',
+      port,
+      path: urlPath,
+      method,
+      agent: false,
+      rejectUnauthorized: false,
+      headers: { accept: 'application/json', ...headers },
+      timeout: 15000,
+    };
+    if (payload) {
+      opts.headers['content-type'] = 'application/json';
+      opts.headers['content-length'] = Buffer.byteLength(payload);
+    }
+    if (cookies) opts.headers.cookie = cookies;
+    if (csrf) opts.headers['x-csrf-token'] = csrf;
+    const req = lib.request(opts, (res) => {
+      let raw = '';
+      res.on('data', (c) => { raw += c; });
+      res.on('end', () => {
+        let json = null;
+        try { json = JSON.parse(raw); } catch (_) { /* non-json */ }
+        resolve({ status: res.statusCode, headers: res.headers, json, raw, error: '' });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.on('error', (err) => resolve({ status: 0, headers: {}, json: null, raw: '', error: String(err.code || err.message) }));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+/** A port nothing is holding right now, or 0 when the OS would not say. */
+function freePort() {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', () => resolve(0));
+    probe.listen(0, '127.0.0.1', () => {
+      const port = probe.address().port;
+      probe.close(() => resolve(port));
+    });
+  });
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -319,8 +379,106 @@ function startMockXui(inboundRows) {
     const meta = await request('GET', '/api/meta');
     check('meta is public and reports setup', meta.status === 200 && meta.json.data.setupRequired === true);
 
-    const missing = await request('GET', '/api/does-not-exist');
-    check('unknown api returns json 404', missing.status === 404 && missing.json.error.code === 'not_found');
+    // ═════════════════════════════════════════════════════════════════════ v2.1.0
+    // ------------------------------- v2.1.0: the male/female activation gate first
+    //
+    // «اگر کسی این پنل را نصب کرد و آدرس پنل را تو مرورگر زد، باید ازش رمز و کلید
+    // بخواد؛ کلید نر را خودش نشان بدهد و کلید مادگی را بگیرد.» A brand-new install
+    // therefore answers NOTHING but /meta, /health and /activation until a female
+    // key has been accepted — including the first-run setup form, which is exactly
+    // the hole this closes: an installer that created the owner first would have
+    // unlocked the panel without ever asking for a key.
+    //
+    // The accept path itself cannot be driven from here: the repository carries the
+    // male ids and one hash per partner, never a female string, and no test may
+    // invent one. What is proven below is the lock (every other call, both wrong-key
+    // refusals, the recorded attempts) and the release condition (an install that
+    // carries an activation record behaves like any other panel). The real key
+    // landing in that record is proven out of band, by `activation set <female>` and
+    // by the installer interview, against the shipped module.
+    {
+      const gate0 = await request('GET', '/api/activation');
+      check('v2.1.0 the gate endpoint is open on a locked install',
+        gate0.status === 200 && gate0.json.data.required === true && gate0.json.data.activated === false,
+        `status=${gate0.status}`);
+      const maleKey = String(gate0.json?.data?.maleKey || '');
+      // Read from the shipped source rather than requiring the module: config.js
+      // creates its data directories at require time, and a test parent process has
+      // no business making those in the installed tree.
+      let maleIds = [];
+      try {
+        const source = fs.readFileSync(path.join(ROOT, 'src/activation.js'), 'utf8');
+        maleIds = [...source.matchAll(/male: '(SCM-[A-Z0-9]{4}-[A-Z0-9]{4})'/g)].map((m) => m[1]);
+      } catch (_) { /* the shape check below still runs */ }
+      check('v2.1.0 the male key offered is one of the ids the panel ships',
+        /^SCM-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(maleKey) && maleIds.length === 5 && maleIds.includes(maleKey),
+        `male=${maleKey} shipped=${maleIds.length}`);
+      const gate1 = await request('GET', '/api/activation');
+      check('v2.1.0 the same install keeps offering the same male key',
+        String(gate1.json?.data?.maleKey || '') === maleKey, `${maleKey} vs ${gate1.json?.data?.maleKey}`);
+      const gateMeta = await request('GET', '/api/meta');
+      check('v2.1.0 the lock screen can still be drawn (/meta stays open)',
+        gateMeta.status === 200 && gateMeta.json.data.setupRequired === true, `status=${gateMeta.status}`);
+      check('v2.1.0 health stays open while locked', health.status === 200);
+
+      const lockedUnknown = await request('GET', '/api/does-not-exist');
+      check('v2.1.0 nothing behind the lock answers, not even a 404',
+        lockedUnknown.status === 423 && lockedUnknown.json.error.code === 'activation_required',
+        `status=${lockedUnknown.status} code=${lockedUnknown.json?.error?.code}`);
+      const lockedAdmin = await request('GET', '/api/admin/users');
+      check('v2.1.0 the admin API is behind the same lock',
+        lockedAdmin.status === 423 && lockedAdmin.json.error.details.maleKey === maleKey,
+        `status=${lockedAdmin.status}`);
+
+      const emptyKey = await request('POST', '/api/activation', { body: { key: '   ' } });
+      check('v2.1.0 a blank key is not tried',
+        emptyKey.status === 422 && emptyKey.json.error.code === 'key_required', `code=${emptyKey.json?.error?.code}`);
+      const wrongKey = await request('POST', '/api/activation', { body: { key: 'SCF-AAAA-BBBB-CCCC-DDDD' } });
+      check('v2.1.0 a wrong female key is refused by name',
+        wrongKey.status === 403 && wrongKey.json.error.code === 'activation_invalid',
+        `status=${wrongKey.status} code=${wrongKey.json?.error?.code}`);
+      const wrongAgain = await request('POST', '/api/activation', { body: { key: 'not-a-key-at-all' } });
+      check('v2.1.0 and refused again, with no side effect',
+        wrongAgain.status === 403, `status=${wrongAgain.status}`);
+
+      const GateDatabase = require('better-sqlite3');
+      const gateDb = new GateDatabase(path.join(DATA_DIR, 'panel.db'));
+      const gateRow = gateDb.prepare('SELECT male_key, activated_at, attempts, source FROM activation WHERE id = 1').get() || {};
+      check('v2.1.0 both wrong tries are counted against the install',
+        Number(gateRow.attempts || 0) === 2 && Number(gateRow.activated_at || 0) === 0,
+        `attempts=${gateRow.attempts} activated_at=${gateRow.activated_at}`);
+      check('v2.1.0 the male key a stranger was shown is the one stored',
+        String(gateRow.male_key || '') === maleKey, `db=${gateRow.male_key}`);
+      const failedAudits = gateDb.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'activation.failed'").get().c;
+      check('v2.1.0 every wrong key leaves an audit line for the owner',
+        Number(failedAudits) >= 2, `rows=${failedAudits}`);
+
+      const lockedSetup = await request('POST', '/api/setup', {
+        body: { username: OWNER, password: OWNER_PASS, name: 'Self Test' },
+      });
+      check('v2.1.0 the first-run setup is refused until a key is accepted',
+        lockedSetup.status === 423 && lockedSetup.json.error.code === 'activation_required',
+        `status=${lockedSetup.status}`);
+      const stillAccounts = gateDb.prepare('SELECT COUNT(*) AS c FROM users').get().c;
+      check('v2.1.0 and it really did not create the owner', Number(stillAccounts) === 0, `users=${stillAccounts}`);
+      gateDb.close();
+
+      // The release condition: this is the row activation.activate() writes when a
+      // matching female key arrives (see src/activation.js, same 5 columns).
+      const unlockDb = new GateDatabase(path.join(DATA_DIR, 'panel.db'));
+      unlockDb.prepare(
+        `INSERT INTO activation (id, male_key, fingerprint, activated_at, source) VALUES (1, ?, 'selftest', ?, 'test')
+         ON CONFLICT(id) DO UPDATE SET activated_at = excluded.activated_at, source = excluded.source`
+      ).run(maleKey, Date.now());
+      unlockDb.close();
+
+      const gateAfter = await request('GET', '/api/activation');
+      check('v2.1.0 an install carrying an activation record is unlocked',
+        gateAfter.status === 200 && gateAfter.json.data.activated === true && gateAfter.json.data.required === false,
+        `activated=${gateAfter.json?.data?.activated}`);
+      const unknown = await request('GET', '/api/does-not-exist');
+      check('unknown api returns json 404', unknown.status === 404 && unknown.json.error.code === 'not_found');
+    }
 
     // ------------------------------------------------------------------ setup
     const setup = await request('POST', '/api/setup', {
@@ -690,6 +848,31 @@ function startMockXui(inboundRows) {
     // --------------------------------------------------------------- inbounds
     // Subscription order (x-ui subSortIndex) drives the admin list order. The rows
     // belong to the primary server, which now exists because of the x-ui save above.
+    //
+    // The monitor's own cycle rewrites sub_sort_index from the node (the double
+    // answers 1..4 in list order), so the four numbers seeded below only survive if
+    // no cycle lands between the write and the read. Since 2.1.0 the listener bind
+    // is awaited (src/net.js) and monitor.start() happens right after it, so the
+    // boot cycle can now be running while these lines execute. Park the timer, then
+    // wait for the startup cycle to be FINISHED — runCycle stamps lastRunAt only
+    // after syncInbounds returns — and only then seed.
+    const monitorWas31 = Number((await request('GET', '/api/admin/settings', { cookies }))
+      .json?.data?.settings?.monitor?.intervalSec || 120);
+    const park31 = await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } });
+    let monitorIdle31 = {};
+    const waitUntil31 = Date.now() + 30000;
+    for (;;) {
+      const serversSeen31 = await request('GET', '/api/admin/servers', { cookies });
+      monitorIdle31 = serversSeen31.json?.data?.monitor || {};
+      const doneStartup31 = Number(monitorIdle31.lastRunAt) > Number(monitorIdle31.startedAt) + 4000;
+      if (doneStartup31 && monitorIdle31.busy !== true) break;
+      if (Date.now() > waitUntil31) break;
+      await sleep(200);
+    }
+    check('the inbound order fixture waits for the boot cycle the panel runs on its own',
+      park31.status === 200 && Number(monitorIdle31.lastRunAt) > Number(monitorIdle31.startedAt) + 4000
+        && monitorIdle31.busy !== true,
+      `park=${park31.status} lastRun=${monitorIdle31.lastRunAt} started=${monitorIdle31.startedAt} busy=${monitorIdle31.busy}`);
     const Database = require('better-sqlite3');
     const panelDb = new Database(path.join(DATA_DIR, 'panel.db'));
     try {
@@ -718,6 +901,9 @@ function startMockXui(inboundRows) {
     );
     const firstRow = (ordered.json?.data?.rows || [])[0] || {};
     check('inbound payload exposes subSortIndex', typeof firstRow.subSortIndex === 'number');
+    const unpark31 = await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: monitorWas31 } });
+    check('the monitor timer is handed back at the interval it was parked from',
+      unpark31.status === 200, `was=${monitorWas31} status=${unpark31.status}`);
 
     const maxQuote = await request('POST', '/api/admin/pricing/quote', {
       cookies, csrf,
@@ -4845,8 +5031,11 @@ function startMockXui(inboundRows) {
           `tables=${tables.length} planCols=${planCols.length}`);
         // v1.5.8: plan_purchases is the twentieth table, and plans grew the three
         // shelf columns (category / per_user_limit / allowed_users).
+        // v2.1.0 adds two more: config_trash (the admin Trash) and activation
+        // (the male/female key gate), so a fresh install now carries 22 tables.
         check('v1.5.8 adds the take-ledger beside the nineteen tables of 1.5.4',
-          tables.length === 20 && tables.includes('plan_purchases')
+          tables.length === 22 && tables.includes('plan_purchases') && tables.includes('config_trash')
+            && tables.includes('activation')
             && planCols.includes('category') && planCols.includes('per_user_limit') && planCols.includes('allowed_users'),
           tables.join(','));
 
@@ -5222,7 +5411,7 @@ function startMockXui(inboundRows) {
             && onNode25(pkgEmail25) === LINE25('برچسب نماینده'),
           `status=${newOwnerRename25.status} node="${onNode25(pkgEmail25)}"`);
         const wireVersion25 = (await request('GET', '/api/health')).json?.version;
-        check('this build is v2.0.0 on the wire too', wireVersion25 === '2.0.0', `version=${wireVersion25}`);
+        check('this build is v2.1.0 on the wire too', wireVersion25 === '2.1.0', `version=${wireVersion25}`);
       } finally {
         if (lifted25) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit25 } });
         tdb.close();
@@ -6056,8 +6245,9 @@ function startMockXui(inboundRows) {
         const settingsCount20 = Number(bdb.prepare('SELECT COUNT(*) AS c FROM settings').get().c);
         const setRead20 = await request('GET', '/api/admin/settings', { cookies });
         const cleanupCfg20 = setRead20.json?.data?.settings?.cleanup || {};
+        // v2.1.0: the twelfth row is `banner` (the owner's notice bar).
         check('the fresh schema carries the sweep: configs.depleted_at and the eleventh settings row, born off',
-          cols20.includes('depleted_at') && settingsCount20 === 11
+          cols20.includes('depleted_at') && settingsCount20 === 12
             && cleanupCfg20.enabled === false && Number(cleanupCfg20.graceDays) === 7,
           `depleted_at=${cols20.includes('depleted_at')} settings=${settingsCount20} enabled=${cleanupCfg20.enabled}`);
         const deadSwitch20 = await cleanupPatch({ enabled: true, expired: false, depleted: false });
@@ -6240,6 +6430,603 @@ function startMockXui(inboundRows) {
         if (lifted20) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit20 } });
         for (const email of seedEmails20) mockXui.clients.delete(email);
         bdb.close();
+      }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════ v2.1.0
+    //
+    // Four new areas, one block:
+    //   ۱) the live listener — the panel port, the public address and the two
+    //      certificate paths are not stored text any more; they ARE the socket the
+    //      panel answers on, so every claim here is proved by knocking on the port.
+    //   ۲) the admin Trash — a deleted package leaves a snapshot with the email,
+    //      uuid and subscription token it had, and «همون اشتراک قبلیشو میخوام» has
+    //      to come back with the volume and the days that were still unused.
+    //   ۳) the owner's banner — green or red, for all resellers or for the ones he
+    //      picked, inside an optional window.
+    //   ۴) the shape a fresh 2.1.0 install boots with.
+    //
+    // Anything where the port is in play goes through `onPort()`, never through
+    // `request()`: Node keeps sockets alive per host, so a pooled agent could
+    // answer from a connection to a port the panel already let go — and that is
+    // exactly the thing these checks must never fake.
+    {
+      const tdb = new Database(path.join(DATA_DIR, 'panel.db'));
+      const P21 = 'Trash-Pass-12345';
+      const DAY21 = 86400000;
+      const GB21 = 1024 ** 3;
+      const NOW21 = Date.now();
+      const code21 = (res) => String(res.json?.error?.code || '');
+      const netOf21 = (res) => res.json?.data?.net || {};
+      const settingsRead21 = async () => (await request('GET', '/api/admin/settings', { cookies })).json?.data?.settings || {};
+      const generalRead21 = async () => (await settingsRead21()).general || {};
+      const patchGeneral21 = (body, { port, tls = false } = {}) => onPort(Number(port || PORT), 'PATCH',
+        '/api/admin/settings/general', { body, cookies, csrf, tls });
+      const patchBanner21 = (body) => request('PATCH', '/api/admin/settings/banner', { cookies, csrf, body });
+      const health21 = (port, tls = false) => onPort(port, 'GET', '/api/health', { tls });
+      const trashList21 = (params) => request('GET', `/api/admin/trash?${params}`, { cookies });
+      const trashRow21 = (id) => tdb.prepare('SELECT * FROM config_trash WHERE id = ?').get(Number(id)) || {};
+      const newestTrash21 = (email) => tdb.prepare('SELECT * FROM config_trash WHERE email = ? ORDER BY id DESC LIMIT 1').get(String(email)) || {};
+      const rowsOf21 = (email) => tdb.prepare('SELECT * FROM configs WHERE email = ? ORDER BY id').all(String(email));
+      const alive21 = (email) => rowsOf21(email).filter((row) => !row.deleted_at);
+      const buriedOf21 = (email) => rowsOf21(email).filter((row) => Number(row.deleted_at) > 0);
+      const rowIdOf21 = (email, inboundId) => Number(tdb.prepare(
+        'SELECT id FROM configs WHERE email = ? AND inbound_id = ? AND deleted_at = 0'
+      ).get(String(email), Number(inboundId))?.id || 0);
+      const build21 = async (userId, name, { gb = 5, days = 30 } = {}) => {
+        const res = await request('POST', '/api/admin/configs', {
+          cookies, csrf,
+          body: { userId, inboundIds: [901, 902], gb, days, label: name, customerName: name },
+        });
+        const made = res.json?.data?.configs || [];
+        return {
+          status: res.status,
+          id: Number(made[0]?.id || 0),
+          email: String(made[0]?.email || ''),
+          uuid: String(made[0]?.uuid || ''),
+          ids: made.map((row) => Number(row.id)),
+        };
+      };
+      const deleteRow21 = (id) => request('DELETE', `/api/admin/configs/${id}`, { cookies, csrf });
+      const deletePackage21 = (id) => request('DELETE', `/api/admin/configs/${id}/package`, { cookies, csrf });
+      const restore21 = (id, body = {}) => request('POST', `/api/admin/trash/${id}/restore`, { cookies, csrf, body });
+      const setUsage21 = (email, up, down) => tdb.prepare('UPDATE configs SET up_bytes = ?, down_bytes = ? WHERE email = ?')
+        .run(Number(up), Number(down), String(email));
+      const setExpiry21 = (email, ms) => tdb.prepare('UPDATE configs SET expiry_at = ? WHERE email = ?').run(Number(ms), String(email));
+      const mkUser21 = async (username, extra = {}) => {
+        const created = await request('POST', '/api/admin/users', {
+          cookies, csrf, body: { username, password: P21, role: 'reseller', balance: 4000000, max_configs: 100, ...extra },
+        });
+        return { id: Number(created.json?.data?.user?.id || 0), status: created.status };
+      };
+      const login21 = async (username) => {
+        const res = await request('POST', '/api/auth/login', { body: { username, password: P21 } });
+        return { status: res.status, cookies: cookiesFrom(res.headers), csrf: res.json?.data?.csrf };
+      };
+      const seedEmails21 = [];
+      const seed21 = (email, opts = {}) => {
+        mockXui.clients.set(email, {
+          email, id: `uuid-${email}`, subId: `sub-${email}`, security: 'auto', comment: '',
+          totalGB: opts.totalGB ?? 2 * GB21, expiryTime: opts.expiryTime ?? NOW21 + 30 * DAY21,
+          enable: true, up: 0, down: 0, inboundIds: opts.inboundIds || [901],
+        });
+        seedEmails21.push(email);
+        return email;
+      };
+      const onPosix21 = process.platform !== 'win32';
+      const certDir21 = fs.mkdtempSync(path.join(os.tmpdir(), 'sc210-cert-'));
+      const certPair21 = () => {
+        const cert = path.join(certDir21, 'sc210.crt');
+        const key = path.join(certDir21, 'sc210.key');
+        const made = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
+          '-out', cert, '-days', '2', '-subj', 'CN=127.0.0.1'], { encoding: 'utf8' });
+        if (made.status !== 0 || !fs.existsSync(cert) || !fs.existsSync(key)) return null;
+        return { cert, key };
+      };
+      let was21 = null;
+      let bannerWas21 = null;
+      let limit21 = 10;
+      let lifted21 = false;
+      let busy21 = null;
+      let movedTo21 = 0;
+      try {
+        const secRead21 = await request('GET', '/api/admin/settings', { cookies });
+        limit21 = Number(secRead21.json?.data?.settings?.security?.loginRateLimit || 10);
+        lifted21 = (await request('PATCH', '/api/admin/settings/security', {
+          cookies, csrf, body: { loginRateLimit: 100 },
+        })).status === 200;
+
+        // ───────────────────────── ۱) «تغییر پورت پنل» — the settings ARE the socket
+        was21 = await generalRead21();
+        const sysHome21 = netOf21(await request('GET', '/api/admin/system', { cookies }));
+        check('the system read knows the socket the panel is really on',
+          sysHome21.listening === true && Number(sysHome21.port) === PORT && sysHome21.tls === false
+            && Number(sysHome21.desiredPort) === Number(was21.panelPort || PORT),
+          `port=${sysHome21.port} desired=${sysHome21.desiredPort}`);
+
+        const lowPort21 = await patchGeneral21({ panelPort: 80 });
+        const wordPort21 = await patchGeneral21({ panelPort: 'پنل' });
+        check('a port below 1024 and a port that is not a number are both refused',
+          lowPort21.status === 422 && code21(lowPort21) === 'invalid_panel_port'
+            && wordPort21.status === 422 && code21(wordPort21) === 'invalid_panel_port',
+          `low=${code21(lowPort21)} word=${code21(wordPort21)}`);
+        const genAfterBad21 = await generalRead21();
+        check('a refused port writes nothing — the stored number is still the live one',
+          Number(genAfterBad21.panelPort) === Number(was21.panelPort),
+          `stored=${genAfterBad21.panelPort} was=${was21.panelPort}`);
+
+        busy21 = http.createServer();
+        await new Promise((resolve) => busy21.listen(0, '127.0.0.1', resolve));
+        const busyPort21 = busy21.address().port;
+        const busyTry21 = await patchGeneral21({ panelPort: busyPort21 });
+        const netBusy21 = netOf21(busyTry21);
+        check('a port somebody else holds is TRIED before anything is written, then refused',
+          busyTry21.status === 422 && code21(busyTry21) === 'panel_port_busy' && !netBusy21.port,
+          `code=${code21(busyTry21)} body=${JSON.stringify(netBusy21)}`);
+        const busyHealth21 = await health21(PORT);
+        const genAfterBusy21 = await generalRead21();
+        check('the refusal costs nothing: the panel answers and the number was not stored',
+          busyHealth21.status === 200 && Number(genAfterBusy21.panelPort) === Number(was21.panelPort),
+          `health=${busyHealth21.status} stored=${genAfterBusy21.panelPort}`);
+        await new Promise((resolve) => busy21.close(resolve));
+        busy21 = null;
+
+        const movePort21 = await freePort();
+        const moveOut21 = await patchGeneral21({ panelPort: movePort21 });
+        const netMove21 = netOf21(moveOut21);
+        movedTo21 = movePort21;
+        check('a free port is really taken over — the answer comes back with the new number',
+          moveOut21.status === 200 && netMove21.changed === true && Number(netMove21.port) === movePort21,
+          `status=${moveOut21.status} changed=${netMove21.changed} port=${netMove21.port}`);
+        const newHealth21 = await health21(movePort21);
+        const oldHealth21 = await health21(PORT);
+        check('the panel answers on the new port and the old one is empty',
+          newHealth21.status === 200 && oldHealth21.status === 0 && /ECONNREFUSED/.test(String(oldHealth21.error)),
+          `new=${newHealth21.status} old=${oldHealth21.error}`);
+        const meOnNew21 = await onPort(movePort21, 'GET', '/api/auth/me', { cookies });
+        const sysOnNew21 = netOf21(await onPort(movePort21, 'GET', '/api/admin/system', { cookies }));
+        check('the session that was logged in before the move works after it, on the new port',
+          meOnNew21.status === 200 && Number(sysOnNew21.port) === movePort21
+            && Number(sysOnNew21.desiredPort) === movePort21,
+          `me=${meOnNew21.status} reported=${sysOnNew21.port}/${sysOnNew21.desiredPort}`);
+        const moveBack21 = await patchGeneral21({ panelPort: PORT }, { port: movePort21 });
+        const netBack21 = netOf21(moveBack21);
+        movedTo21 = 0;
+        check('moving back is asked through the port the panel is standing on right now',
+          moveBack21.status === 200 && netBack21.changed === true && Number(netBack21.port) === PORT,
+          `status=${moveBack21.status} port=${netBack21.port}`);
+        const homeHealth21 = await health21(PORT);
+        const goneHealth21 = await health21(movePort21);
+        check('and both sockets are proved again after the move back',
+          homeHealth21.status === 200 && goneHealth21.status === 0,
+          `home=${homeHealth21.status} moved=${goneHealth21.error}`);
+
+        const badUrl21 = await patchGeneral21({ publicUrl: 'sulduz.example.test' });
+        check('an address without http(s):// is refused before it can break a subscribe link',
+          badUrl21.status === 422 && code21(badUrl21) === 'invalid_public_url', `code=${code21(badUrl21)}`);
+        const goodUrl21 = await patchGeneral21({ publicUrl: 'https://panel.example.test/' });
+        const genUrl21 = await generalRead21();
+        check('a full address is stored without its trailing slash and is live at once',
+          goodUrl21.status === 200 && genUrl21.publicUrl === 'https://panel.example.test'
+            && netOf21(goodUrl21).publicUrl === 'https://panel.example.test',
+          `stored=${genUrl21.publicUrl}`);
+
+        const relCert21 = await patchGeneral21({ sslCertPath: 'etc/ssl/sc210.crt' });
+        check('a certificate path has to be absolute — a relative one would be a guess',
+          relCert21.status === 422 && code21(relCert21) === 'invalid_cert_path', `code=${code21(relCert21)}`);
+        const halfPair21 = await patchGeneral21({ sslCertPath: '/etc/ssl/sc210-full.crt' });
+        check('one box of the pair is refused: half a key pair silently means no HTTPS',
+          halfPair21.status === 422 && code21(halfPair21) === 'cert_pair_incomplete', `code=${code21(halfPair21)}`);
+        const absent21 = await patchGeneral21({ sslCertPath: path.join(certDir21, 'sc210-absent.crt'), sslKeyPath: path.join(certDir21, 'sc210-absent.key') });
+        const netAbsent21 = netOf21(absent21);
+        const absentHealth21 = await health21(PORT);
+        check('two paths to files that are not there save, name the file, and do not touch the socket',
+          absent21.status === 200 && netAbsent21.changed === false && netAbsent21.tls === false
+            && String(netAbsent21.tlsError).includes('sc210-absent.crt') && absentHealth21.status === 200,
+          `changed=${netAbsent21.changed} err=${String(netAbsent21.tlsError).slice(0, 60)}`);
+        await patchGeneral21({ sslCertPath: '', sslKeyPath: '' });
+
+        // The same-port HTTPS switch is the regression this version was written to
+        // close: one process cannot hold one port twice, so binding TLS over the
+        // port the panel is already sitting on used to fail with EADDRINUSE while
+        // the form said it was on.
+        const pair21 = onPosix21 ? certPair21() : null;
+        if (pair21) {
+          const tlsOn21 = await patchGeneral21({ sslCertPath: pair21.cert, sslKeyPath: pair21.key });
+          const netTls21 = netOf21(tlsOn21);
+          check('a real key pair switches the SAME port to HTTPS',
+            tlsOn21.status === 200 && netTls21.changed === true && netTls21.tls === true
+              && netTls21.scheme === 'https' && Number(netTls21.port) === PORT,
+            `changed=${netTls21.changed} tls=${netTls21.tls} scheme=${netTls21.scheme} err=${String(netTls21.tlsError).slice(0, 60)}`);
+          const httpsHealth21 = await health21(PORT, true);
+          const httpsMe21 = await onPort(PORT, 'GET', '/api/auth/me', { cookies, tls: true });
+          const plainNow21 = await health21(PORT, false);
+          check('the panel answers over TLS — session included — and no longer in plain text',
+            httpsHealth21.status === 200 && httpsMe21.status === 200 && plainNow21.status !== 200,
+            `https=${httpsHealth21.status} me=${httpsMe21.status} plain=${plainNow21.status}/${plainNow21.error}`);
+          const tlsOff21 = await patchGeneral21({ sslCertPath: '', sslKeyPath: '' }, { tls: true });
+          const netOff21 = netOf21(tlsOff21);
+          const plainBack21 = await health21(PORT);
+          check('clearing both boxes moves the same port back to HTTP and the panel is plain again',
+            tlsOff21.status === 200 && netOff21.changed === true && netOff21.tls === false
+              && netOff21.scheme === 'http' && plainBack21.status === 200,
+            `changed=${netOff21.changed} scheme=${netOff21.scheme} health=${plainBack21.status}`);
+        } else {
+          check('the TLS switch needs openssl on a posix box (skipped here)', true, `platform=${process.platform}`);
+        }
+
+        // ─────────────────────────────────────── ۲) the Trash and the exact rebuild
+        const shop21 = await mkUser21('sc210shop', { telegram_id: '7021070210' });
+        const other21 = await mkUser21('sc210other');
+        const gone21 = await mkUser21('sc210gone');
+        check('the three representatives the Trash tests need are alive',
+          shop21.status === 201 && other21.status === 201 && gone21.status === 201,
+          `shop=${shop21.id} other=${other21.id} gone=${gone21.id}`);
+
+        const peel21 = await build21(shop21.id, 'sc210peel');
+        const peelClient21 = mockXui.clients.get(peel21.email) || {};
+        check('the fixture package is one client standing on two channels',
+          peel21.status === 201 && peel21.ids.length === 2 && alive21(peel21.email).length === 2
+            && (peelClient21.inboundIds || []).join(',') === '901,902',
+          `rows=${peel21.ids.length} node=${peelClient21.inboundIds}`);
+        const peelRow90221 = rowIdOf21(peel21.email, 902);
+        const peelDel21 = await deleteRow21(peelRow90221);
+        const peelSnaps21 = Number(tdb.prepare('SELECT COUNT(*) AS c FROM config_trash WHERE email = ?').get(peel21.email).c);
+        const peelNode21 = mockXui.clients.get(peel21.email) || {};
+        check('taking one channel off a live package is not a deletion — nothing enters the Trash',
+          peelDel21.status === 200 && peelSnaps21 === 0 && alive21(peel21.email).length === 1
+            && (peelNode21.inboundIds || []).join(',') === '901',
+          `snaps=${peelSnaps21} node=${peelNode21.inboundIds}`);
+        const peelRow90121 = rowIdOf21(peel21.email, 901);
+        const lastDel21 = await deleteRow21(peelRow90121);
+        const peelTr21 = newestTrash21(peel21.email);
+        check('deleting the LAST channel leaves exactly one snapshot, with the identity inside',
+          lastDel21.status === 200 && Number(peelTr21.id) > 0 && peelTr21.mode === 'soft'
+            && peelTr21.reason === 'channel_last' && String(peelTr21.email) === peel21.email
+            && String(peelTr21.uuid).length > 0 && Number(peelTr21.total_bytes) === 5 * GB21,
+          `mode=${peelTr21.mode} reason=${peelTr21.reason} uuid=${String(peelTr21.uuid).slice(0, 8)}`);
+        const peelRestore21 = await restore21(Number(peelTr21.id), { userId: shop21.id });
+        const peelRevived21 = peelRestore21.json?.data?.revived || [];
+        check('the restore brings the buried row ITSELF back — same id, not a copy',
+          peelRestore21.status === 200 && peelRevived21.length === 1 && Number(peelRevived21[0]) === peelRow90121
+            && alive21(peel21.email).length === 1,
+          `revived=${peelRevived21} want=${peelRow90121} alive=${alive21(peel21.email).length}`);
+        check('the channel that was set aside weeks ago stays set aside',
+          buriedOf21(peel21.email).some((row) => Number(row.inbound_id) === 902 && Number(row.deleted_at) > 0),
+          `buried=${buriedOf21(peel21.email).map((row) => row.inbound_id)}`);
+        const peelNodeBack21 = mockXui.clients.get(peel21.email) || {};
+        check('and the node has him again on the one channel the package still has',
+          (peelNodeBack21.inboundIds || []).join(',') === '901' && String(peelNodeBack21.id) === String(peelTr21.uuid),
+          `node=${peelNodeBack21.inboundIds} uuid=${String(peelNodeBack21.id).slice(0, 8)}`);
+        check('the snapshot is stamped restored and cannot be restored a second time',
+          Number(trashRow21(Number(peelTr21.id)).restored_at) > 0
+            && (await restore21(Number(peelTr21.id), { userId: shop21.id })).status === 409);
+        const twice21 = await restore21(Number(peelTr21.id), { userId: shop21.id });
+        check('…and the refusal is named, not a database error',
+          code21(twice21) === 'already_restored', `code=${code21(twice21)}`);
+
+        const pkg21 = await build21(shop21.id, 'sc210pkg');
+        tdb.prepare('UPDATE configs SET customer_name = ? WHERE email = ?').run('سارا ۲۱۰', pkg21.email);
+        setUsage21(pkg21.email, 1 * GB21, 1 * GB21);
+        setExpiry21(pkg21.email, NOW21 + 10 * DAY21);
+        const addCallsBefore21 = mockXui.calls.filter((call) => call.route === '/clients/add').length;
+        const pkgDel21 = await deletePackage21(pkg21.id);
+        const pkgTr21 = newestTrash21(pkg21.email);
+        const pkgMembers21 = JSON.parse(String(pkgTr21.rows_json || '[]'));
+        check('deleting the whole customer is ONE snapshot carrying BOTH channels',
+          pkgDel21.status === 200 && Number(pkgTr21.id) > 0 && pkgMembers21.length === 2
+            && Number(tdb.prepare('SELECT COUNT(*) AS c FROM config_trash WHERE email = ?').get(pkg21.email).c) === 1,
+          `members=${pkgMembers21.length}`);
+        check('and it keeps what was still unused: ۲ گیگ رفته، ۳ گیگ مانده، ۱۰ روز',
+          Number(pkgTr21.total_bytes) === 5 * GB21 && Number(pkgTr21.used_bytes) === 2 * GB21
+            && Number(pkgTr21.left_bytes) === 3 * GB21 && Number(pkgTr21.left_days) === 10
+            && String(pkgTr21.customer_name) === 'سارا ۲۱۰',
+          `used=${pkgTr21.used_bytes} left=${pkgTr21.left_bytes} days=${pkgTr21.left_days} who=${pkgTr21.customer_name}`);
+        const listQ21 = await trashList21('q=7021070210&includeRestored=1&pageSize=200');
+        const qRows21 = listQ21.json?.data?.rows || [];
+        check('the search reads the client email, so a customer is found by his node name',
+          listQ21.status === 200 && qRows21.length >= 2 && qRows21.every((row) => String(row.email).startsWith('7021070210')),
+          `rows=${qRows21.length}`);
+        const listLabel21 = await trashList21('q=sc210pkg&pageSize=200');
+        check('…and by the label or the customer name he was typed under',
+          (listLabel21.json?.data?.rows || []).some((row) => row.label === 'sc210pkg'),
+          `rows=${(listLabel21.json?.data?.rows || []).length}`);
+        const hardBefore21 = Number(tdb.prepare("SELECT COUNT(*) AS c FROM config_trash WHERE mode = 'hard'").get().c);
+        const listHard21 = await trashList21('mode=hard&pageSize=200');
+        check('the mode filter counts what the database really holds',
+          Number(listHard21.json?.data?.total) === hardBefore21
+            && (listHard21.json?.data?.rows || []).every((row) => row.mode === 'hard'),
+          `total=${listHard21.json?.data?.total} db=${hardBefore21}`);
+        const listShop21 = await trashList21(`userId=${shop21.id}&includeRestored=1&pageSize=200`);
+        check('one representative cannot read the Trash of another',
+          (listShop21.json?.data?.rows || []).every((row) => Number(row.userId) === shop21.id)
+            && (listShop21.json?.data?.rows || []).length >= 2,
+          `rows=${(listShop21.json?.data?.rows || []).length}`);
+        const detail21 = await request('GET', `/api/admin/trash/${pkgTr21.id}`, { cookies });
+        const det21 = detail21.json?.data || {};
+        check('the dialog before the rebuild shows both channels, that they are usable, and ۳ گیگ left',
+          detail21.status === 200 && (det21.inbounds || []).length === 2 && det21.usable === true
+            && Number(det21.entry?.leftGb) === 3 && (det21.rows || []).length === 2,
+          `inbounds=${(det21.inbounds || []).length} leftGb=${det21.entry?.leftGb} usable=${det21.usable}`);
+
+        // A live row with the same email means the customer never really went away:
+        // rebuilding would hand one client two owners. The row is put back by hand
+        // here — that state is a fixture, and the guard is the thing under test.
+        const healRow21 = Number((pkgMembers21.find((item) => Number(item.inbound_id) === 901) || {}).id || 0);
+        if (healRow21) tdb.prepare('UPDATE configs SET deleted_at = 0, enabled = 1 WHERE id = ?').run(healRow21);
+        const clashRestore21 = await restore21(Number(pkgTr21.id), { userId: shop21.id });
+        const addCallsAfterClash21 = mockXui.calls.filter((call) => call.route === '/clients/add').length;
+        check('one row of the same customer already in the panel stops the restore — before x-ui is touched',
+          clashRestore21.status === 409 && code21(clashRestore21) === 'client_exists'
+            && addCallsAfterClash21 === addCallsBefore21,
+          `status=${clashRestore21.status} code=${code21(clashRestore21)} adds=${addCallsAfterClash21 - addCallsBefore21}`);
+        if (healRow21) tdb.prepare('UPDATE configs SET deleted_at = ?, enabled = 0 WHERE id = ?').run(Date.now(), healRow21);
+
+        tdb.prepare('UPDATE inbounds SET enabled = 0 WHERE id IN (901, 902)').run();
+        const disRestore21 = await restore21(Number(pkgTr21.id), { userId: shop21.id });
+        check('a channel that has been switched off is refused by name',
+          disRestore21.status === 422 && code21(disRestore21) === 'inbound_disabled',
+          `status=${disRestore21.status} code=${code21(disRestore21)}`);
+        tdb.prepare('UPDATE inbounds SET enabled = 1 WHERE id IN (901, 902)').run();
+        const noneInbound21 = await restore21(Number(pkgTr21.id), { userId: shop21.id, inboundIds: [99999] });
+        check('channel ids that no longer exist leave nothing to rebuild on',
+          noneInbound21.status === 422 && code21(noneInbound21) === 'inbound_required',
+          `code=${code21(noneInbound21)}`);
+
+        const realRestore21 = await restore21(Number(pkgTr21.id), { userId: shop21.id });
+        const rr21 = realRestore21.json?.data || {};
+        const rrRows21 = alive21(pkg21.email);
+        check('the customer comes back on BOTH channels, as the very rows he had',
+          realRestore21.status === 200 && rrRows21.length === 2 && (rr21.ids || []).length === 2
+            && (rr21.revived || []).length === 2
+            && rrRows21.map((row) => Number(row.id)).sort().join(',') === pkg21.ids.slice().sort().join(','),
+          `alive=${rrRows21.length} revived=${(rr21.revived || []).length} ids=${(rr21.ids || []).join(',')}`);
+        check('same uuid, same subscription token — his own app keeps working, no new link',
+          rrRows21.every((row) => String(row.uuid) === String(pkgTr21.uuid))
+            && rrRows21.every((row) => String(row.sub_id) === String(pkgTr21.sub_id))
+            && rrRows21.every((row) => String(row.xui_sub_id) === String((pkgMembers21[0] || {}).xui_sub_id)),
+          `uuid=${String(rr21.uuid).slice(0, 8)} sub=${String((pkgMembers21[0] || {}).xui_sub_id).slice(0, 8)}`);
+        const rrNode21 = mockXui.clients.get(pkg21.email) || {};
+        check('and the node has him on both channels again',
+          (rrNode21.inboundIds || []).map(Number).sort((a, b) => a - b).join(',') === '901,902'
+            && String(rrNode21.id) === String(pkgTr21.uuid),
+          `node=${rrNode21.inboundIds} uuid=${String(rrNode21.id).slice(0, 8)}`);
+        check('with the plain rule he comes back with what was LEFT — ۳ گیگ, not the old ۵',
+          rrRows21.every((row) => Number(row.total_bytes) === 3 * GB21),
+          `total=${rrRows21.map((row) => row.total_bytes / GB21)}`);
+        check('and the clock runs from the days that were unused, not from the old date',
+          rrRows21.every((row) => Math.abs(Number(row.expiry_at) - (Date.now() + 10 * DAY21)) < DAY21),
+          `left=${rrRows21.map((row) => Math.round((row.expiry_at - NOW21) / DAY21))}`);
+        check('a rebuilt client starts with an EMPTY traffic counter — five gig is really five gig',
+          rrRows21.every((row) => Number(row.up_bytes) === 0 && Number(row.down_bytes) === 0
+            && Number(row.depleted_at) === 0),
+          `used=${rrRows21.map((row) => (row.up_bytes + row.down_bytes) / GB21)}`);
+        const listNoRestored21 = await trashList21('q=7021070210&pageSize=200');
+        const listAllBack21 = await trashList21('q=7021070210&includeRestored=1&pageSize=200');
+        const dbAll21 = Number(tdb.prepare("SELECT COUNT(*) AS c FROM config_trash WHERE lower(email) LIKE '%7021070210%'").get().c);
+        check('a rebuilt entry drops out of the default list and is back when asked for',
+          Number(listAllBack21.json?.data?.total) === dbAll21
+            && (listAllBack21.json?.data?.rows || []).some((row) => row.restoredAt > 0)
+            && !(listNoRestored21.json?.data?.rows || []).some((row) => row.restoredAt > 0),
+          `all=${listAllBack21.json?.data?.total} db=${dbAll21} kept=${(listNoRestored21.json?.data?.rows || []).length}`);
+        const counts21 = listAllBack21.json?.data?.counts || {};
+        const dbCounts21 = tdb.prepare('SELECT SUM(CASE WHEN restored_at = 0 THEN 1 ELSE 0 END) AS kept, SUM(CASE WHEN restored_at > 0 THEN 1 ELSE 0 END) AS back FROM config_trash').get();
+        check('the kept/back counters are the whole table, not the filtered page',
+          Number(counts21.kept) === Number(dbCounts21.kept || 0) && Number(counts21.back) === Number(dbCounts21.back || 0),
+          `kept=${counts21.kept}/${dbCounts21.kept} back=${counts21.back}/${dbCounts21.back}`);
+
+        // «همون دوره و حجم قبلی» only means something when what was LEFT differs
+        // from what the package WAS — so this is a fresh customer with real
+        // traffic (۵ گیگ sold, ۲ رفته, ۸ روز مانده) rather than the package above,
+        // whose second snapshot had just been rebuilt from its own leftovers.
+        const keepPkg21 = await build21(shop21.id, 'sc210keep');
+        setUsage21(keepPkg21.email, 1 * GB21, 1 * GB21);
+        const keepExpiry21 = NOW21 + 8 * DAY21;
+        setExpiry21(keepPkg21.email, keepExpiry21);
+        const keepDel21 = await deletePackage21(keepPkg21.id);
+        const keepTr21 = newestTrash21(keepPkg21.email);
+        check('the snapshot holds the two different numbers: ۵ گیگ sold, ۳ گیگ and ۸ روز left',
+          keepDel21.status === 200 && Number(keepTr21.total_bytes) === 5 * GB21
+            && Number(keepTr21.used_bytes) === 2 * GB21 && Number(keepTr21.left_bytes) === 3 * GB21
+            && Number(keepTr21.left_days) === 8 && Number(keepTr21.expiry_at) === keepExpiry21,
+          `total=${keepTr21.total_bytes / GB21} used=${keepTr21.used_bytes / GB21} left=${keepTr21.left_bytes / GB21} days=${keepTr21.left_days}`);
+        const keepRestore21 = await restore21(Number(keepTr21.id), { userId: shop21.id, keepUsageWindow: true });
+        const keepRows21 = alive21(keepPkg21.email);
+        check('«همون دوره و حجم قبلی» gives the ORIGINAL date back and the FULL volume',
+          keepRestore21.status === 200 && keepRows21.length === 2
+            && keepRows21.every((row) => Number(row.total_bytes) === 5 * GB21)
+            && keepRows21.every((row) => Number(row.expiry_at) === keepExpiry21),
+          `total=${keepRows21.map((row) => row.total_bytes / GB21)} expiry=${keepRows21.map((row) => row.expiry_at === keepExpiry21)}`);
+        check('but the counters still come back EMPTY — five gig on a fresh client is five gig unused',
+          keepRows21.every((row) => Number(row.up_bytes) === 0 && Number(row.down_bytes) === 0
+            && Number(row.depleted_at) === 0),
+          `used=${keepRows21.map((row) => (row.up_bytes + row.down_bytes) / GB21)}`);
+        const keepList21 = await trashList21('q=sc210keep&pageSize=200');
+        check('an entry rebuilt whole is out of the kept list, and the audit says so',
+          (keepList21.json?.data?.rows || []).length === 0
+            && (keepList21.json?.data?.counts || {}).kept === Number(dbCounts21.kept)
+            && (keepList21.json?.data?.counts || {}).back === Number(dbCounts21.back) + 1,
+          `rows=${(keepList21.json?.data?.rows || []).length} kept=${(keepList21.json?.data?.counts || {}).kept}/${dbCounts21.kept} back=${(keepList21.json?.data?.counts || {}).back}/${Number(dbCounts21.back) + 1}`);
+
+        const expPkg21 = await build21(shop21.id, 'sc210exp', { gb: 2, days: 7 });
+        setExpiry21(expPkg21.email, NOW21 - 6 * DAY21);
+        await deletePackage21(expPkg21.id);
+        const expTr21 = newestTrash21(expPkg21.email);
+        const expRestore21 = await restore21(Number(expTr21.id), { userId: shop21.id });
+        const expRows21 = alive21(expPkg21.email);
+        check('a customer whose time had run out does NOT come back unlimited',
+          Number(expTr21.left_days) === 0 && expRestore21.status === 200 && expRows21.length === 2
+            && expRows21.every((row) => Number(row.expiry_at) === Number(expTr21.expiry_at))
+            && expRows21.every((row) => Number(row.expiry_at) > 0 && Number(row.expiry_at) < Date.now()),
+          `left=${expTr21.left_days} expiry=${expRows21.map((row) => row.expiry_at === expTr21.expiry_at)}`);
+
+        const gonePkg21 = await build21(gone21.id, 'sc210gone-pkg', { gb: 1, days: 3 });
+        const hardMark21 = Number(tdb.prepare("SELECT COUNT(*) AS c FROM config_trash WHERE mode = 'hard'").get().c);
+        const purgeUser21 = await request('DELETE', `/api/admin/users/${gone21.id}?purge=1`, { cookies, csrf });
+        const goneSnaps21 = tdb.prepare("SELECT id FROM config_trash WHERE user_id = ? AND mode = 'hard' ORDER BY id").all(gone21.id);
+        check('deleting a representative with purge leaves one HARD snapshot per channel',
+          purgeUser21.status === 200 && goneSnaps21.length === 2
+            && Number(tdb.prepare('SELECT COUNT(*) AS c FROM configs WHERE email = ?').get(gonePkg21.email).c) === 0,
+          `snaps=${goneSnaps21.length} rows=${tdb.prepare('SELECT COUNT(*) AS c FROM configs WHERE email = ?').get(gonePkg21.email).c}`);
+        const purgedRestore21 = await restore21(Number(goneSnaps21[0]?.id || 0), {});
+        check('his snapshot cannot rebuild itself — the owner account is gone',
+          purgedRestore21.status === 422 && code21(purgedRestore21) === 'user_not_found',
+          `code=${code21(purgedRestore21)}`);
+        const handedRestore21 = await restore21(Number(goneSnaps21[0]?.id || 0), { userId: shop21.id });
+        const hr21 = handedRestore21.json?.data || {};
+        const handedOwner21 = Number(tdb.prepare('SELECT user_id FROM configs WHERE id = ?').get(Number((hr21.ids || [])[0] || 0))?.user_id || 0);
+        check('handed to a live representative it rebuilds him there as a brand-new row',
+          handedRestore21.status === 200 && (hr21.revived || []).length === 0 && (hr21.ids || []).length === 1
+            && handedOwner21 === shop21.id,
+          `revived=${(hr21.revived || []).length} owner=${handedOwner21}/${shop21.id}`);
+
+        const extEmail21 = seed21('sc210ext-1', { inboundIds: [901], totalGB: 2 * GB21 });
+        const adopt21 = await request('POST', '/api/admin/configs/adopt', {
+          cookies, csrf, body: { email: extEmail21, userId: other21.id, serverId: primaryId },
+        });
+        const adoptedRow21 = rowIdOf21(extEmail21, 901);
+        const extDel21 = await deletePackage21(adoptedRow21);
+        const extTr21 = newestTrash21(extEmail21);
+        const extRestore21 = await restore21(Number(extTr21.id), { userId: other21.id });
+        check('an adopted subscription is refused: deleting it only forgot it here, so rebuilding it would create a client this panel never owned',
+          adopt21.status === 201 && extDel21.status === 200 && extRestore21.status === 422
+            && code21(extRestore21) === 'external_snapshot' && mockXui.clients.has(extEmail21) === true,
+          `adopt=${adopt21.status} del=${extDel21.status} restore=${extRestore21.status}/${code21(extRestore21)}`);
+        const purgeTr21 = await request('DELETE', `/api/admin/trash/${extTr21.id}`, { cookies, csrf });
+        const afterPurge21 = await request('GET', `/api/admin/trash/${extTr21.id}`, { cookies });
+        check('purging an entry erases it for good, and it really is gone afterwards',
+          purgeTr21.status === 200 && afterPurge21.status === 404 && Number(trashRow21(Number(extTr21.id)).id || 0) === 0,
+          `purge=${purgeTr21.status} read=${afterPurge21.status}`);
+        const shopSess21 = await login21('sc210shop');
+        const resellerTrash21 = await request('GET', '/api/admin/trash', { cookies: shopSess21.cookies });
+        check('a representative has no Trash at all', resellerTrash21.status === 403, `status=${resellerTrash21.status}`);
+        const trAudit21 = tdb.prepare("SELECT details FROM audit_logs WHERE action = 'config.trash_restore' AND details LIKE ? ORDER BY id DESC LIMIT 1")
+          .get(`%${pkg21.email}%`) || {};
+        const trAuditJson21 = JSON.parse(String(trAudit21.details || '{}'));
+        check('every rebuild is audited with the email, the channels and what was revived',
+          trAuditJson21.email === pkg21.email && (trAuditJson21.inboundIds || []).length === 2
+            && (trAuditJson21.revived || []).length === 2,
+          `audit=${String(trAudit21.details || '').slice(0, 60)}`);
+
+        // ────────────────────────────────────── ۳) «بنر اطلاع‌رسانی» سبز/قرمز
+        bannerWas21 = (await settingsRead21()).banner || {};
+        const emptyOn21 = await patchBanner21({ enabled: true, text: '' });
+        check('the banner cannot be switched on with an empty message',
+          emptyOn21.status === 422 && code21(emptyOn21) === 'banner_empty', `code=${code21(emptyOn21)}`);
+        const noAudience21 = await patchBanner21({ enabled: true, text: 'قطعی داریم', targets: 'selected', userIds: [] });
+        check('«selected» with nobody picked is refused too',
+          noAudience21.status === 422 && code21(noAudience21) === 'banner_no_audience', `code=${code21(noAudience21)}`);
+        const badWindow21 = await patchBanner21({ enabled: true, text: 'قطعی', targets: 'all', startsAt: NOW21 + DAY21, endsAt: NOW21 });
+        check('a window that ends before it starts is refused',
+          badWindow21.status === 422 && code21(badWindow21) === 'banner_window', `code=${code21(badWindow21)}`);
+        const textSave21 = await patchBanner21({
+          enabled: true,
+          text: '\n  تخفیف   ویژه  برای\n حساب  کاربری   شما   اعمال  شد  ',
+          tone: 'blue',
+          targets: 'all',
+        });
+        const bannerRow21 = (await settingsRead21()).banner || {};
+        check('the message is folded to one line and an unknown tone becomes green',
+          textSave21.status === 200 && bannerRow21.text === 'تخفیف ویژه برای حساب کاربری شما اعمال شد'
+            && bannerRow21.tone === 'green', `text=${bannerRow21.text} tone=${bannerRow21.tone}`);
+        await patchBanner21({ text: 'x'.repeat(400) });
+        const longRow21 = (await settingsRead21()).banner || {};
+        check('three hundred characters is the limit the box keeps',
+          String(longRow21.text).length === 300, `len=${String(longRow21.text).length}`);
+        await patchBanner21({ text: 'تخفیف ویژه برای حساب کاربری شما اعمال شد', tone: 'green', targets: 'all' });
+        const shopBanner21 = await request('GET', '/api/banner', { cookies: shopSess21.cookies });
+        const adminBanner21 = await request('GET', '/api/banner', { cookies });
+        const anonBanner21 = await request('GET', '/api/banner', {});
+        check('a green bar for all representatives reaches the reseller panel',
+          shopBanner21.status === 200 && shopBanner21.json?.data?.tone === 'green'
+            && String(shopBanner21.json?.data?.text).includes('تخفیف ویژه'),
+          `status=${shopBanner21.status} data=${JSON.stringify(shopBanner21.json?.data || null)}`);
+        check('…and never shows over the owner\'s own screen, nor over an anonymous one',
+          adminBanner21.status === 200 && adminBanner21.json?.data === null && anonBanner21.status === 401,
+          `admin=${JSON.stringify(adminBanner21.json?.data)} anon=${anonBanner21.status}`);
+        const otherSess21 = await login21('sc210other');
+        const picked21 = await patchBanner21({ tone: 'red', targets: 'selected', userIds: [other21.id, 987654] });
+        const aud21 = picked21.json?.data?.audience || {};
+        check('the picked ids come back resolved — the one that does not exist is flagged, not dropped',
+          picked21.status === 200 && Number(aud21.count) === 1 && (aud21.rows || []).length === 2
+            && aud21.rows[0]?.username === 'sc210other' && aud21.rows[1]?.gone === true,
+          `count=${aud21.count} rows=${JSON.stringify((aud21.rows || []).map((row) => [row.username, row.gone]))}`);
+        const otherBanner21 = await request('GET', '/api/banner', { cookies: otherSess21.cookies });
+        const shopBanner22 = await request('GET', '/api/banner', { cookies: shopSess21.cookies });
+        check('the red bar reaches exactly the representative who was picked',
+          otherBanner21.json?.data?.tone === 'red' && shopBanner22.json?.data === null,
+          `other=${JSON.stringify(otherBanner21.json?.data)} shop=${JSON.stringify(shopBanner22.json?.data)}`);
+        const future21 = await patchBanner21({ targets: 'all', startsAt: NOW21 + 60 * DAY21, endsAt: 0 });
+        const futureView21 = await request('GET', '/api/banner', { cookies: otherSess21.cookies });
+        check('a banner written before an outage is not up yet',
+          future21.status === 200 && futureView21.json?.data === null,
+          `status=${futureView21.status} data=${JSON.stringify(futureView21.json?.data)}`);
+        const over21 = await patchBanner21({ startsAt: NOW21 - 2 * DAY21, endsAt: NOW21 - DAY21 });
+        const overView21 = await request('GET', '/api/banner', { cookies: otherSess21.cookies });
+        check('…and comes down by itself once its window has passed',
+          over21.status === 200 && overView21.json?.data === null,
+          `data=${JSON.stringify(overView21.json?.data)}`);
+        const off21 = await patchBanner21({ enabled: false });
+        const offRow21 = (await settingsRead21()).banner || {};
+        check('switching it off keeps the text for the next crisis',
+          off21.status === 200 && offRow21.enabled === false && String(offRow21.text).length > 0,
+          `enabled=${offRow21.enabled} text=${String(offRow21.text).length}`);
+
+        // ─────────────────────────────────────── ۴) what a fresh 2.1.0 boots with
+        const tables21 = tdb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all().map((row) => row.name);
+        const trashCols21 = tdb.prepare('PRAGMA table_info(config_trash)').all().map((row) => row.name);
+        const settingsKeys21 = tdb.prepare('SELECT key FROM settings ORDER BY key').all().map((row) => row.key);
+        check('the two new tables are there and the rest of the schema is untouched',
+          tables21.includes('config_trash') && tables21.includes('activation') && tables21.length === 22,
+          tables21.join(','));
+        check('the Trash stores the identity AND the arithmetic a rebuild needs',
+          ['email', 'sub_id', 'uuid', 'total_bytes', 'used_bytes', 'left_bytes', 'left_days', 'expiry_at',
+            'inbound_ids', 'rows_json', 'mode', 'restored_at'].every((col) => trashCols21.includes(col)),
+          trashCols21.join(','));
+        check('the twelfth settings row is the banner, born switched off',
+          settingsKeys21.length === 12 && settingsKeys21.includes('banner')
+            && Boolean((await settingsRead21()).banner) === true && bannerWas21.enabled === false,
+          `rows=${settingsKeys21.length} was=${JSON.stringify(bannerWas21.enabled)}`);
+      } finally {
+        // The listener goes back FIRST: every check after this block is made
+        // against the port the harness booted with, so a failure inside the block
+        // must not be able to leave the panel answering somewhere else.
+        for (const candidate of [PORT, movedTo21].filter((port, index, all) => Number(port) > 0 && all.indexOf(port) === index)) {
+          const sysTry21 = await onPort(candidate, 'GET', '/api/admin/system', { cookies });
+          if (sysTry21.status !== 200) continue;
+          await onPort(candidate, 'PATCH', '/api/admin/settings/general', {
+            body: {
+              panelPort: PORT,
+              publicUrl: String((was21 || {}).publicUrl || ''),
+              sslCertPath: '',
+              sslKeyPath: '',
+            },
+            cookies, csrf, tls: Boolean(netOf21(sysTry21).tls),
+          });
+          break;
+        }
+        const homeAgain21 = await health21(PORT);
+        const netHomeAgain21 = netOf21(await onPort(PORT, 'GET', '/api/admin/system', { cookies }));
+        check('the listener is home: the port the suite booted with, in plain http',
+          homeAgain21.status === 200 && netHomeAgain21.tls === false && Number(netHomeAgain21.port) === PORT,
+          `health=${homeAgain21.status} tls=${netHomeAgain21.tls} port=${netHomeAgain21.port}`);
+        if (bannerWas21) {
+          await patchBanner21({
+            enabled: Boolean(bannerWas21.enabled),
+            text: String(bannerWas21.text || ''),
+            tone: String(bannerWas21.tone || 'green'),
+            targets: String(bannerWas21.targets || 'all'),
+            userIds: Array.isArray(bannerWas21.userIds) ? bannerWas21.userIds : [],
+            startsAt: 0,
+            endsAt: 0,
+          });
+        }
+        tdb.prepare('UPDATE inbounds SET enabled = 1 WHERE id IN (901, 902)').run();
+        if (lifted21) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit21 } });
+        if (busy21) { try { busy21.close(); } catch (_) { /* already gone */ } }
+        for (const email of seedEmails21) mockXui.clients.delete(email);
+        fs.rmSync(certDir21, { recursive: true, force: true });
+        tdb.close();
       }
     }
 

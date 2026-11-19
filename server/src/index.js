@@ -15,6 +15,8 @@ const config = require('./config');
 const { getDb, closeDb } = require('./db');
 const settings = require('./settings');
 const auth = require('./auth');
+const net = require('./net');
+const activation = require('./activation');
 const monitor = require('./services/monitor');
 const backupService = require('./services/backup');
 const telegram = require('./services/telegram');
@@ -41,6 +43,35 @@ app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 
 app.use(auth.authMiddleware);
 app.use(auth.csrfProtection);
+
+// ------------------------------------------------------- v2.1.0 activation gate
+//
+// An install that has never been activated answers nothing but the three calls its
+// own lock screen needs: /api/meta (brand + csrf), /api/health and /api/activation.
+// Everything else — including /api/setup, which is how a stranger would otherwise
+// hand himself the owner account — is 423 until the FEMALE half of the male key on
+// the screen is typed.
+//
+// activation.isRequired() is the whole safety of this: it is only true while the
+// panel has NO accounts, so a panel upgraded from 2.0.0 (or any older install,
+// which has accounts and no activation row) keeps working exactly as it did. The
+// static SPA is deliberately not gated; the gate is on the API, so a locked
+// install serves the unlock page rather than a blank screen.
+
+const ACTIVATION_OPEN = ['/meta', '/health', '/activation'];
+app.use('/api', (req, res, next) => {
+  const path = req.path === '/' ? '' : req.path;
+  if (ACTIVATION_OPEN.some((open) => path === open || path.startsWith(`${open}/`) || path.startsWith(`${open}?`))) return next();
+  if (!activation.isRequired()) return next();
+  return res.status(423).json({
+    ok: false,
+    error: {
+      code: 'activation_required',
+      message: 'این نصب هنوز فعال نشده است / this install is not activated yet',
+      details: { maleKey: activation.challengeMale() },
+    },
+  });
+});
 
 // ------------------------------------------------------------------ routes
 
@@ -101,6 +132,13 @@ function bootstrapOwner() {
   const db = getDb();
   const count = db.prepare('SELECT COUNT(*) AS c FROM users WHERE deleted_at = 0').get().c;
   if (count > 0) return false;
+  // v2.1.0: the ADMIN_USERNAME/ADMIN_PASSWORD bootstrap is the install script's
+  // door, not a way around the activation gate. An unactivated install that has
+  // never had a key typed stays locked even if somebody sets the variables.
+  if (activation.isRequired()) {
+    log('[boot] owner bootstrap skipped: this install is not activated yet');
+    return false;
+  }
   const username = process.env.ADMIN_USERNAME;
   const password = process.env.ADMIN_PASSWORD;
   if (!username || !password) return false;
@@ -271,8 +309,22 @@ function start() {
   getDb();
   settings.ensureDefaults();
   bootstrapOwner();
-  const server = app.listen(config.port, config.host, () => {
-    log(`Sulduz Cloud ${config.version} listening on http://${config.host}:${config.port}`);
+  // v2.1.0: the port, the address and the certificate paths all come from
+  // settings → general now (src/net.js), so a port move from the settings screen
+  // or the SSH menu needs no restart and no .env edit. `serve()` resolves once the
+  // socket is listening; a port that cannot be opened is the one failure that must
+  // stop the boot, because there is then no panel at all to serve.
+  net.serve(app).then((result) => {
+    if (result.failed) {
+      logError(`[boot] ${result.error}`);
+      process.exit(1);
+    }
+    const seen = net.describe();
+    log(`Sulduz Cloud ${config.version} listening on ${seen.scheme}://${seen.host}:${seen.port}`);
+    if (seen.tlsError) logError(`[net] ${seen.tlsError}`);
+    const gate = activation.status();
+    if (gate.required) log(`[boot] awaiting activation — male key ${gate.maleKey}`);
+    else if (gate.activated) log(`[boot] activated (key ${gate.maleKey}, ${gate.source})`);
     monitor.start();
     startAutoBackupTimer();
     startDailyReportTimer();
@@ -282,15 +334,18 @@ function start() {
     // the webhook and then polls in the background, and a bot that is switched
     // off in settings stays idle without a single network call.
     bot.start().catch((err) => logError('[bot] start failed:', err.message));
+  }).catch((err) => {
+    logError('[boot] listener failed:', err && err.stack ? err.stack : err);
+    process.exit(1);
   });
-  server.requestTimeout = 120000;
-  server.headersTimeout = 130000;
 
   const shutdown = (signal) => {
     log(`[boot] received ${signal}, shutting down`);
     monitor.stop();
     bot.stop();
-    server.close(() => {
+    // net.close(), not the boot-time instance: after a port move the socket this
+    // process opened first is no longer the one answering requests.
+    net.close().then(() => {
       closeDb();
       process.exit(0);
     });

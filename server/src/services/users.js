@@ -422,7 +422,7 @@ function updateUser(id, data, req) {  const db = getDb();
   return getUser(id);
 }
 
-function deleteUser(id, { purgeConfigs = false } = {}, req) {
+async function deleteUser(id, { purgeConfigs = false } = {}, req) {
   const db = getDb();
   const user = getUser(id);
   if (!user) throw new ApiError(404, 'not_found', 'User not found');
@@ -437,7 +437,13 @@ function deleteUser(id, { purgeConfigs = false } = {}, req) {
     const configs = db.prepare('SELECT * FROM configs WHERE user_id = ? AND deleted_at = 0').all(Number(id));
     for (const cfg of configs) {
       try {
-        configsService.removeConfig(cfg.id, { hard: true, silent: true, force: true }, req);
+        // v2.1.0: removeConfig is ASYNC — it asks the node before it touches a
+        // single row. Awaiting it is not decoration: without it the DELETE
+        // answered 200 while the node calls were still in the air, so the Trash
+        // snapshot of a purged representative arrived after his account had
+        // already been stamped deleted, and the owner's «حذف با کانفینگ‌ها» was a
+        // promise the panel had not kept yet.
+        await configsService.removeConfig(cfg.id, { hard: true, silent: true, force: true }, req);
         removed += 1;
       } catch (err) {
         console.error(`[users] failed to remove config ${cfg.email}:`, err.message);

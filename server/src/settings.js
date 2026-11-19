@@ -54,6 +54,15 @@ const DEFAULTS = {
     telegram: '',
     defaultLang: 'fa',
     timezone: 'Asia/Tehran',
+    // v2.1.0 — the three network fields, and they are the listener's own truth.
+    // src/net.js binds this port (falling back to the .env PORT when it is empty
+    // or unusable), serves HTTPS as soon as both certificate paths read, and
+    // hands `publicUrl` to everything that quotes an address to a customer:
+    // subscribe links, payment callbacks and the cookie's Secure flag.
+    panelPort: config.port,
+    publicUrl: config.publicUrl,
+    sslCertPath: '',
+    sslKeyPath: '',
   },
   xui: {
     url: config.xuiUrl,
@@ -172,6 +181,26 @@ const DEFAULTS = {
     maxPerRun: 50,
     lastRunAt: 0,
     lastSummary: '',
+  },
+  // v2.1.0 — the crisis banner («نوار سبز یا قرمز»). The owner's case is an
+  // outage or a special offer: one line of text, in one of two colours, above the
+  // reseller's own panel — either for every reseller or for the ones he ticks.
+  //
+  //   enabled  — the only switch that matters; a disabled banner is invisible
+  //              even inside its own window;
+  //   tone     — 'green' (good news, a discount) or 'red' (outage, trouble);
+  //   targets  — 'all' or 'selected' with userIds;
+  //   startsAt / endsAt — optional wall-clock window, 0 means open-ended, so a
+  //              banner written before an outage can go up and come down by
+  //              itself while the owner sleeps.
+  banner: {
+    enabled: false,
+    text: '',
+    tone: 'green',
+    targets: 'all',
+    userIds: [],
+    startsAt: 0,
+    endsAt: 0,
   },
   telegram: {
     enabled: false,
@@ -491,6 +520,7 @@ function allRedacted() {
     payment: redactSection('payment', getSetting('payment')),
     backup: redactSection('backup', getSetting('backup')),
     cleanup: redactSection('cleanup', getSetting('cleanup')),
+    banner: redactSection('banner', getSetting('banner')),
     telegram: redactSection('telegram', getSetting('telegram')),
     security: redactSection('security', getSetting('security')),
   };

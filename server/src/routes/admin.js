@@ -24,8 +24,12 @@ const reports = require('../services/reports');
 const monitor = require('../services/monitor');
 const cleanupService = require('../services/cleanup');
 const ticketsService = require('../services/tickets');
+const trashService = require('../services/trash');
+const bannerService = require('../services/banner');
 const notify = require('../notify');
 const xui = require('../xui');
+const net = require('../net');
+const activation = require('../activation');
 const { ApiError, asyncH, sanitizeUser, pageParams, toCsv, bytesToGb } = require('../utils');
 const { audit, listAudit } = require('../audit');
 
@@ -304,14 +308,14 @@ router.post('/users/:id/balance', auth.requirePerm('users'), (req, res) => {
   res.json({ ok: true, data: result });
 });
 
-router.delete('/users/:id', auth.requirePerm('users'), (req, res) => {
-  const result = usersService.deleteUser(
+router.delete('/users/:id', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const result = await usersService.deleteUser(
     num(req.params.id),
     { purgeConfigs: String(req.query.purge || '') === '1' },
     req
   );
   res.json({ ok: true, data: result });
-});
+}));
 
 // ---------------------------------------------------------- pricing/discounts
 
@@ -1014,6 +1018,82 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     if (clean.loginRateLimit !== undefined) clean.loginRateLimit = Math.min(100, Math.max(3, num(clean.loginRateLimit, 10)));
   }
   if (section === 'smtp' && clean.port !== undefined) clean.port = Math.min(65535, Math.max(1, num(clean.port, 587)));
+  if (section === 'general') {
+    // v2.1.0: the three network fields the owner asked for. They are not stored
+    // text — src/net.js turns them into the socket this panel listens on and the
+    // address every subscribe link and payment callback is built from, so they get
+    // the same type guards the smtp port has always had, plus a shape check.
+    if (clean.panelPort !== undefined) {
+      const port = net.clampPort(clean.panelPort);
+      if (!port) {
+        throw new ApiError(422, 'invalid_panel_port',
+          `پورت پنل باید بین ${net.MIN_PORT} و ${net.MAX_PORT} باشد / the panel port must be between ${net.MIN_PORT} and ${net.MAX_PORT}`);
+      }
+      // Asking for a port somebody else already holds used to be saved first and
+      // failed later: the old socket kept answering, so the screen stayed alive,
+      // while the stored number guaranteed a service that would not boot. The new
+      // port is tried on a throwaway socket here instead, and a busy one is simply
+      // refused — nothing is written, and the panel keeps running where it is.
+      const busy = await net.probe(port);
+      if (!busy.ok) {
+        throw new ApiError(422, 'panel_port_busy',
+          `پورت ${port} روی این سرور آزاد نیست (${busy.error}) — پنل همچنان روی ${net.describe().port} کار می‌کند / port ${port} is not available on this server (${busy.error}); the panel is still listening on ${net.describe().port}`);
+      }
+      clean.panelPort = port;
+    }
+    if (clean.publicUrl !== undefined) {
+      const raw = String(clean.publicUrl || '').trim().replace(/\/+$/, '');
+      if (raw && !/^https?:\/\/[^\s/?#]+\.[^\s/?#]+/i.test(raw) && !/^https?:\/\/(\d{1,3}\.){3}\d{1,3}(:\d+)?$/i.test(raw)) {
+        throw new ApiError(422, 'invalid_public_url',
+          'آدرس پنل باید با http:// یا https:// شروع شود و یک میزبان معتبر باشد / the panel address must be a full http(s) URL');
+      }
+      clean.publicUrl = raw;
+    }
+    for (const key of ['sslCertPath', 'sslKeyPath']) {
+      if (clean[key] === undefined) continue;
+      const raw = String(clean[key] || '').trim().slice(0, 300);
+      // An absolute path only: the panel would otherwise resolve it against its own
+      // working directory, which nobody can read off a settings form.
+      if (raw && !raw.startsWith('/')) {
+        throw new ApiError(422, 'invalid_cert_path', 'مسیر گواهی باید مطلق باشد (با / شروع شود) / certificate paths must be absolute');
+      }
+      clean[key] = raw;
+    }
+    if (clean.sslCertPath !== undefined || clean.sslKeyPath !== undefined) {
+      // Half a key pair is the dead-switch case again: HTTPS would silently stay
+      // off while the form shows a path in one box. Checked against the merged
+      // row, because saving only one of the two boxes is how it happens.
+      const merged = { ...settings.getSetting('general'), ...clean };
+      if (Boolean(merged.sslCertPath) !== Boolean(merged.sslKeyPath)) {
+        throw new ApiError(422, 'cert_pair_incomplete',
+          'برای HTTPS هر دو مسیر — کلید عمومی و کلید خصوصی — لازم است / fill both the public key and the private key path');
+      }
+    }
+  }
+  if (section === 'banner') {
+    // v2.1.0: the owner's notice bar. Normalised over the MERGED row so a partial
+    // save (flipping the switch only) keeps the text and the audience he already
+    // set, and so the stored shape is always what services/banner.js reads.
+    const merged = { ...settings.getSetting('banner'), ...clean };
+    const next = bannerService.normalize(merged);
+    if (clean.enabled === true && !next.text) {
+      throw new ApiError(422, 'banner_empty', 'متن بنر خالی است / write the message before switching the banner on');
+    }
+    if (clean.enabled === true && next.targets === 'selected' && !next.userIds.length) {
+      throw new ApiError(422, 'banner_no_audience',
+        'هیچ نماینده‌ای انتخاب نشده است / pick at least one reseller, or choose «همهٔ نمایندگان»');
+    }
+    if (next.startsAt && next.endsAt && next.endsAt <= next.startsAt) {
+      throw new ApiError(422, 'banner_window', 'پایان بازهٔ نمایش قبل از شروع آن است / the banner window ends before it starts');
+    }
+    clean.enabled = next.enabled;
+    clean.text = next.text;
+    clean.tone = next.tone;
+    clean.targets = next.targets;
+    if (clean.userIds !== undefined) clean.userIds = next.userIds;
+    if (clean.startsAt !== undefined) clean.startsAt = next.startsAt;
+    if (clean.endsAt !== undefined) clean.endsAt = next.endsAt;
+  }
   const saved = settings.updateSection(section, clean);
   audit(req, 'settings.update', 'settings', section, { keys: Object.keys(clean) });
   if (section === 'monitor' || section === 'backup') monitor.reconfigure();
@@ -1047,8 +1127,74 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     try { xuiTest = await xui.testConnection(); } catch (err) { xuiTest = { ok: false, error: err.message }; }
     monitor.runCycle('settings').catch(() => {});
   }
-  res.json({ ok: true, data: { section, saved: settings.redactSection(section, saved), xuiTest } });
+  // v2.1.0: the network fields are not decoration — the saved port, address and
+  // certificate paths are applied to the live listener here. net.apply() opens the
+  // new socket BEFORE it closes the old one, so a port somebody else is holding,
+  // or a key file this user cannot read, leaves the panel answering on the socket
+  // it is answering on now. That outcome is reported to the form rather than
+  // thrown, because the settings themselves did save.
+  let netResult = null;
+  if (section === 'general') netResult = await net.apply();
+  // The banner tab picks people by name, so the saved ids come back resolved:
+  // «۳ نماینده» with the names under it, and an account that has since been
+  // deleted stays in the list and is flagged instead of silently dropping out.
+  let bannerAudience = null;
+  if (section === 'banner') bannerAudience = bannerService.audience(saved);
+  res.json({
+    ok: true,
+    data: { section, saved: settings.redactSection(section, saved), xuiTest, net: netResult, audience: bannerAudience },
+  });
 }));
+
+// ------------------------------------------------------ v2.1.0: listener + gate
+//
+// One read for the settings tab: what socket the panel is really on (which can
+// differ from what the form says when a move failed), whether HTTPS took, and the
+// activation state with the male key of THIS install.
+
+router.get('/system', auth.requirePerm('settings'), (req, res) => {
+  res.json({ ok: true, data: { net: net.describe(), activation: activation.status() } });
+});
+
+// --------------------------------------------------------- v2.1.0: the Trash
+//
+// Every package this panel deleted left a snapshot here (services/trash.js), with
+// the email, uuid and subscription token it had and how much time and volume were
+// still unused. Listing and reading it needs the same permission as the configs
+// themselves; putting one back calls x-ui, so it is a real create and is audited
+// as `config.trash_restore`.
+
+router.get('/trash', auth.requirePerm('configs'), (req, res) => {
+  const { page, pageSize } = pageParams(req.query, 25, 200);
+  const data = trashService.listTrash({
+    q: String(req.query.q || ''),
+    userId: Number(req.query.userId || 0),
+    mode: String(req.query.mode || ''),
+    includeRestored: req.query.includeRestored === '1',
+    page,
+    pageSize,
+  });
+  res.json({ ok: true, data });
+});
+
+router.get('/trash/:id', auth.requirePerm('configs'), (req, res) => {
+  res.json({ ok: true, data: trashService.detail(Number(req.params.id)) });
+});
+
+router.post('/trash/:id/restore', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const body = req.body || {};
+  const data = await trashService.restore(Number(req.params.id), {
+    userId: Number(body.userId || 0),
+    inboundIds: Array.isArray(body.inboundIds) ? body.inboundIds.map(Number) : null,
+    keepUsageWindow: Boolean(body.keepUsageWindow),
+    req,
+  });
+  res.json({ ok: true, data });
+}));
+
+router.delete('/trash/:id', auth.requirePerm('configs'), (req, res) => {
+  res.json({ ok: true, data: trashService.purge(Number(req.params.id), req) });
+});
 
 router.post('/settings/test-email', auth.requirePerm('settings'), asyncH(async (req, res) => {
   const result = await notify.testEmail();

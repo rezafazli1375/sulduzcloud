@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   BellRing,
+  AlertTriangle,
   CalendarClock,
   CheckCircle2,
   CreditCard,
@@ -12,6 +13,7 @@ import {
   Landmark,
   Lock,
   Mail,
+  Megaphone,
   MessageSquareText,
   Play,
   Plug,
@@ -20,6 +22,7 @@ import {
   RefreshCw,
   Save,
   Send,
+  Server,
   ShieldCheck,
   SlidersHorizontal,
   Trash2,
@@ -31,6 +34,8 @@ import { formatDate, formatNumber } from '../../lib/format.js';
 import {
   Badge,
   Button,
+  Checkbox,
+  CopyButton,
   ErrorState,
   Field,
   Input,
@@ -59,6 +64,9 @@ const TIMEZONES = [
 
 const TAB_LIST = [
   { value: 'general', icon: Globe2, label: 'settings.tabs.general' },
+  // v2.1.0: the owner's broadcast sits second because it is the one section he
+  // reaches for during an outage, when every extra tap is a wasted one.
+  { value: 'banner', icon: Megaphone, label: 'settings.tabs.banner' },
   { value: 'xui', icon: Plug, label: 'settings.tabs.xui' },
   { value: 'monitor', icon: BellRing, label: 'settings.tabs.monitor' },
   { value: 'smtp', icon: Mail, label: 'settings.tabs.smtp' },
@@ -144,6 +152,128 @@ function Rail({ icon: Icon, label, state, hint }) {
   );
 }
 
+/**
+ * v2.1.0: is the banner's own window open right now?
+ *
+ * A copy of the two lines in services/banner.js `inWindow()`, because the owner
+ * writes these notices during an outage and needs to see, before saving, whether
+ * the bar is up, still waiting for its start time, or already past its end.
+ */
+function windowState(cfg = {}) {
+  const now = Date.now();
+  if (Number(cfg.startsAt || 0) > now) return 'waiting';
+  if (Number(cfg.endsAt || 0) > 0 && Number(cfg.endsAt || 0) <= now) return 'over';
+  return 'now';
+}
+
+/**
+ * v2.1.0, item 1: the listener readout.
+ *
+ * The four boxes above it are what the owner WANTS; this is what the panel IS.
+ * They can disagree — a port somebody else holds is refused, half a certificate
+ * pair keeps the socket on HTTP — and printing only the form would hide both.
+ * `GET /api/admin/system` answers this, so the numbers come from the process that
+ * is actually listening rather than from React state.
+ */
+function NetReadout({ system, loading }) {
+  const { t } = useI18n();
+  if (loading || !system) {
+    return (
+      <div className="mt-4 space-y-2">
+        <Skeleton className="h-5 w-64" />
+        <Skeleton className="h-4 w-80" />
+      </div>
+    );
+  }
+  const net = system.net || {};
+  const gate = system.activation || {};
+  const wanted = Number(net.desiredPort || 0);
+  const live = Number(net.port || 0);
+  const pendingMove = wanted > 0 && wanted !== live;
+  const hasPair = Boolean(net.certPath && net.keyPath);
+
+  return (
+    <div className="mt-4 space-y-2.5 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3.5 py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge tone={net.listening ? (pendingMove ? 'amber' : 'emerald') : 'rose'} dot>
+          {net.listening
+            ? (pendingMove ? t('settings.net.pendingMove') : t('settings.net.listening'))
+            : t('settings.net.notListening')}
+        </Badge>
+        <span className="chip border-white/10 bg-white/[0.04] text-slate-300" dir="ltr">
+          {net.scheme}://{net.host}:{live || '—'}
+        </span>
+        {net.publicUrl ? (
+          <span className="chip border-white/10 bg-white/[0.04] text-slate-400" dir="ltr">{net.publicUrl}</span>
+        ) : null}
+        {hasPair ? (
+          <Badge tone={net.tls ? 'emerald' : 'amber'}>
+            {net.tls ? t('settings.net.httpsOn') : t('settings.net.httpsOff')}
+          </Badge>
+        ) : null}
+      </div>
+
+      {pendingMove ? (
+        <p className="text-[10.5px] leading-5 text-amber-300/90">
+          {t('settings.net.pendingMoveHint', { wanted, live })}
+        </p>
+      ) : null}
+
+      {net.tlsError ? (
+        <p className="text-[10.5px] leading-5 text-amber-300/90" dir="auto">
+          {t('settings.net.tlsError')}: {net.tlsError}
+        </p>
+      ) : null}
+
+      {gate.maleKey ? (
+        <div className="flex flex-wrap items-center gap-2 border-t border-white/[0.06] pt-2.5">
+          <KeyRound className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+          <span className="text-[10.5px] text-slate-500">{t('settings.net.maleKey')}</span>
+          <code dir="ltr" className="rounded-md bg-white/[0.05] px-2 py-1 font-mono text-[11.5px] text-slate-200">
+            {gate.maleKey}
+          </code>
+          <CopyButton value={gate.maleKey} size="xs" />
+          <Badge tone={gate.activated ? 'emerald' : gate.legacy ? 'amber' : 'rose'}>
+            {gate.activated
+              ? t('settings.net.activated')
+              : gate.legacy ? t('settings.net.legacyInstall') : t('settings.net.notActivated')}
+          </Badge>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * v2.1.0, item 6: what the reseller will actually see, drawn with the same two
+ * colours and the same bar shape as Shell.jsx. The owner is writing this during an
+ * outage; the only honest way to review a sentence about an outage is to read it
+ * in the colour it will appear in, before it goes out.
+ */
+function BannerPreview({ text, tone }) {
+  const { t } = useI18n();
+  const red = tone === 'red';
+  return (
+    <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+      <p className="mb-2 text-[10.5px] text-slate-500">{t('settings.banner.preview')}</p>
+      <div
+        dir="rtl"
+        className={cx(
+          'flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px] font-medium text-white',
+          red ? 'bg-rose-600/90' : 'bg-emerald-600/90'
+        )}
+      >
+        {red
+          ? <AlertTriangle className="h-4 w-4 shrink-0" />
+          : <CheckCircle2 className="h-4 w-4 shrink-0" />}
+        <span className="min-w-0 flex-1 leading-6">
+          {String(text || '').trim() || t('settings.banner.previewEmpty')}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function Settings() {
   const { t, lang } = useI18n();
   const toast = useToast();
@@ -151,6 +281,8 @@ export default function Settings() {
   const { refresh } = useAuth();
   const [tab, setTab] = useState('general');
   const [local, setLocal] = useState(null);
+  // v2.1.0: the names behind the picked banner ids, resolved by the server on save.
+  const [bannerAudience, setBannerAudience] = useState(null);
 
   const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['settings'],
@@ -166,6 +298,14 @@ export default function Settings() {
     onSuccess: (result, variables) => {
       toast.success(t('settings.saved'));
       if (variables.section === 'general') refresh?.();
+      // v2.1.0: port / address / certificate paths are stored on `general`, and the
+      // server normalizes them (a trailing slash is dropped, a port is rounded).
+      // Re-read the row and the listener instead of trusting what was typed, so
+      // this screen always shows the settings that are actually in force.
+      if (variables.section === 'general' || variables.section === 'banner') {
+        queryClient.invalidateQueries({ queryKey: ['settings'] });
+        queryClient.invalidateQueries({ queryKey: ['admin-system'] });
+      }
       if (variables.section === 'backup') queryClient.invalidateQueries({ queryKey: ['backups'] });
       // v1.5.5: the payment rows read the SERVER's model (payment.methods), not this
       // form — that is what makes them honest about a gateway that is switched on but
@@ -176,6 +316,22 @@ export default function Settings() {
         queryClient.invalidateQueries({ queryKey: ['payment-status'] });
         queryClient.invalidateQueries({ queryKey: ['topups'] });
       }
+      // v2.1.0, item 1: the network fields did save either way, so a refused move is
+      // reported rather than thrown — but it must be LOUD. Silence here is how an
+      // owner ends up with a form that says 3100 and a panel that is still on 3101.
+      if (result?.net) {
+        if (result.net.failed) {
+          toast.error(result.net.error || t('settings.net.failed'), { title: t('settings.net.failedTitle') });
+        } else if (result.net.changed) {
+          toast.success(
+            `${t('settings.net.movedTo')} ${result.net.scheme}://${result.net.host}:${result.net.port}`,
+            { title: t('settings.net.movedTitle') }
+          );
+        } else if (result.net.tlsError) {
+          toast.error(result.net.tlsError, { title: t('settings.net.tlsFailedTitle') });
+        }
+      }
+      if (result?.audience) setBannerAudience(result.audience);
       if (result?.xuiTest) {
         if (result.xuiTest.ok) {
           toast.success(`${t('settings.xui.ok')} · ${result.xuiTest.latencyMs ?? 0}ms · ${result.xuiTest.inbounds ?? 0}`);
@@ -215,6 +371,28 @@ export default function Settings() {
     mutationFn: () => api.post('/admin/settings/test-telegram'),
     onSuccess: (result) => toast.success(`${t('settings.telegram.connected')}${result?.bot ? ` · @${result.bot}` : ''}`),
     onError: (err) => toast.error(err?.message || t('errors.generic')),
+  });
+
+  // ---- v2.1.0: the live listener, the activation gate, the banner audience -----
+  //
+  // Three reads the settings form cannot know from its own state:
+  //
+  //   `system`   — what socket the panel is ACTUALLY on. A port move can be
+  //                refused, so the number in the box and the number answering
+  //                requests are not the same fact, and only the server holds the
+  //                second one. It also carries this install's male activation key.
+  //   `audience` — the resellers the banner tab picks by name (GET /admin/users),
+  //                plus the names behind the ids already stored.
+  const system = useQuery({
+    queryKey: ['admin-system'],
+    queryFn: () => api.get('/admin/system'),
+    enabled: tab === 'general',
+  });
+
+  const bannerPeople = useQuery({
+    queryKey: ['admin-users-resellers'],
+    queryFn: () => api.get('/admin/users?role=reseller&pageSize=200'),
+    enabled: tab === 'banner',
   });
 
   // ---- v1.5.4: payment rails ---------------------------------------------
@@ -287,6 +465,43 @@ export default function Settings() {
     ...prev,
     payment: { ...prev.payment, cards: (prev.payment?.cards || []).filter((_, i) => i !== index) },
   }));
+
+  // ---- v2.1.0: the banner -------------------------------------------------
+  // `userIds` is a list inside the section, so one tick rewrites that array and
+  // nothing else — the same rule that keeps a card row from clobbering its
+  // neighbours. Window times are absolute epoch milliseconds: the browser converts
+  // the wall-clock string the owner typed, the server compares it with its own
+  // clock, and neither side has to agree on a timezone.
+  const toggleBannerUser = (userId) => setLocal((prev) => {
+    const id = Number(userId);
+    const list = prev.banner?.userIds || [];
+    return {
+      ...prev,
+      banner: {
+        ...prev.banner,
+        userIds: list.includes(id) ? list.filter((value) => value !== id) : [...list, id],
+      },
+    };
+  });
+
+  const patchBannerWindow = (field, value) => setLocal((prev) => {
+    const stamp = value ? Math.round(new Date(value).getTime()) : 0;
+    return {
+      ...prev,
+      banner: { ...prev.banner, [field]: Number.isFinite(stamp) ? stamp : 0 },
+    };
+  });
+
+  // The two window boxes are `datetime-local` inputs, which want "YYYY-MM-DDTHH:MM"
+  // in the browser's own zone. 0 (open-ended) renders as an empty box.
+  const windowInput = (ms) => {
+    const stamp = Number(ms || 0);
+    if (!stamp) return '';
+    const d = new Date(stamp);
+    if (Number.isNaN(d.getTime())) return '';
+    const two = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}T${two(d.getHours())}:${two(d.getMinutes())}`;
+  };
 
   // ---- the nightly report -------------------------------------------------
   // `daily` is the read model the schedule card, the recipient list and the
@@ -367,6 +582,7 @@ export default function Settings() {
   const cleanup = local.cleanup || {};
   const telegram = local.telegram || {};
   const security = local.security || {};
+  const banner = local.banner || {};
   const payment = local.payment || {};
   const payCards = payment.cards || [];
   const payLive = payStatus.data?.methods || {};
@@ -377,6 +593,7 @@ export default function Settings() {
   const repRows = rep.recipients || [];
   const repHistory = rep.history || [];
   const savingSection = save.isPending ? save.variables?.section : null;
+  const bannerState = windowState(banner);
 
   return (
     <>
@@ -444,9 +661,214 @@ export default function Settings() {
                 </Select>
               </Field>
             </div>
+            {/*
+              v2.1.0, item 1: «یک کادر برای تغییر پورت پنل … و تغییر دامنه و آدرس
+              پنل و دوتا کادر برای آدرس دهی سرتیفکت».
+              These four boxes are not stored text. src/net.js re-opens the socket
+              on the port below, rewrites the address that every subscribe link,
+              payment callback and cookie is built from, and turns the listener into
+              HTTPS as soon as BOTH certificate paths are readable by the service
+              user. A port that is already taken is refused before anything is
+              written, so saving here can never leave a panel that will not boot.
+            */}
+            <div className="border-t border-white/[0.06] pt-4">
+              <div className="mb-1 flex items-center gap-2">
+                <Server className="h-4 w-4 text-slate-400" />
+                <p className="text-[12.5px] font-semibold text-slate-200">{t('settings.net.section')}</p>
+              </div>
+              <p className="mb-3 text-[10.5px] leading-5 text-slate-500">{t('settings.net.sectionHint')}</p>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label={t('settings.net.panelPort')} hint={t('settings.net.panelPortHint')}>
+                  <Input
+                    dir="ltr"
+                    inputMode="numeric"
+                    value={general.panelPort ?? ''}
+                    onChange={(e) => patch('general', 'panelPort', e.target.value)}
+                    placeholder="3100"
+                  />
+                </Field>
+                <Field label={t('settings.net.publicUrl')} hint={t('settings.net.publicUrlHint')}>
+                  <Input
+                    dir="ltr"
+                    value={general.publicUrl || ''}
+                    onChange={(e) => patch('general', 'publicUrl', e.target.value)}
+                    placeholder="https://panel.example.com"
+                  />
+                </Field>
+                <Field label={t('settings.net.certPath')} hint={t('settings.net.certPathHint')}>
+                  <Input
+                    dir="ltr"
+                    value={general.sslCertPath || ''}
+                    onChange={(e) => patch('general', 'sslCertPath', e.target.value)}
+                    placeholder="/etc/letsencrypt/live/panel/fullchain.pem"
+                  />
+                </Field>
+                <Field label={t('settings.net.keyPath')} hint={t('settings.net.keyPathHint')}>
+                  <Input
+                    dir="ltr"
+                    value={general.sslKeyPath || ''}
+                    onChange={(e) => patch('general', 'sslKeyPath', e.target.value)}
+                    placeholder="/etc/letsencrypt/live/panel/privkey.pem"
+                  />
+                </Field>
+              </div>
+              <NetReadout system={system.data} loading={system.isLoading} />
+            </div>
             <SaveBar
               saving={savingSection === 'general'}
               onSave={() => save.mutate({ section: 'general', payload: general })}
+              extra={(
+                <span className="text-[10.5px] text-slate-500">{t('settings.net.saveHint')}</span>
+              )}
+            />
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {/*
+        v2.1.0, item 6: «در شرایط بحرانی و قطعی سرورها و اینترنت یک پیام بصورت
+        نوار سبز رنگ یا قرمز رنگ برای نمایندگانی که انتخاب کردیم یا برای همهٔ
+        نمایندگان نشان داده بشه».
+        One settings row, no new table. The switch, the two colours and the window
+        are all enforced again by the server (banner_empty, banner_no_audience,
+        banner_window), so a half-written banner cannot go live; the preview is the
+        owner's proof that the sentence says what he meant before it reaches fifty
+        resellers' screens.
+      */}
+      {tab === 'banner' ? (
+        <SectionCard icon={Megaphone} title={t('settings.tabs.banner')} subtitle={t('settings.banner.subtitle')}>
+          <div className="space-y-4">
+            <SwitchRow
+              label={t('settings.banner.enabled')}
+              hint={t('settings.banner.enabledHint')}
+              checked={banner.enabled}
+              onChange={(value) => patch('banner', 'enabled', value)}
+            />
+
+            <BannerPreview text={banner.text} tone={banner.tone} />
+
+            <Field label={t('settings.banner.text')} hint={t('settings.banner.textHint')}>
+              <Textarea
+                dir="rtl"
+                rows={3}
+                maxLength={300}
+                value={banner.text || ''}
+                onChange={(e) => patch('banner', 'text', e.target.value)}
+                placeholder={t('settings.banner.textPlaceholder')}
+              />
+              <p className="mt-1 text-[10px] text-slate-500">
+                {`${String(banner.text || '').length} / 300`}
+              </p>
+            </Field>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label={t('settings.banner.tone')}>
+                <div className="flex gap-2">
+                  {[['green', t('settings.banner.toneGreen'), 'bg-emerald-600'], ['red', t('settings.banner.toneRed'), 'bg-rose-600']].map(([value, label, swatch]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => patch('banner', 'tone', value)}
+                      className={cx(
+                        'flex flex-1 items-center justify-center gap-2 rounded-xl border px-3 py-2 text-[12px] font-medium transition',
+                        banner.tone === value
+                          ? 'border-white/25 bg-white/[0.08] text-white'
+                          : 'border-white/[0.07] bg-white/[0.02] text-slate-400 hover:border-white/15'
+                      )}
+                    >
+                      <span className={cx('h-3 w-3 rounded-full', swatch)} />
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+              <Field label={t('settings.banner.targets')} hint={t('settings.banner.targetsHint')}>
+                <Select value={banner.targets || 'all'} onChange={(e) => patch('banner', 'targets', e.target.value)}>
+                  <option value="all">{t('settings.banner.allResellers')}</option>
+                  <option value="selected">{t('settings.banner.selectedResellers')}</option>
+                </Select>
+              </Field>
+            </div>
+
+            {banner.targets === 'selected' ? (
+              <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3.5">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[12px] font-medium text-slate-200">
+                    {t('settings.banner.audience')}
+                    <span className="ms-2 text-[11px] text-slate-500">
+                      {(banner.userIds || []).length}
+                    </span>
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => patch('banner', 'userIds', [])}
+                    className="text-[10.5px] text-slate-400 underline-offset-4 hover:text-slate-200 hover:underline"
+                  >
+                    {t('settings.banner.clearAudience')}
+                  </button>
+                </div>
+                {bannerPeople.isLoading ? (
+                  <div className="space-y-2">
+                    <Skeleton className="h-9" />
+                    <Skeleton className="h-9" />
+                    <Skeleton className="h-9" />
+                  </div>
+                ) : (
+                  <div className="max-h-64 space-y-1.5 overflow-y-auto pe-1">
+                    {(bannerPeople.data?.rows || []).map((row) => (
+                      <Checkbox
+                        key={row.id}
+                        checked={(banner.userIds || []).includes(Number(row.id))}
+                        onChange={() => toggleBannerUser(row.id)}
+                        label={`${row.username}${row.name ? ` · ${row.name}` : ''}`}
+                        className="rounded-lg border border-white/[0.05] bg-white/[0.02] px-3 py-2"
+                      />
+                    ))}
+                    {!(bannerPeople.data?.rows || []).length ? (
+                      <p className="text-[11px] text-slate-500">{t('settings.banner.noResellers')}</p>
+                    ) : null}
+                  </div>
+                )}
+                {bannerAudience?.rows?.length ? (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/[0.06] pt-3">
+                    <span className="text-[10.5px] text-slate-500">{t('settings.banner.savedAudience')}</span>
+                    {bannerAudience.rows.map((row) => (
+                      <Badge key={row.id} tone={row.gone ? 'rose' : 'slate'}>
+                        {row.username || `#${row.id}`}
+                        {row.gone ? ` · ${t('settings.banner.gone')}` : ''}
+                      </Badge>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label={t('settings.banner.startsAt')} hint={t('settings.banner.windowHint')}>
+                <Input
+                  dir="ltr"
+                  type="datetime-local"
+                  value={windowInput(banner.startsAt)}
+                  onChange={(e) => patchBannerWindow('startsAt', e.target.value)}
+                />
+              </Field>
+              <Field label={t('settings.banner.endsAt')}>
+                <Input
+                  dir="ltr"
+                  type="datetime-local"
+                  value={windowInput(banner.endsAt)}
+                  onChange={(e) => patchBannerWindow('endsAt', e.target.value)}
+                />
+              </Field>
+            </div>
+            <div className="flex items-center gap-2">
+              <CalendarClock className="h-3.5 w-3.5 text-slate-500" />
+              <span className="text-[10.5px] text-slate-500">{t(`settings.banner.state.${bannerState}`)}</span>
+            </div>
+
+            <SaveBar
+              saving={savingSection === 'banner'}
+              onSave={() => save.mutate({ section: 'banner', payload: banner })}
             />
           </div>
         </SectionCard>

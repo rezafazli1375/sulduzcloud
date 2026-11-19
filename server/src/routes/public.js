@@ -14,6 +14,8 @@ const payment = require('../services/payment');
 const xui = require('../xui');
 const notify = require('../notify');
 const monitor = require('../services/monitor');
+const banner = require('../services/banner');
+const activation = require('../activation');
 const { ApiError, asyncH, sanitizeUser } = require('../utils');
 const { audit } = require('../audit');
 
@@ -27,6 +29,16 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: { code: 'rate_limited', message: 'Too many attempts, try again later' } },
+});
+
+// Key guessing gets its own, much tighter, budget than login: there are five real
+// answers, so a few hundred tries an hour changes the odds for nobody.
+const activationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: { code: 'rate_limited', message: 'Too many attempts, try again in an hour' } },
 });
 
 function usersCount() {
@@ -44,6 +56,45 @@ router.get('/meta', (req, res) => {
 
 router.get('/setup/status', (req, res) => {
   res.json({ ok: true, data: { setupRequired: usersCount() === 0 } });
+});
+
+// ------------------------------------------------ v2.1.0: activation gate
+//
+// The owner's condition for letting a stranger run this panel: the install shows
+// one MALE key and stays locked until the matching FEMALE half is typed. This is
+// the only way in — src/index.js answers 423 for every other API call while the
+// gate is up, and `/meta`, `/health` and `/activation` itself stay open so the
+// screen that asks can be drawn.
+//
+// Only the male id and the hash of the female half are in the shipped code
+// (src/activation.js); the keys themselves are the owner's, which is why an
+// install cannot be unlocked by reading the repository.
+
+router.get('/activation', (req, res) => {
+  res.json({ ok: true, data: activation.status() });
+});
+
+router.post('/activation', activationLimiter, asyncH(async (req, res) => {
+  const key = String((req.body || {}).key || '').trim();
+  if (!key) throw new ApiError(422, 'key_required', 'کلید فعال‌سازی را وارد کنید / enter the activation key');
+  const result = activation.activate(key, { source: 'web' });
+  if (!result.ok) {
+    audit({ ...req, user: null }, 'activation.failed', 'activation', result.male, {});
+    throw new ApiError(403, 'activation_invalid', 'این کلید با کلید نر این نصب سازگار نیست / this key does not match the male key of this install');
+  }
+  audit({ ...req, user: null }, 'activation.success', 'activation', result.male, {});
+  res.json({ ok: true, data: { ...activation.status(), unlocked: true } });
+}));
+
+// ------------------------------------------------ v2.1.0: the owner's banner
+//
+// One small read: the shell asks it on load and every minute, because a message
+// about an outage that only appears after a refresh is a message nobody gets.
+// null means "show nothing" — switched off, no text, outside its window, or this
+// account is not one of the ones the owner picked.
+
+router.get('/banner', auth.requireAuth, (req, res) => {
+  res.json({ ok: true, data: banner.forUser(req.user, settings.getSetting('banner')) });
 });
 
 router.post('/setup', asyncH(async (req, res) => {

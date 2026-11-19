@@ -491,6 +491,23 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+/**
+ * The comment x-ui shows for a client (v1.5.5).
+ *
+ * «برچسب — the name the reseller gives a subscription — leads it, followed by who
+ * the customer is and how to reach him.» It lives here rather than in
+ * services/configs.js because the trash restore (v2.1.0) writes the same client
+ * from a different module, and one sentence written two ways is how a node ends
+ * up disagreeing with the panel that owns it. 120 characters is x-ui's own limit.
+ */
+function clientComment({ label, customerName, customerPhone } = {}) {
+  return [label, customerName, customerPhone]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .join(' | ')
+    .slice(0, 120);
+}
+
 function log(...args) {
   const ts = new Date().toISOString();
   console.log(`[${ts}]`, ...args);
@@ -536,6 +553,7 @@ module.exports = {
   timingSafeEqual,
   asyncH,
   clamp,
+  clientComment,
   log,
   logError,
 };

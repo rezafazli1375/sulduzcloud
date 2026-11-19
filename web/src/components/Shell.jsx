@@ -3,8 +3,10 @@ import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-do
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Activity,
+  AlertTriangle,
   Bell,
   Boxes,
+  CheckCircle2,
   ChevronDown,
   CreditCard,
   DatabaseBackup,
@@ -26,6 +28,7 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Trash2,
   Users,
   Wallet,
   X,
@@ -64,6 +67,9 @@ const ADMIN_GROUPS = [
       { to: '/tickets', label: 'nav.tickets', icon: MessageSquare, perm: 'tickets' },
       { to: '/topups', label: 'nav.topups', icon: Receipt, perm: 'users' },
       { to: '/node-search', label: 'nav.nodeSearch', icon: Search, perm: 'configs' },
+      // v2.1.0: «زباله‌دان» — every package deleted outright lands here with the
+      // email, uuid and subscribe token it had, and can be rebuilt from that.
+      { to: '/trash', label: 'nav.trash', icon: Trash2, perm: 'configs' },
       { to: '/broadcasts', label: 'nav.broadcasts', icon: Sparkles, perm: 'broadcasts' },
     ],
   },
@@ -564,6 +570,65 @@ function SidebarFooter() {
   );
 }
 
+/**
+ * v2.1.0 — «نوار اطلاع‌رسانی», the owner's banner.
+ *
+ * His ask: in an emergency — a node down, the internet cut — a line of his own
+ * words appears above every page of the reseller panel, in green or in red, for
+ * everyone or only for the resellers he picked. The example he gave was an offer
+ * («تخفیف ویژه برای حساب کاربری شما اعمال شد»), so this is a notice, not an alarm.
+ *
+ * The whole decision of who sees what lives in services/banner.js; this component
+ * only asks GET /api/banner, which answers `null` when there is nothing to show —
+ * switched off, no text, outside its window, or this account is not one of the
+ * ones he picked. That is why there is no logic here beyond rendering: the server
+ * already said whether THIS account should see it.
+ *
+ * Refetched every minute on purpose («در شرایط بحرانی»). A notice that only
+ * appears after the reseller reloads the page is a notice nobody gets during an
+ * outage, and one small GET a minute per open panel is what makes it arrive.
+ */
+function BroadcastBanner() {
+  const { t } = useI18n();
+  const [dismissed, setDismissed] = useState('');
+
+  const banner = useQuery({
+    queryKey: ['banner'],
+    queryFn: () => api.get('/banner'),
+    refetchInterval: 60000,
+    retry: false,
+  });
+
+  const data = banner.data;
+  // A new message is a new message: an earlier dismissal must not hide it.
+  if (!data?.text || dismissed === data.text) return null;
+
+  const red = data.tone === 'red';
+  return (
+    <div
+      role="status"
+      dir="rtl"
+      className={
+        red
+          ? 'flex items-center gap-3 border-b border-rose-400/30 bg-rose-600/90 px-4 py-2.5 text-[12.5px] font-medium text-white sm:px-6'
+          : 'flex items-center gap-3 border-b border-emerald-400/30 bg-emerald-600/90 px-4 py-2.5 text-[12.5px] font-medium text-white sm:px-6'
+      }
+    >
+      {red ? <AlertTriangle className="h-4 w-4 shrink-0" /> : <CheckCircle2 className="h-4 w-4 shrink-0" />}
+      <p className="min-w-0 flex-1 leading-6">{data.text}</p>
+      <button
+        type="button"
+        onClick={() => setDismissed(data.text)}
+        aria-label={t('banner.dismiss')}
+        title={t('banner.dismiss')}
+        className="shrink-0 rounded-lg p-1 text-white/80 transition hover:bg-white/15 hover:text-white"
+      >
+        <X className="h-4 w-4" />
+      </button>
+    </div>
+  );
+}
+
 export default function Shell() {
   const { user, isAdmin, can } = useAuth();
   const { t, lang } = useI18n();
@@ -710,6 +775,13 @@ export default function Shell() {
             <UserMenu />
           </div>
         </header>
+
+        {/*
+          v2.1.0: the owner's broadcast. It sits between the header and the page so
+          it is the first thing the reseller sees, and it is OUTSIDE <main>, which
+          means an admin page that scrolls cannot push it away.
+        */}
+        <BroadcastBanner />
 
         <main className="mx-auto w-full max-w-[1500px] flex-1 px-4 py-6 sm:px-6 lg:px-8">
           <Outlet />

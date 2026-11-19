@@ -169,6 +169,56 @@ CREATE INDEX IF NOT EXISTS idx_configs_sub ON configs(sub_id);
 -- FIRST inbound of such a client and silently drop the rest.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_configs_email_inbound ON configs(email, inbound_id);
 
+-- Panel v2.1.0 — the admin Trash. Every package this panel deletes leaves ONE
+-- snapshot row here, whether the rows were only hidden (deleted_at) or actually
+-- erased (a hard delete). It carries exactly what the owner asked to keep so the
+-- same customer can be rebuilt later: the email, the uuid, the subscription
+-- token, the inbounds he stood on, and how much time and volume he had LEFT at
+-- the moment he went. rows_json holds every member row verbatim, so a restore
+-- writes the identical client back instead of a near-copy.
+CREATE TABLE IF NOT EXISTS config_trash (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL DEFAULT 0,
+  server_id INTEGER NOT NULL DEFAULT 1,
+  head_config_id INTEGER NOT NULL DEFAULT 0,
+  email TEXT NOT NULL DEFAULT '',
+  sub_id TEXT NOT NULL DEFAULT '',
+  uuid TEXT NOT NULL DEFAULT '',
+  label TEXT NOT NULL DEFAULT '',
+  customer_name TEXT NOT NULL DEFAULT '',
+  customer_phone TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  origin TEXT NOT NULL DEFAULT 'panel',
+  total_bytes INTEGER NOT NULL DEFAULT 0,
+  used_bytes INTEGER NOT NULL DEFAULT 0,
+  expiry_at INTEGER NOT NULL DEFAULT 0,
+  left_bytes INTEGER NOT NULL DEFAULT 0,
+  left_days INTEGER NOT NULL DEFAULT 0,
+  inbound_ids TEXT NOT NULL DEFAULT '[]',
+  rows_json TEXT NOT NULL DEFAULT '[]',
+  mode TEXT NOT NULL DEFAULT 'soft',
+  reason TEXT NOT NULL DEFAULT '',
+  deleted_by TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  restored_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_trash_created ON config_trash(created_at);
+CREATE INDEX IF NOT EXISTS idx_trash_user ON config_trash(user_id, restored_at);
+
+-- Panel v2.1.0 — the activation record. One row, id 1: the MALE key this install
+-- answers with, the short fingerprint of the FEMALE half that unlocked it (for
+-- display only — the pair itself lives in src/activation.js as a hash), when it
+-- unlocked, and how often it was guessed at. See src/activation.js.
+CREATE TABLE IF NOT EXISTS activation (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  male_key TEXT NOT NULL DEFAULT '',
+  fingerprint TEXT NOT NULL DEFAULT '',
+  activated_at INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT '',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS usage_daily (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   config_id INTEGER NOT NULL,
