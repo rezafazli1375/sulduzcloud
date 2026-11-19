@@ -5,7 +5,10 @@ const path = require('path');
 const { getSetting } = require('../settings');
 const { ApiError } = require('../utils');
 
-const API_BASE = 'https://api.telegram.org';
+// The public Bot API. The env override exists for the offline UI harness, which
+// points a throwaway instance at a local mock instead of api.telegram.org;
+// production never sets it.
+const API_BASE = process.env.TELEGRAM_API_BASE || 'https://api.telegram.org';
 
 function config() {
   const cfg = getSetting('telegram');
@@ -124,6 +127,42 @@ async function sendDocument(filePath, caption) {
 }
 
 /**
+ * v2.0.0: one photo + caption to one specific chat — the reseller's own numeric
+ * Telegram id. This is how «ارسال به تلگرام من» delivers the subscription QR and
+ * its link as a single forwardable message. Multipart, like sendDocument, because
+ * the PNG is built in memory (services/qrcode.js) and never touches the disk.
+ */
+async function sendPhotoTo(chatId, buffer, filename, caption) {
+  const cfg = config();
+  if (!cfg.botToken) throw new ApiError(422, 'telegram_not_configured', 'توکن ربات تلگرام تنظیم نشده است');
+  const target = String(chatId || '').trim();
+  if (!/^-?\d{4,20}$/.test(target)) throw new ApiError(422, 'telegram_chat_id', 'آیدی عددی تلگرام معتبر نیست');
+  const form = new FormData();
+  form.append('chat_id', target);
+  if (caption) {
+    form.append('caption', String(caption).slice(0, 1024));
+    form.append('parse_mode', 'HTML');
+  }
+  form.append('photo', new Blob([buffer], { type: 'image/png' }), filename || 'subscription.png');
+  const res = await fetch(`${API_BASE}/bot${cfg.botToken}/sendPhoto`, {
+    method: 'POST',
+    body: form,
+    signal: AbortSignal.timeout(60000),
+  });
+  let body = null;
+  try {
+    body = await res.json();
+  } catch (_) {
+    body = null;
+  }
+  if (!res.ok || !body?.ok) {
+    const detail = body?.description || `HTTP ${res.status}`;
+    throw new ApiError(502, 'telegram_error', `Telegram: ${detail}`);
+  }
+  return body.result;
+}
+
+/**
  * v1.5.2: fetch a receipt the bot was sent, so the admin can look at it inside
  * the panel too and not only in Telegram. The bot token never leaves this
  * function — the caller gets bytes and a mime type, and the file_id is always
@@ -190,4 +229,4 @@ async function sendBackup(filePath, name, reason = 'auto') {
   return { sent: true, name };
 }
 
-module.exports = { config, botConfig, ready, call, sendMessage, sendMessageTo, sendDocument, fetchFile, test, sendBackup };
+module.exports = { config, botConfig, ready, call, sendMessage, sendMessageTo, sendPhotoTo, sendDocument, fetchFile, test, sendBackup };

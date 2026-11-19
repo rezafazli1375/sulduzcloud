@@ -107,7 +107,7 @@ function startMockXui(inboundRows) {
   // to notice that from the re-read and attach the leftovers through bulkAttach —
   // it must never paper over a missing channel by writing a row the node does not
   // serve, and never by creating a second client for the same customer.
-  const quirks = { addKeepsOnlyFirst: false, failGet: new Set() };
+  const quirks = { addKeepsOnlyFirst: false, failGet: new Set(), failDel: new Set() };
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (chunk) => { raw += chunk; });
@@ -219,6 +219,9 @@ function startMockXui(inboundRows) {
           // to answer `true`, which is exactly why the panel's "cannot delete a
           // subscription that is not on the node" bug survived every earlier run.
           const email = emailOf('/clients/del/');
+          // v2.0.0: a node that refuses the delete itself (locked DB, timeout…)
+          // — the cleanup sweep must keep the package when this happens.
+          if (quirks.failDel.has(email)) return failMsg('database is locked');
           if (!clients.has(email)) return failMsg('Obtain (record not found)');
           clients.delete(email);
           return send(true);
@@ -5219,7 +5222,7 @@ function startMockXui(inboundRows) {
             && onNode25(pkgEmail25) === LINE25('برچسب نماینده'),
           `status=${newOwnerRename25.status} node="${onNode25(pkgEmail25)}"`);
         const wireVersion25 = (await request('GET', '/api/health')).json?.version;
-        check('this build is v1.5.8 on the wire too', wireVersion25 === '1.5.8', `version=${wireVersion25}`);
+        check('this build is v2.0.0 on the wire too', wireVersion25 === '2.0.0', `version=${wireVersion25}`);
       } finally {
         if (lifted25) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit25 } });
         tdb.close();
@@ -5858,6 +5861,384 @@ function startMockXui(inboundRows) {
         if (parked28) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
         for (const email of speedEmails28) mockXui.clients.delete(email);
         mockXui.clients.delete('v158plain-one');
+        bdb.close();
+      }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════ v2.0.0
+    //
+    // Three new areas, one block:
+    //   ۱) «جستجوی پیشرفتهٔ کانفینگ» — field / status / ownership / inbound /
+    //      quota / expiring filters plus sorting, filter-only search, and an
+    //      honest matched/truncated count.
+    //   ۲) «حذف زمان‌بندی‌شدهٔ اشتراک‌های تمام‌شده» — grace windows, the depleted
+    //      stamp, a top-up keeping the subscription, adopted clients staying on
+    //      the other panel, a refusing node keeping its package, the cap.
+    //   ۳) «ارسال کانفینگ به تلگرام خود نماینده» — the HTTP guards. The full
+    //      send, the caption and the QR round-trip live in test/send-config.js.
+    //
+    // The 60s timer only ticks when settings.cleanup.enabled is true. This block
+    // keeps that switch FALSE and drives every sweep through POST /cleanup/run
+    // (runCleanup itself does not read `enabled`), so no background tick can
+    // race the assertions.
+    {
+      const bdb = new Database(path.join(DATA_DIR, 'panel.db'));
+      const P20 = 'Cleanup-Pass-12345';
+      const DAY20 = 86400000;
+      const NOW20 = Date.now();
+      const code20 = (res) => String(res.json?.error?.code || '');
+      const mkUser20 = async (username, extra = {}) => {
+        const created = await request('POST', '/api/admin/users', {
+          cookies, csrf, body: { username, password: P20, role: 'reseller', balance: 0, max_configs: 100, ...extra },
+        });
+        return { id: Number(created.json?.data?.user?.id || 0), status: created.status };
+      };
+      const login20 = async (username) => {
+        const res = await request('POST', '/api/auth/login', { body: { username, password: P20 } });
+        return { status: res.status, cookies: cookiesFrom(res.headers), csrf: res.json?.data?.csrf };
+      };
+      const build20 = async (userId, name) => {
+        const res = await request('POST', '/api/admin/configs', {
+          cookies, csrf,
+          body: { userId, inboundIds: [901, 902], gb: 5, days: 30, label: name, customerName: name },
+        });
+        const rows = res.json?.data?.configs || [];
+        return { status: res.status, id: Number(rows[0]?.id || 0), email: String(rows[0]?.email || '') };
+      };
+      const rowsOf20 = (email) => bdb.prepare('SELECT * FROM configs WHERE email = ? ORDER BY id').all(String(email));
+      const alive20 = (email) => rowsOf20(email).filter((row) => !row.deleted_at).length;
+      const setExpiry20 = (email, ms) => bdb.prepare('UPDATE configs SET expiry_at = ? WHERE email = ?').run(Number(ms), String(email));
+      const setUsed20 = (email, bytes) => bdb.prepare('UPDATE configs SET up_bytes = ? WHERE email = ?').run(Number(bytes), String(email));
+      const cleanupPatch = (body) => request('PATCH', '/api/admin/settings/cleanup', { cookies, csrf, body });
+      const preview20 = () => request('GET', '/api/admin/cleanup/preview', { cookies });
+      const run20 = () => request('POST', '/api/admin/cleanup/run', { cookies, csrf });
+      const resultOf20 = (summary, email) => (summary?.results || []).find((row) => row.email === email);
+      const search20 = (params) => request('GET', `/api/admin/node-clients?serverId=${primaryId}&${params}`, { cookies });
+      const WRITE20 = /\/clients\/(add|update\/|del\/|bulkAttach|bulkEnable|bulkDisable|bulkAdjust|resetTraffic\/)|\/detach$/;
+      const seedEmails20 = [];
+      const seed20 = (email, opts = {}) => {
+        mockXui.clients.set(email, {
+          email, id: `uuid-${email}`, uuid: String(opts.uuid || ''), subId: `sub-${email}`,
+          comment: String(opts.comment || ''), totalGB: opts.totalGB ?? 10 * 1024 ** 3,
+          expiryTime: opts.expiryTime ?? NOW20 + 30 * DAY20, enable: opts.enable !== false,
+          up: Number(opts.up || 0), down: Number(opts.down || 0), inboundIds: opts.inboundIds || [901],
+        });
+        seedEmails20.push(email);
+        return email;
+      };
+      let limit20 = 10;
+      let lifted20 = false;
+      let tgWas20 = null;
+      try {
+        const secRead20 = await request('GET', '/api/admin/settings', { cookies });
+        limit20 = Number(secRead20.json?.data?.settings?.security?.loginRateLimit || 10);
+        lifted20 = (await request('PATCH', '/api/admin/settings/security', {
+          cookies, csrf, body: { loginRateLimit: 100 },
+        })).status === 200;
+
+        const shop20 = await mkUser20('v200shop', { balance: 1000000 });
+        const stranger20 = await mkUser20('v200stranger');
+        const admin20 = await mkUser20('v200admin', { role: 'admin' });
+        const shopSess20 = await login20('v200shop');
+        const strangerSess20 = await login20('v200stranger');
+        const adminSess20 = await login20('v200admin');
+
+        // ───────────────────────────── ۱) the advanced search, on seeded clients
+        const uuidActive20 = 'f47ac10b-58cc-4372-a567-0e02b2c3d200';
+        seed20('v200s-active', { comment: 'مشتری فعال', inboundIds: [901, 902], uuid: uuidActive20, up: 1024 ** 3, down: 1024 ** 3 });
+        seed20('v200s-expired', { expiryTime: NOW20 - DAY20 });
+        seed20('v200s-depleted', { inboundIds: [902], up: 6 * 1024 ** 3, down: 4 * 1024 ** 3 });
+        seed20('v200s-disabled', { enable: false });
+        seed20('v200s-unlimited', { inboundIds: [901, 902], totalGB: 0, expiryTime: 0 });
+        seed20('v200s-soon', { inboundIds: [902], expiryTime: NOW20 + 2 * DAY20 });
+        seed20('zzz-other-200', { comment: 'v200needle برچسب' });
+        // Adopted + long expired: the sweep's external-row fixture. Its email is
+        // outside the v200s prefix so the search counts below stay exact.
+        seed20('v200ext-old', { expiryTime: NOW20 - 30 * DAY20 });
+        const adoptA20 = await request('POST', '/api/admin/configs/adopt', {
+          cookies, csrf, body: { email: 'v200s-active', userId: shop20.id, serverId: primaryId },
+        });
+        const adoptE20 = await request('POST', '/api/admin/configs/adopt', {
+          cookies, csrf, body: { email: 'v200ext-old', userId: shop20.id, serverId: primaryId },
+        });
+        check('both fixtures adopt cleanly before the search runs',
+          adoptA20.status === 201 && adoptE20.status === 201, `a=${adoptA20.status} e=${adoptE20.status}`);
+
+        const mark20 = mockXui.calls.length;
+        const byEmail20 = await search20('q=v200s&field=email');
+        check('the field selector narrows the text to the email alone',
+          byEmail20.status === 200 && (byEmail20.json?.data?.rows || []).length === 6
+            && byEmail20.json.data.rows.every((row) => row.email.startsWith('v200s-')),
+          `rows=${(byEmail20.json?.data?.rows || []).length}`);
+        const byRemark20 = await search20('q=v200needle&field=remark');
+        const byEmailNeedle20 = await search20('q=v200needle&field=email');
+        check('a remark-only needle finds the labelled client — and the email field does not',
+          byRemark20.status === 200 && (byRemark20.json?.data?.rows || []).length === 1
+            && byRemark20.json.data.rows[0].email === 'zzz-other-200'
+            && byEmailNeedle20.status === 200 && (byEmailNeedle20.json?.data?.rows || []).length === 0,
+          `remark=${(byRemark20.json?.data?.rows || []).length} email=${(byEmailNeedle20.json?.data?.rows || []).length}`);
+        const byUuid20 = await search20(`q=${uuidActive20}&field=uuid`);
+        const bySub20 = await search20('q=sub-v200s-expired&field=subid');
+        check('uuid and subscription-id each have their own field',
+          byUuid20.status === 200 && (byUuid20.json?.data?.rows || []).length === 1
+            && byUuid20.json.data.rows[0].email === 'v200s-active'
+            && bySub20.status === 200 && (bySub20.json?.data?.rows || []).length === 1
+            && bySub20.json.data.rows[0].email === 'v200s-expired',
+          `uuid=${(byUuid20.json?.data?.rows || []).length} sub=${(bySub20.json?.data?.rows || []).length}`);
+        const stExp20 = await search20('q=v200s&status=expired');
+        const stDep20 = await search20('q=v200s&status=depleted');
+        const stDis20 = await search20('q=v200s&status=disabled');
+        const stAct20 = await search20('q=v200s&status=active');
+        check('the status filter splits the six exactly: 1 expired, 1 depleted, 1 disabled, 3 active',
+          (stExp20.json?.data?.rows || []).length === 1 && stExp20.json.data.rows[0].email === 'v200s-expired'
+            && (stDep20.json?.data?.rows || []).length === 1 && stDep20.json.data.rows[0].email === 'v200s-depleted'
+            && (stDis20.json?.data?.rows || []).length === 1 && stDis20.json.data.rows[0].email === 'v200s-disabled'
+            && (stAct20.json?.data?.rows || []).length === 3,
+          `exp=${(stExp20.json?.data?.rows || []).length} dep=${(stDep20.json?.data?.rows || []).length} dis=${(stDis20.json?.data?.rows || []).length} act=${(stAct20.json?.data?.rows || []).length}`);
+        const filterOnly20 = await search20('q=&status=depleted');
+        const foRows20 = filterOnly20.json?.data?.rows || [];
+        check('«همهٔ تمام‌شده‌های این نود» — a filter alone is a legitimate search',
+          filterOnly20.status === 200 && foRows20.length >= 1
+            && foRows20.every((row) => row.status === 'depleted')
+            && foRows20.some((row) => row.email === 'v200s-depleted'),
+          `status=${filterOnly20.status} rows=${foRows20.length}`);
+        const oneChar20 = await search20('q=a&status=expired');
+        const noQuery20 = await search20('q=');
+        check('one character is still too short even with a filter, and nothing at all is refused',
+          oneChar20.status === 422 && code20(oneChar20) === 'query_too_short'
+            && noQuery20.status === 422 && code20(noQuery20) === 'query_too_short',
+          `one=${oneChar20.status} none=${noQuery20.status}`);
+        const quotaUn20 = await search20('q=v200s&quota=unlimited');
+        const quotaLi20 = await search20('q=v200s&quota=limited');
+        check('the quota filter separates the unlimited client from the five limited ones',
+          (quotaUn20.json?.data?.rows || []).length === 1 && quotaUn20.json.data.rows[0].email === 'v200s-unlimited'
+            && (quotaLi20.json?.data?.rows || []).length === 5,
+          `un=${(quotaUn20.json?.data?.rows || []).length} li=${(quotaLi20.json?.data?.rows || []).length}`);
+        const soon20 = await search20('q=v200s&expiringDays=5');
+        check('«تا ۵ روز دیگر منقضی می‌شوند» finds exactly the one expiring soon',
+          soon20.status === 200 && (soon20.json?.data?.rows || []).length === 1
+            && soon20.json.data.rows[0].email === 'v200s-soon',
+          `rows=${(soon20.json?.data?.rows || []).length}`);
+        const inb902id20 = Number(bdb.prepare('SELECT id FROM inbounds WHERE server_id = ? AND xui_id = 902').get(primaryId)?.id || 0);
+        const byInb20 = await search20(`q=v200s&inboundId=${inb902id20}`);
+        check('the inbound filter keeps only the clients attached to that channel',
+          inb902id20 > 0 && (byInb20.json?.data?.rows || []).length === 4
+            && byInb20.json.data.rows.every((row) => (row.inboundIds || []).includes(902)),
+          `inb=${inb902id20} rows=${(byInb20.json?.data?.rows || []).length}`);
+        const ownAd20 = await search20('q=v200s&ownership=adopted');
+        const ownFr20 = await search20('q=v200s&ownership=free');
+        check('ownership tells the adopted client apart from the five free ones',
+          (ownAd20.json?.data?.rows || []).length === 1 && ownAd20.json.data.rows[0].email === 'v200s-active'
+            && ownAd20.json.data.rows[0].adopted === true && (ownFr20.json?.data?.rows || []).length === 5,
+          `adopted=${(ownAd20.json?.data?.rows || []).length} free=${(ownFr20.json?.data?.rows || []).length}`);
+        const sortUsed20 = await search20('q=v200s&sortBy=used&sortDir=desc');
+        const suRows20 = sortUsed20.json?.data?.rows || [];
+        check('sorting by usage puts the drained client first and never rises afterwards',
+          suRows20.length === 6 && suRows20[0].email === 'v200s-depleted'
+            && suRows20.every((row, i) => i === 0 || Number(suRows20[i - 1].used) >= Number(row.used)),
+          `first=${suRows20[0]?.email}`);
+        const capped20 = await search20('q=v200s&sortBy=email&limit=2');
+        check('a small limit cuts the page but reports the whole match honestly',
+          capped20.status === 200 && (capped20.json?.data?.rows || []).length === 2
+            && capped20.json.data.matched === 6 && capped20.json.data.truncated === true,
+          `rows=${(capped20.json?.data?.rows || []).length} matched=${capped20.json?.data?.matched}`);
+        const bogus20 = await search20('q=v200s&status=bogus');
+        check('an unknown enum value degrades to «no filter», not an error',
+          bogus20.status === 200 && bogus20.json?.data?.filters?.status === ''
+            && (bogus20.json?.data?.rows || []).length === 6,
+          `status=${bogus20.status} filters.status=${bogus20.json?.data?.filters?.status}`);
+        check('the whole advanced search stayed a read: not one write reached the node',
+          mockXui.calls.slice(mark20).filter((call) => WRITE20.test(call.route)).length === 0,
+          `writes=${mockXui.calls.slice(mark20).filter((call) => WRITE20.test(call.route)).map((call) => call.route).join(',') || 'none'}`);
+
+        // ───────────────────────────── ۲) the scheduled sweep
+        const cols20 = bdb.prepare('PRAGMA table_info(configs)').all().map((row) => row.name);
+        const settingsCount20 = Number(bdb.prepare('SELECT COUNT(*) AS c FROM settings').get().c);
+        const setRead20 = await request('GET', '/api/admin/settings', { cookies });
+        const cleanupCfg20 = setRead20.json?.data?.settings?.cleanup || {};
+        check('the fresh schema carries the sweep: configs.depleted_at and the eleventh settings row, born off',
+          cols20.includes('depleted_at') && settingsCount20 === 11
+            && cleanupCfg20.enabled === false && Number(cleanupCfg20.graceDays) === 7,
+          `depleted_at=${cols20.includes('depleted_at')} settings=${settingsCount20} enabled=${cleanupCfg20.enabled}`);
+        const deadSwitch20 = await cleanupPatch({ enabled: true, expired: false, depleted: false });
+        check('a schedule switched on with both states off is refused',
+          deadSwitch20.status === 422 && code20(deadSwitch20) === 'cleanup_nothing_selected',
+          `status=${deadSwitch20.status} code=${code20(deadSwitch20)}`);
+        const clamp20 = await cleanupPatch({ graceDays: 9999, intervalHours: 9999, maxPerRun: 99999 });
+        check('greedy numbers are clamped, not accepted',
+          clamp20.status === 200 && Number(clamp20.json?.data?.saved?.graceDays) === 365
+            && Number(clamp20.json?.data?.saved?.intervalHours) === 168
+            && Number(clamp20.json?.data?.saved?.maxPerRun) === 500,
+          `grace=${clamp20.json?.data?.saved?.graceDays} interval=${clamp20.json?.data?.saved?.intervalHours} max=${clamp20.json?.data?.saved?.maxPerRun}`);
+        await cleanupPatch({ graceDays: 7, intervalHours: 6, maxPerRun: 50 });
+        const fakeRun20 = await cleanupPatch({ lastRunAt: 5, lastSummary: 'fake' });
+        const afterFake20 = (await request('GET', '/api/admin/settings', { cookies })).json?.data?.settings?.cleanup || {};
+        check('the form cannot fake the last-run bookkeeping',
+          fakeRun20.status === 200 && Number(afterFake20.lastRunAt || 0) === 0 && String(afterFake20.lastSummary || '') === '',
+          `lastRunAt=${afterFake20.lastRunAt} lastSummary=${afterFake20.lastSummary}`);
+        const resPreview20 = await request('GET', '/api/admin/cleanup/preview', { cookies: shopSess20.cookies });
+        const resRun20 = await request('POST', '/api/admin/cleanup/run', { cookies: shopSess20.cookies, csrf: shopSess20.csrf });
+        check('the sweep is the admin\'s: a reseller gets 403 on both preview and run',
+          resPreview20.status === 403 && resRun20.status === 403, `preview=${resPreview20.status} run=${resRun20.status}`);
+        const on20 = await cleanupPatch({ enabled: true });
+        const off20 = await cleanupPatch({ enabled: false });
+        check('the master switch turns on and off cleanly',
+          on20.status === 200 && on20.json?.data?.saved?.enabled === true
+            && off20.status === 200 && off20.json?.data?.saved?.enabled === false,
+          `on=${on20.status} off=${off20.status}`);
+
+        // Five packages for shop20, each in a different state. The sweep reads
+        // the panel's own rows (packageStatusSql), so the DB edits below are the
+        // fixture — the node keeps serving every client until a delete lands.
+        const expiredOld20 = await build20(shop20.id, 'منقضی قدیمی');
+        const expiredFresh20 = await build20(shop20.id, 'منقضی تازه');
+        const depletedPkg20 = await build20(shop20.id, 'تمام‌شده');
+        const activePkg20 = await build20(shop20.id, 'سالم');
+        const toppedUp20 = await build20(shop20.id, 'شارژ شده');
+        setExpiry20(expiredOld20.email, NOW20 - 20 * DAY20);
+        setExpiry20(expiredFresh20.email, NOW20 - 2 * DAY20);
+        setUsed20(depletedPkg20.email, 5 * 1024 ** 3);
+        setUsed20(toppedUp20.email, 5 * 1024 ** 3);
+        bdb.prepare('UPDATE configs SET depleted_at = ? WHERE email = ?').run(NOW20 - 10 * DAY20, toppedUp20.email);
+        bdb.prepare('UPDATE configs SET total_bytes = ? WHERE email = ?').run(10 * 1024 ** 3, toppedUp20.email);
+        await cleanupPatch({ expired: true, depleted: true, graceDays: 7, maxPerRun: 500, includeExternal: false, notifyReseller: false });
+
+        const delCallsBefore20 = mockXui.calls.filter((call) => call.route.startsWith('/clients/del/')).length;
+        const pv20 = await preview20();
+        const pd20 = pv20.json?.data || {};
+        const pvOld20 = resultOf20(pd20, expiredOld20.email);
+        const pvDep20 = resultOf20(pd20, depletedPkg20.email);
+        check('the preview says exactly what would happen: the old expired goes, the full one gets its stamp',
+          pv20.status === 200 && pd20.dryRun === true
+            && pvOld20?.action === 'would_delete' && pvOld20?.reason === 'expired_grace'
+            && pvDep20?.action === 'would_stamp'
+            && !resultOf20(pd20, expiredFresh20.email) && !resultOf20(pd20, activePkg20.email),
+          `old=${pvOld20?.action} dep=${pvDep20?.action}`);
+        check('the preview wrote nothing: rows alive, no stamp, no delete on the node',
+          alive20(expiredOld20.email) === 2 && alive20(depletedPkg20.email) === 2
+            && rowsOf20(depletedPkg20.email).every((row) => Number(row.depleted_at) === 0)
+            && mockXui.calls.filter((call) => call.route.startsWith('/clients/del/')).length === delCallsBefore20,
+          `oldAlive=${alive20(expiredOld20.email)} depAlive=${alive20(depletedPkg20.email)}`);
+        const r120 = await run20();
+        const rd120 = r120.json?.data || {};
+        check('the first sweep deletes the long-expired and stamps the newly-full, nothing else',
+          r120.status === 200 && resultOf20(rd120, expiredOld20.email)?.action === 'deleted'
+            && resultOf20(rd120, depletedPkg20.email)?.action === 'stamped'
+            && alive20(expiredOld20.email) === 0 && alive20(expiredFresh20.email) === 2 && alive20(activePkg20.email) === 2
+            && rowsOf20(depletedPkg20.email).every((row) => Number(row.depleted_at) > 0),
+          `old=${resultOf20(rd120, expiredOld20.email)?.action} dep=${resultOf20(rd120, depletedPkg20.email)?.action}`);
+        check('a topped-up customer keeps his subscription and loses the old stamp',
+          alive20(toppedUp20.email) === 2 && rowsOf20(toppedUp20.email).every((row) => Number(row.depleted_at) === 0),
+          `alive=${alive20(toppedUp20.email)} stamp=${rowsOf20(toppedUp20.email)[0]?.depleted_at}`);
+        const auditDel20 = bdb.prepare("SELECT details FROM audit_logs WHERE action = 'config.auto_delete' ORDER BY id DESC").all().map((row) => String(row.details));
+        const auditRun20 = Number(bdb.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'cleanup.run'").get().c);
+        check('the sweep leaves its trail: an auto-delete audit naming the customer and the reason, plus a run audit',
+          auditDel20.some((details) => details.includes(expiredOld20.email) && details.includes('expired_grace')) && auditRun20 >= 1,
+          `autoDeletes=${auditDel20.length} runs=${auditRun20}`);
+        const afterRun20 = (await request('GET', '/api/admin/settings', { cookies })).json?.data?.settings?.cleanup || {};
+        let sumParsed20 = null;
+        try { sumParsed20 = JSON.parse(String(afterRun20.lastSummary || '')); } catch (_) { sumParsed20 = null; }
+        check('the settings row remembers the last run',
+          Number(afterRun20.lastRunAt || 0) > 0 && sumParsed20 && Number(sumParsed20.deleted) >= 1,
+          `lastRunAt=${afterRun20.lastRunAt} summary=${String(afterRun20.lastSummary || '').slice(0, 80)}`);
+        const r220 = await run20();
+        const rd220 = r220.json?.data || {};
+        check('the second sweep respects the grace window: the stamped package is skipped, not deleted',
+          r220.status === 200 && Number(rd220.skippedGrace) >= 1
+            && alive20(depletedPkg20.email) === 2 && !resultOf20(rd220, depletedPkg20.email),
+          `skippedGrace=${rd220.skippedGrace} alive=${alive20(depletedPkg20.email)}`);
+        bdb.prepare('UPDATE configs SET depleted_at = ? WHERE email = ?').run(NOW20 - 8 * DAY20, depletedPkg20.email);
+        const r320 = await run20();
+        const rd320 = r320.json?.data || {};
+        const depRes320 = resultOf20(rd320, depletedPkg20.email);
+        check('once the grace window passes, the full package goes too — with its own reason',
+          depRes320?.action === 'deleted' && depRes320?.reason === 'depleted_grace' && alive20(depletedPkg20.email) === 0,
+          `action=${depRes320?.action} reason=${depRes320?.reason}`);
+        check('an adopted customer is never swept while includeExternal is off',
+          Number(rd320.skippedExternal) >= 1 && alive20('v200ext-old') >= 1 && mockXui.clients.has('v200ext-old'),
+          `skippedExternal=${rd320.skippedExternal} alive=${alive20('v200ext-old')}`);
+        await cleanupPatch({ includeExternal: true });
+        const delMarkExt20 = mockXui.calls.length;
+        await run20();
+        check('with includeExternal on, only the local rows go — the other panel\'s client stays',
+          alive20('v200ext-old') === 0 && mockXui.clients.has('v200ext-old')
+            && mockXui.calls.slice(delMarkExt20).every((call) => !call.route.includes('/clients/del/v200ext-old')),
+          `alive=${alive20('v200ext-old')} onNode=${mockXui.clients.has('v200ext-old')}`);
+        await cleanupPatch({ includeExternal: false });
+
+        // The per-run cap, measured against whatever is eligible right now.
+        const capA20 = await build20(shop20.id, 'سقف الف');
+        const capB20 = await build20(shop20.id, 'سقف ب');
+        setExpiry20(capA20.email, NOW20 - 20 * DAY20);
+        setExpiry20(capB20.email, NOW20 - 20 * DAY20);
+        const eligible20 = Number(((await preview20()).json?.data || {}).eligible || 0);
+        await cleanupPatch({ maxPerRun: 1 });
+        const rCap20 = (await run20()).json?.data || {};
+        check('the per-run cap holds: one goes, the rest are counted as capped',
+          eligible20 >= 2 && Number(rCap20.deleted) === 1 && Number(rCap20.capped) === eligible20 - 1,
+          `eligible=${eligible20} deleted=${rCap20.deleted} capped=${rCap20.capped}`);
+        await cleanupPatch({ maxPerRun: 500 });
+        const rRest20 = (await run20()).json?.data || {};
+        check('raising the cap clears the backlog on the next sweep',
+          Number(rRest20.deleted) === eligible20 - 1 && alive20(capA20.email) + alive20(capB20.email) === 0,
+          `deleted=${rRest20.deleted} expected=${eligible20 - 1}`);
+
+        const refusePkg20 = await build20(shop20.id, 'نود سرسخت');
+        setExpiry20(refusePkg20.email, NOW20 - 20 * DAY20);
+        mockXui.quirks.failDel.add(refusePkg20.email);
+        const rRef20 = (await run20()).json?.data || {};
+        const refRes20 = resultOf20(rRef20, refusePkg20.email);
+        mockXui.quirks.failDel.delete(refusePkg20.email);
+        check('a node that refuses the delete keeps the package — the sweep reports the failure',
+          refRes20?.action === 'failed' && Number(rRef20.failed) >= 1
+            && alive20(refusePkg20.email) === 2 && mockXui.clients.has(refusePkg20.email),
+          `action=${refRes20?.action} alive=${alive20(refusePkg20.email)}`);
+        const gonePkg20 = await build20(shop20.id, 'رفته از نود');
+        setExpiry20(gonePkg20.email, NOW20 - 20 * DAY20);
+        mockXui.clients.delete(gonePkg20.email);
+        const rGone20 = (await run20()).json?.data || {};
+        const goneRes20 = resultOf20(rGone20, gonePkg20.email);
+        check('a client already off the node is a success — and the refused package goes on the retry',
+          goneRes20?.action === 'deleted' && Number(goneRes20?.alreadyGone) >= 1
+            && alive20(gonePkg20.email) === 0 && alive20(refusePkg20.email) === 0,
+          `action=${goneRes20?.action} alreadyGone=${goneRes20?.alreadyGone} refuseAlive=${alive20(refusePkg20.email)}`);
+        const notesBefore20 = Number(bdb.prepare("SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND title = 'اشتراک حذف شد'").get(shop20.id).c);
+        await cleanupPatch({ notifyReseller: true });
+        const notifyPkg20 = await build20(shop20.id, 'با خبر');
+        setExpiry20(notifyPkg20.email, NOW20 - 20 * DAY20);
+        await run20();
+        const notesAfter20 = Number(bdb.prepare("SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND title = 'اشتراک حذف شد'").get(shop20.id).c);
+        check('with the notice on, the reseller is told which subscription the sweep removed',
+          notesAfter20 === notesBefore20 + 1 && alive20(notifyPkg20.email) === 0,
+          `notes=${notesBefore20}→${notesAfter20}`);
+
+        // ───────────────────────────── ۳) «ارسال به تلگرام من» — the HTTP guards
+        // (the successful send, the caption and the QR itself are proven in
+        // test/send-config.js with a recorded bot transport — no network here).
+        const sendNoId20 = await request('POST', `/api/reseller/configs/${activePkg20.id}/send-telegram`, { cookies: shopSess20.cookies, csrf: shopSess20.csrf });
+        check('without a numeric Telegram id on the account the send is refused honestly',
+          sendNoId20.status === 422 && code20(sendNoId20) === 'telegram_id_required',
+          `status=${sendNoId20.status} code=${code20(sendNoId20)}`);
+        bdb.prepare('UPDATE users SET telegram_id = ? WHERE id = ?').run('770200777', shop20.id);
+        const tgRead20 = await request('GET', '/api/admin/settings', { cookies });
+        tgWas20 = { botEnabled: Boolean(tgRead20.json?.data?.settings?.telegram?.botEnabled) };
+        await request('PATCH', '/api/admin/settings/telegram', { cookies, csrf, body: { botEnabled: false } });
+        const sendBotOff20 = await request('POST', `/api/reseller/configs/${activePkg20.id}/send-telegram`, { cookies: shopSess20.cookies, csrf: shopSess20.csrf });
+        check('with the bot switched off the send is refused too',
+          sendBotOff20.status === 422 && code20(sendBotOff20) === 'bot_disabled',
+          `status=${sendBotOff20.status} code=${code20(sendBotOff20)}`);
+        const sendStranger20 = await request('POST', `/api/reseller/configs/${activePkg20.id}/send-telegram`, { cookies: strangerSess20.cookies, csrf: strangerSess20.csrf });
+        check('another reseller cannot send someone else\'s config to his own chat',
+          sendStranger20.status === 403, `status=${sendStranger20.status}`);
+        const sendAdmin20 = await request('POST', `/api/admin/configs/${activePkg20.id}/send-telegram`, { cookies: adminSess20.cookies, csrf: adminSess20.csrf });
+        check('the admin route exists and asks for the same numeric id',
+          sendAdmin20.status === 422 && code20(sendAdmin20) === 'telegram_id_required',
+          `status=${sendAdmin20.status} code=${code20(sendAdmin20)}`);
+      } finally {
+        await cleanupPatch({ enabled: false, expired: true, depleted: true, graceDays: 7, intervalHours: 6, maxPerRun: 50, includeExternal: false, notifyReseller: true });
+        if (tgWas20) await request('PATCH', '/api/admin/settings/telegram', { cookies, csrf, body: { botEnabled: tgWas20.botEnabled } });
+        if (lifted20) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit20 } });
+        for (const email of seedEmails20) mockXui.clients.delete(email);
         bdb.close();
       }
     }

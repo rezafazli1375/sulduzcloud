@@ -27,7 +27,7 @@ import {
 import { useAuth } from '../../lib/auth.jsx';
 import { useI18n, translateError } from '../../lib/i18n.jsx';
 import { api } from '../../lib/api.js';
-import { formatNumber } from '../../lib/format.js';
+import { formatDate, formatNumber } from '../../lib/format.js';
 import {
   Badge,
   Button,
@@ -66,6 +66,7 @@ const TAB_LIST = [
   { value: 'billing', icon: CreditCard, label: 'settings.tabs.billing' },
   { value: 'payment', icon: Landmark, label: 'settings.tabs.payment' },
   { value: 'backup', icon: DatabaseBackup, label: 'settings.tabs.backup' },
+  { value: 'cleanup', icon: Trash2, label: 'settings.tabs.cleanup' },
   { value: 'telegram', icon: Send, label: 'settings.tabs.telegram' },
   { value: 'security', icon: Lock, label: 'settings.tabs.security' },
 ];
@@ -84,6 +85,24 @@ function SwitchRow({ label, hint, checked, onChange }) {
       <Switch checked={Boolean(checked)} onChange={onChange} />
     </div>
   );
+}
+
+// The sweep's compact summary (stored as JSON on the settings row) and a live
+// preview share one shape for the readout line; this normalizes both.
+function safeSummary(value) {
+  let obj = value;
+  if (typeof value === 'string') {
+    try { obj = JSON.parse(value); } catch (_) { obj = {}; }
+  }
+  obj = obj || {};
+  return {
+    checked: Number(obj.checked || 0),
+    deleted: Number(obj.deleted || 0),
+    stamped: Number(obj.stamped || 0),
+    grace: Number(obj.skippedGrace ?? obj.grace ?? 0),
+    external: Number(obj.skippedExternal ?? obj.external ?? 0),
+    failed: Number(obj.failed || 0),
+  };
 }
 
 function SaveBar({ onSave, saving, extra }) {
@@ -223,6 +242,31 @@ export default function Settings() {
     onError: (err) => toast.error(translateError(err, t)),
   });
 
+  // ---- v2.0.0: scheduled cleanup -------------------------------------------
+  // The preview runs the exact sweep with dryRun on the server — nothing is
+  // written — and the manual run is the same function the timer calls.
+  const [cleanupPreview, setCleanupPreview] = useState(null);
+
+  const cleanupPreviewMut = useMutation({
+    mutationFn: () => api.get('/admin/cleanup/preview'),
+    onSuccess: (result) => setCleanupPreview(result || null),
+    onError: (err) => toast.error(translateError(err, t)),
+  });
+
+  const cleanupRun = useMutation({
+    mutationFn: () => api.post('/admin/cleanup/run'),
+    onSuccess: (result) => {
+      toast.success(t('settings.cleanup.runOk', {
+        deleted: formatNumber(result?.deleted ?? 0, lang),
+        stamped: formatNumber(result?.stamped ?? 0, lang),
+      }));
+      setCleanupPreview(null);
+      queryClient.invalidateQueries({ queryKey: ['settings'] });
+      queryClient.invalidateQueries({ queryKey: ['configs'] });
+    },
+    onError: (err) => toast.error(translateError(err, t)),
+  });
+
   // Cards are a list inside the section, so a keystroke in one row may not touch
   // the other rows or the gateway switches beside them.
   const patchCard = (index, field, value) => {
@@ -320,6 +364,7 @@ export default function Settings() {
   const sms = local.sms || {};
   const billing = local.billing || {};
   const backup = local.backup || {};
+  const cleanup = local.cleanup || {};
   const telegram = local.telegram || {};
   const security = local.security || {};
   const payment = local.payment || {};
@@ -959,6 +1004,116 @@ export default function Settings() {
             <SaveBar
               saving={savingSection === 'backup'}
               onSave={() => save.mutate({ section: 'backup', payload: backup })}
+            />
+          </div>
+        </SectionCard>
+      ) : null}
+
+      {tab === 'cleanup' ? (
+        <SectionCard icon={Trash2} title={t('settings.tabs.cleanup')}>
+          <div className="space-y-4">
+            <p className="rounded-xl border border-amber-400/20 bg-amber-500/[0.06] px-3.5 py-2.5 text-[11px] leading-6 text-amber-100/90">
+              {t('settings.cleanup.warning')}
+            </p>
+            <SwitchRow
+              label={t('settings.cleanup.enabled')}
+              hint={t('settings.cleanup.enabledHint')}
+              checked={cleanup.enabled}
+              onChange={(value) => patch('cleanup', 'enabled', value)}
+            />
+            <div className="grid gap-3 sm:grid-cols-2">
+              <SwitchRow
+                label={t('settings.cleanup.expired')}
+                hint={t('settings.cleanup.expiredHint')}
+                checked={cleanup.expired}
+                onChange={(value) => patch('cleanup', 'expired', value)}
+              />
+              <SwitchRow
+                label={t('settings.cleanup.depleted')}
+                hint={t('settings.cleanup.depletedHint')}
+                checked={cleanup.depleted}
+                onChange={(value) => patch('cleanup', 'depleted', value)}
+              />
+            </div>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field label={t('settings.cleanup.graceDays')} hint="0 – 365">
+                <Input type="number" min="0" max="365" dir="ltr" value={cleanup.graceDays ?? 7} onChange={(e) => patch('cleanup', 'graceDays', e.target.value)} />
+              </Field>
+              <Field label={t('settings.cleanup.intervalHours')} hint="1 – 168">
+                <Input type="number" min="1" max="168" dir="ltr" value={cleanup.intervalHours ?? 6} onChange={(e) => patch('cleanup', 'intervalHours', e.target.value)} />
+              </Field>
+              <Field label={t('settings.cleanup.maxPerRun')} hint="1 – 500">
+                <Input type="number" min="1" max="500" dir="ltr" value={cleanup.maxPerRun ?? 50} onChange={(e) => patch('cleanup', 'maxPerRun', e.target.value)} />
+              </Field>
+            </div>
+            <p className="text-[10.5px] leading-5 text-slate-500">{t('settings.cleanup.graceHint')}</p>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <SwitchRow
+                label={t('settings.cleanup.includeExternal')}
+                hint={t('settings.cleanup.includeExternalHint')}
+                checked={cleanup.includeExternal}
+                onChange={(value) => patch('cleanup', 'includeExternal', value)}
+              />
+              <SwitchRow
+                label={t('settings.cleanup.notifyReseller')}
+                hint={t('settings.cleanup.notifyResellerHint')}
+                checked={cleanup.notifyReseller}
+                onChange={(value) => patch('cleanup', 'notifyReseller', value)}
+              />
+            </div>
+
+            <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-3.5 py-3">
+              <p className="flex items-center gap-1.5 text-[11.5px] font-medium text-slate-300">
+                <CalendarClock className="h-3.5 w-3.5" />
+                {t('settings.cleanup.lastRun')}: {cleanup.lastRunAt ? formatDate(cleanup.lastRunAt, lang, true) : t('settings.cleanup.never')}
+              </p>
+              {cleanup.lastSummary ? (
+                <p className="mt-1 text-[10.5px] leading-5 text-slate-500">
+                  {t('settings.cleanup.summary', safeSummary(cleanup.lastSummary))}
+                </p>
+              ) : null}
+            </div>
+
+            {cleanupPreview ? (
+              <div className="rounded-xl border border-cyan-400/20 bg-cyan-500/[0.05] p-3.5">
+                <p className="text-[11.5px] font-semibold text-cyan-100">{t('settings.cleanup.previewTitle')}</p>
+                <p className="mt-1 text-[10.5px] leading-5 text-cyan-100/70">
+                  {t('settings.cleanup.summary', safeSummary(cleanupPreview))}
+                </p>
+                {(cleanupPreview.results || []).length ? (
+                  <div className="mt-2 space-y-1.5">
+                    {(cleanupPreview.results || []).slice(0, 60).map((item) => (
+                      <div key={`${item.configId}-${item.action}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5">
+                        <span className="min-w-0 truncate font-mono text-[10.5px] text-slate-300" dir="ltr">{item.email || `#${item.configId}`}</span>
+                        <Badge tone={item.action === 'would_delete' ? 'rose' : item.action === 'failed' ? 'rose' : 'amber'}>
+                          {t(`settings.cleanup.action.${item.action}`)}
+                        </Badge>
+                        {item.error ? <span className="w-full text-[10px] text-rose-300/80">{item.error}</span> : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-[10.5px] text-slate-400">{t('settings.cleanup.empty')}</p>
+                )}
+                {Number(cleanupPreview.capped || 0) > 0 ? (
+                  <p className="mt-2 text-[10px] text-amber-200/80">{t('settings.cleanup.capped', { n: formatNumber(cleanupPreview.capped, lang) })}</p>
+                ) : null}
+              </div>
+            ) : null}
+
+            <SaveBar
+              saving={savingSection === 'cleanup'}
+              onSave={() => save.mutate({ section: 'cleanup', payload: cleanup })}
+              extra={(
+                <>
+                  <Button variant="soft" size="sm" icon={Eye} loading={cleanupPreviewMut.isPending} onClick={() => cleanupPreviewMut.mutate()}>
+                    {t('settings.cleanup.preview')}
+                  </Button>
+                  <Button variant="soft" size="sm" icon={Play} loading={cleanupRun.isPending} onClick={() => cleanupRun.mutate()}>
+                    {t('settings.cleanup.run')}
+                  </Button>
+                </>
+              )}
             />
           </div>
         </SectionCard>

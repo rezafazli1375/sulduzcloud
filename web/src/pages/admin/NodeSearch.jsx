@@ -2,10 +2,13 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
+  ArrowDownUp,
   ArrowLeftRight,
   CheckCheck,
+  Filter,
   Fingerprint,
   Network,
+  RotateCcw,
   Search,
   Server,
   UserPlus,
@@ -64,7 +67,10 @@ function ClientCard({ row, selected, onToggle, onAssign }) {
         </span>
         <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold text-slate-100" dir="ltr">{row.email}</span>
         <CopyButton value={row.email} />
-        {row.enabled ? <Badge tone="emerald" dot>{t('common.active')}</Badge> : <Badge tone="slate">{t('common.disabled')}</Badge>}
+        {row.status === 'expired' ? <Badge tone="rose">{t('nodeSearch.statusExpired')}</Badge>
+          : row.status === 'depleted' ? <Badge tone="amber">{t('nodeSearch.statusDepleted')}</Badge>
+            : row.enabled ? <Badge tone="emerald" dot>{t('common.active')}</Badge>
+              : <Badge tone="slate">{t('common.disabled')}</Badge>}
         {otherOwner ? <Badge tone="violet">{t('nodeSearch.adopted')}</Badge> : null}
       </div>
 
@@ -402,10 +408,15 @@ function AssignModal({ open, onClose, clients, onLanded }) {
   );
 }
 
+const DEFAULT_FILTERS = {
+  field: 'all', status: '', ownership: '', inboundId: '', quota: '', expiringDays: '', sortBy: '', sortDir: 'asc',
+};
+
 export default function NodeSearch() {
   const { t, lang } = useI18n();
   const [term, setTerm] = useState('');
   const [serverId, setServerId] = useState('');
+  const [filters, setFilters] = useState(DEFAULT_FILTERS);
   const [submitted, setSubmitted] = useState(null);
   const [selected, setSelected] = useState(() => new Map());
   const [assigning, setAssigning] = useState(null);
@@ -415,11 +426,32 @@ export default function NodeSearch() {
     queryFn: () => api.get('/admin/nodes'),
   });
 
+  // v2.0.0: the inbound filter lists the channels this panel knows, with their
+  // node name, so «channel X on node Y» is one pick instead of a guessed id.
+  const inboundsQuery = useQuery({
+    queryKey: ['inbounds', 'admin', 'list'],
+    queryFn: () => api.get('/admin/inbounds'),
+  });
+
   const searchQuery = useQuery({
-    queryKey: ['node-clients', submitted?.q, submitted?.serverId],
+    queryKey: ['node-clients', JSON.stringify(submitted)],
     // v1.5.8: ask for the service ceiling, not a page-sized slice — the owner's
     // 210 «speed» clients must all arrive so «select all» really means all.
-    queryFn: () => api.get(`/admin/node-clients?q=${encodeURIComponent(submitted.q)}&serverId=${submitted.serverId || 0}&limit=5000`),
+    queryFn: () => {
+      const f = submitted.filters || {};
+      const params = new URLSearchParams({ q: submitted.q, serverId: submitted.serverId || '0', limit: '5000' });
+      if (f.field && f.field !== 'all') params.set('field', f.field);
+      if (f.status) params.set('status', f.status);
+      if (f.ownership) params.set('ownership', f.ownership);
+      if (f.inboundId) params.set('inboundId', String(f.inboundId));
+      if (f.quota) params.set('quota', f.quota);
+      if (Number(f.expiringDays) > 0) params.set('expiringDays', String(Math.round(Number(f.expiringDays))));
+      if (f.sortBy) {
+        params.set('sortBy', f.sortBy);
+        params.set('sortDir', f.sortDir === 'desc' ? 'desc' : 'asc');
+      }
+      return api.get(`/admin/node-clients?${params.toString()}`);
+    },
     enabled: Boolean(submitted),
     // A node client list is a live snapshot of somebody else's panel: keep it,
     // but never silently re-run the network sweep in the background.
@@ -428,21 +460,31 @@ export default function NodeSearch() {
   });
 
   const nodes = nodesQuery.data?.rows || [];
+  const inbounds = inboundsQuery.data?.rows || [];
   const trimmed = term.trim();
-  const canSearch = trimmed.length >= 2;
+  const patchFilter = (key, value) => setFilters((prev) => ({ ...prev, [key]: value }));
+  const activeFilterCount = [
+    filters.field !== 'all', Boolean(filters.status), Boolean(filters.ownership),
+    Boolean(filters.inboundId), Boolean(filters.quota), Number(filters.expiringDays) > 0, Boolean(filters.sortBy),
+  ].filter(Boolean).length;
+  const anyFilter = activeFilterCount > 0;
+  // v2.0.0: a filter-only search is legal (the backend sweeps every node and
+  // keeps only the hits); a bare 1-character term never is.
+  const canSearch = trimmed.length >= 2 || (trimmed.length === 0 && anyFilter);
 
   const rows = searchQuery.data?.rows || [];
   const errors = searchQuery.data?.errors || [];
   const scanned = Number(searchQuery.data?.scanned || 0);
+  const matched = Number(searchQuery.data?.matched || 0);
   const resultCount = useMemo(() => formatNumber(rows.length, lang), [rows.length, lang]);
 
   // A tick belongs to the search it was made in. Keeping it across searches would
   // hand over a customer the admin can no longer see on screen.
-  useEffect(() => { setSelected(new Map()); }, [submitted?.q, submitted?.serverId]);
+  useEffect(() => { setSelected(new Map()); }, [submitted]);
 
   const runSearch = () => {
     if (!canSearch) return;
-    setSubmitted({ q: trimmed, serverId: String(serverId || '') });
+    setSubmitted({ q: trimmed, serverId: String(serverId || ''), filters: { ...filters } });
   };
 
   const toggle = (row, next) => {
@@ -515,9 +557,99 @@ export default function NodeSearch() {
             {t('nodeSearch.search')}
           </Button>
         </div>
-        {!canSearch && trimmed.length > 0 ? (
+        {trimmed.length === 1 ? (
           <p className="mt-2 text-[10.5px] text-amber-200/90">{t('nodeSearch.tooShort')}</p>
         ) : null}
+
+        <div className="mt-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-slate-300">
+              <Filter className="h-3.5 w-3.5 text-cyan-300" />
+              {t('nodeSearch.filters')}
+              {activeFilterCount ? <Badge tone="cyan">{formatNumber(activeFilterCount, lang)}</Badge> : null}
+            </span>
+            {anyFilter ? (
+              <Button size="sm" variant="ghost" icon={RotateCcw} onClick={() => setFilters(DEFAULT_FILTERS)}>
+                {t('nodeSearch.resetFilters')}
+              </Button>
+            ) : null}
+          </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Field label={t('nodeSearch.field')}>
+              <Select value={filters.field} onChange={(e) => patchFilter('field', e.target.value)}>
+                <option value="all">{t('nodeSearch.fieldAll')}</option>
+                <option value="email">{t('nodeSearch.fieldEmail')}</option>
+                <option value="uuid">{t('nodeSearch.fieldUuid')}</option>
+                <option value="remark">{t('nodeSearch.fieldRemark')}</option>
+                <option value="subid">{t('nodeSearch.fieldSubid')}</option>
+              </Select>
+            </Field>
+            <Field label={t('nodeSearch.status')}>
+              <Select value={filters.status} onChange={(e) => patchFilter('status', e.target.value)}>
+                <option value="">{t('nodeSearch.statusAny')}</option>
+                <option value="active">{t('nodeSearch.statusActive')}</option>
+                <option value="expired">{t('nodeSearch.statusExpired')}</option>
+                <option value="depleted">{t('nodeSearch.statusDepleted')}</option>
+                <option value="disabled">{t('nodeSearch.statusDisabled')}</option>
+              </Select>
+            </Field>
+            <Field label={t('nodeSearch.ownership')}>
+              <Select value={filters.ownership} onChange={(e) => patchFilter('ownership', e.target.value)}>
+                <option value="">{t('nodeSearch.ownershipAny')}</option>
+                <option value="adopted">{t('nodeSearch.ownershipAdopted')}</option>
+                <option value="free">{t('nodeSearch.ownershipFree')}</option>
+              </Select>
+            </Field>
+            <Field label={t('nodeSearch.inbound')}>
+              <Select value={filters.inboundId} onChange={(e) => patchFilter('inboundId', e.target.value)}>
+                <option value="">{t('nodeSearch.inboundAny')}</option>
+                {inbounds.map((inbound) => (
+                  <option key={inbound.id} value={inbound.id}>
+                    {(inbound.remark || `#${inbound.id}`) + (inbound.serverName ? ` · ${inbound.serverName}` : '')}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label={t('nodeSearch.quotaFilter')}>
+              <Select value={filters.quota} onChange={(e) => patchFilter('quota', e.target.value)}>
+                <option value="">{t('nodeSearch.quotaAny')}</option>
+                <option value="limited">{t('nodeSearch.quotaLimited')}</option>
+                <option value="unlimited">{t('nodeSearch.quotaUnlimited')}</option>
+              </Select>
+            </Field>
+            <Field label={t('nodeSearch.expiringDays')} hint="0 – 3650">
+              <Input
+                type="number"
+                min="0"
+                max="3650"
+                dir="ltr"
+                placeholder="0"
+                value={filters.expiringDays}
+                onChange={(e) => patchFilter('expiringDays', e.target.value)}
+              />
+            </Field>
+            <Field label={t('nodeSearch.sortBy')}>
+              <Select value={filters.sortBy} onChange={(e) => patchFilter('sortBy', e.target.value)}>
+                <option value="">{t('nodeSearch.sortDefault')}</option>
+                <option value="email">{t('nodeSearch.sortEmail')}</option>
+                <option value="expiryAt">{t('nodeSearch.sortExpiry')}</option>
+                <option value="used">{t('nodeSearch.sortUsed')}</option>
+                <option value="totalBytes">{t('nodeSearch.sortQuota')}</option>
+                <option value="server">{t('nodeSearch.sortServer')}</option>
+              </Select>
+            </Field>
+            <Field label={t('nodeSearch.sortDir')}>
+              <Select value={filters.sortDir} onChange={(e) => patchFilter('sortDir', e.target.value)}>
+                <option value="asc">{t('nodeSearch.sortAsc')}</option>
+                <option value="desc">{t('nodeSearch.sortDesc')}</option>
+              </Select>
+            </Field>
+          </div>
+          <p className="mt-2 flex items-start gap-1.5 text-[10.5px] leading-5 text-slate-500">
+            <ArrowDownUp className="mt-0.5 h-3 w-3 shrink-0" />
+            {t('nodeSearch.filtersHint')}
+          </p>
+        </div>
       </SectionCard>
 
       <div className="mt-4">
@@ -528,6 +660,9 @@ export default function NodeSearch() {
           actions={submitted && searchQuery.data ? (
             <div className="flex flex-wrap items-center gap-2 text-[10.5px] text-slate-500">
               <Badge tone="cyan">{resultCount}</Badge>
+              {matched > rows.length ? (
+                <span>{t('nodeSearch.matched')}: {formatNumber(matched, lang)}</span>
+              ) : null}
               <span>{t('nodeSearch.scanned')}: {formatNumber(scanned, lang)}</span>
             </div>
           ) : null}

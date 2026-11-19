@@ -264,6 +264,15 @@ router.post('/configs/:id/recreate', asyncH(async (req, res) => {
   res.json({ ok: true, data: result });
 }));
 
+// v2.0.0: «ارسال به تلگرام من». The bot hands the reseller this customer's
+// subscription as ONE forwardable message — the QR photo with the link and the
+// customer's numbers in the caption. The chat is the reseller's own numeric
+// Telegram id (req.user.telegram_id); ownership is checked by configDetail.
+router.post('/configs/:id/send-telegram', asyncH(async (req, res) => {
+  const result = await configsService.sendToTelegram(num(req.params.id), req, req.user);
+  res.json({ ok: true, data: result });
+}));
+
 router.delete('/configs/:id', asyncH(async (req, res) => {
   const result = await configsService.removeConfig(num(req.params.id), {}, req, req.user);
   // detachedOnly  — an adopted row: nothing was written to the other panel.

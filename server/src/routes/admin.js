@@ -22,6 +22,7 @@ const topups = require('../services/topups');
 const payment = require('../services/payment');
 const reports = require('../services/reports');
 const monitor = require('../services/monitor');
+const cleanupService = require('../services/cleanup');
 const ticketsService = require('../services/tickets');
 const notify = require('../notify');
 const xui = require('../xui');
@@ -577,6 +578,14 @@ router.post('/configs/:id/recreate', auth.requirePerm('configs'), asyncH(async (
   res.json({ ok: true, data: result });
 }));
 
+// v2.0.0: «ارسال به تلگرام من» — the QR of the subscription link plus the link
+// itself, as ONE message to the caller's own Telegram chat. req.user carries the
+// numeric telegram_id from the account row; the body is never trusted for a chat.
+router.post('/configs/:id/send-telegram', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const result = await configsService.sendToTelegram(num(req.params.id), req, req.user);
+  res.json({ ok: true, data: result });
+}));
+
 router.delete('/configs/:id', auth.requirePerm('configs'), asyncH(async (req, res) => {
   const result = await configsService.removeConfig(num(req.params.id), {}, req, { role: 'admin' });
   res.json({
@@ -864,6 +873,27 @@ router.patch('/settings/:section', auth.requirePerm('settings'), asyncH(async (r
     if (clean.hour !== undefined) clean.hour = Math.min(23, Math.max(0, num(clean.hour, 3)));
     if (clean.minute !== undefined) clean.minute = Math.min(59, Math.max(0, num(clean.minute, 30)));
     if (clean.keep !== undefined) clean.keep = Math.min(60, Math.max(1, num(clean.keep, 14)));
+  }
+  if (section === 'cleanup') {
+    // v2.0.0: the sweep's own bookkeeping is written by runCleanup, never by the
+    // form — a browser tab must not be able to fake "last ran" and skip a sweep.
+    delete clean.lastRunAt;
+    delete clean.lastSummary;
+    if (clean.graceDays !== undefined) clean.graceDays = Math.min(365, Math.max(0, num(clean.graceDays, 7)));
+    if (clean.intervalHours !== undefined) clean.intervalHours = Math.min(168, Math.max(1, num(clean.intervalHours, 6)));
+    if (clean.maxPerRun !== undefined) clean.maxPerRun = Math.min(500, Math.max(1, num(clean.maxPerRun, 50)));
+    for (const key of ['enabled', 'expired', 'depleted', 'includeExternal', 'notifyReseller']) {
+      if (clean[key] !== undefined) clean[key] = Boolean(clean[key]);
+    }
+    // A schedule switched on with BOTH states off would tick forever and delete
+    // nothing — the same dead-switch rule the payment rails follow. Guard on the
+    // MERGED row so a partial save (only the switch) respects the stored flags.
+    const storedCleanup = settings.getSetting('cleanup');
+    const mergedCleanup = { ...storedCleanup, ...clean };
+    if (mergedCleanup.enabled && !mergedCleanup.expired && !mergedCleanup.depleted) {
+      throw new ApiError(422, 'cleanup_nothing_selected',
+        'حداقل یکی از «منقضی‌شده» یا «تمام‌شده» باید انتخاب شود / Pick at least one finished state to sweep');
+    }
   }
   if (section === 'telegram') {
     // The nightly report schedule lives in this section, and the same rule that
@@ -1322,6 +1352,20 @@ router.post('/topups/auto-approve/run', auth.requirePerm('users'), (req, res) =>
   res.json({ ok: true, data: summary });
 });
 
+// ---- v2.0.0: scheduled cleanup of finished subscriptions --------------------
+// The preview runs the exact sweep with dryRun — nothing is written, not even
+// the depleted stamp — so the owner reads tonight's deletions before they exist.
+// The manual run is the same function the timer calls, for right after a save.
+router.get('/cleanup/preview', auth.requirePerm('settings'), asyncH(async (req, res) => {
+  const summary = await cleanupService.runCleanup({ dryRun: true });
+  res.json({ ok: true, data: summary });
+}));
+
+router.post('/cleanup/run', auth.requirePerm('settings'), asyncH(async (req, res) => {
+  const summary = await cleanupService.runCleanup();
+  res.json({ ok: true, data: summary });
+}));
+
 // What the payment methods look like from the reseller's side, with the same
 // reasons the panel gives: not what is switched on, but WHY something is off.
 router.get('/payment/status', auth.requirePerm('settings'), (req, res) => {
@@ -1394,6 +1438,16 @@ router.get('/node-clients', auth.requirePerm('configs'), asyncH(async (req, res)
     // v1.5.8: no route-level cap of its own — the service default (a whole node's
     // worth of hits) applies unless the caller names a limit.
     limit: num(req.query.limit, 0),
+    // v2.0.0: advanced filters. The service validates every enum itself, so the
+    // route only forwards what the browser sent.
+    field: String(req.query.field || 'all'),
+    status: String(req.query.status || ''),
+    ownership: String(req.query.ownership || ''),
+    inboundId: num(req.query.inboundId, 0),
+    quota: String(req.query.quota || ''),
+    expiringDays: num(req.query.expiringDays, 0),
+    sortBy: String(req.query.sortBy || ''),
+    sortDir: String(req.query.sortDir || 'asc'),
   });
   res.json({ ok: true, data });
 }));

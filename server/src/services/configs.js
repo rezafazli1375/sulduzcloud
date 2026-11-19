@@ -24,8 +24,10 @@ const {
   CONFIG_GROUP_KEY_SQL,
   CONFIG_GROUP_USED_SQL,
 } = require('../utils');
-const { audit } = require('../audit');
+const { audit, systemAudit } = require('../audit');
 const { notifyUser } = require('../notify');
+const telegram = require('./telegram');
+const qrcode = require('./qrcode');
 
 const DAY_MS = 86400000;
 
@@ -685,16 +687,61 @@ function clientUuidOf(client) {
   return UUID_RE.test(id) ? id : '';
 }
 
+// v2.0.0: the advanced-search enums. Anything outside them is treated as "no
+// filter" rather than an error, so an old browser tab posting stale params
+// still gets a plain search instead of a 422.
+const SEARCH_FIELDS = ['all', 'email', 'uuid', 'remark', 'subid'];
+const SEARCH_STATUSES = ['active', 'expired', 'depleted', 'disabled'];
+const SEARCH_OWNERSHIP = ['adopted', 'free'];
+const SEARCH_QUOTA = ['limited', 'unlimited'];
+const SEARCH_SORTS = ['email', 'expiryAt', 'used', 'totalBytes', 'server'];
+
+// One x-ui client's state, mirroring packageStatusSql's precedence so the
+// search filter and the configs list agree on what «منقضی» means.
+function clientStatusOf(client, now) {
+  const expiryAt = Number(client.expiryAt || 0);
+  const totalBytes = Number(client.totalBytes || 0);
+  const used = Number(client.up || 0) + Number(client.down || 0);
+  if (expiryAt > 0 && expiryAt <= now) return 'expired';
+  if (totalBytes > 0 && used >= totalBytes) return 'depleted';
+  if (client.enabled === false) return 'disabled';
+  return 'active';
+}
+
 /**
  * Search every enabled node for a client. Read-only: one /clients/list per server,
  * then a local match on email, uuid, subscription id and remark (x-ui's `comment`).
  * Each hit also says whether this panel already holds it and for whom, so the
  * admin can see a conflict before he tries to adopt.
+ *
+ * v2.0.0: advanced filters. `field` narrows which identity the text is matched
+ * against; status / ownership / inboundId / quota / expiringDays filter whole
+ * clients; sortBy + sortDir order the result. With ANY filter active the text
+ * query becomes optional — «همهٔ منقضی‌های این نود» is a legitimate question.
+ * Matching collects every hit before the cap is applied (the old early break
+ * made sorting meaningless and hid the true match count); `matched` tells the
+ * UI how much the cap actually cut off.
  */
-async function searchNodeClients({ q = '', serverId = 0, limit = NODE_SEARCH_LIMIT } = {}) {
+async function searchNodeClients({
+  q = '', serverId = 0, limit = NODE_SEARCH_LIMIT,
+  field = 'all', status = '', ownership = '', inboundId = 0,
+  quota = '', expiringDays = 0, sortBy = '', sortDir = 'asc',
+} = {}) {
   const needle = String(q || '').trim().toLowerCase();
-  if (needle.length < 2) {
-    throw new ApiError(422, 'query_too_short', 'حداقل دو نویسه برای جست‌وجو لازم است / Type at least two characters to search');
+  const wantField = SEARCH_FIELDS.includes(String(field)) ? String(field) : 'all';
+  const wantStatus = SEARCH_STATUSES.includes(String(status)) ? String(status) : '';
+  const wantOwnership = SEARCH_OWNERSHIP.includes(String(ownership)) ? String(ownership) : '';
+  const wantQuota = SEARCH_QUOTA.includes(String(quota)) ? String(quota) : '';
+  const wantInbound = Number(inboundId) || 0;
+  const wantExpiring = Math.min(3650, Math.max(0, Math.round(Number(expiringDays) || 0)));
+  const wantSort = SEARCH_SORTS.includes(String(sortBy)) ? String(sortBy) : '';
+  const dir = String(sortDir) === 'desc' ? -1 : 1;
+  const anyFilter = Boolean(wantField !== 'all' || wantStatus || wantOwnership || wantQuota || wantInbound || wantExpiring || wantSort);
+  if (needle.length < 2 && !anyFilter) {
+    throw new ApiError(422, 'query_too_short', 'حداقل دو نویسه یا یک فیلتر برای جست‌وجو لازم است / Type at least two characters or pick a filter');
+  }
+  if (needle.length === 1) {
+    throw new ApiError(422, 'query_too_short', 'عبارت جست‌وجو باید حداقل دو نویسه باشد / The text query needs at least two characters');
   }
   const cap = Math.min(Math.max(Number(limit) || NODE_SEARCH_LIMIT, 1), NODE_SEARCH_MAX);
   const wanted = Number(serverId) || 0;
@@ -710,7 +757,8 @@ async function searchNodeClients({ q = '', serverId = 0, limit = NODE_SEARCH_LIM
       WHERE lower(c.email) = ? AND c.deleted_at = 0 ORDER BY c.id`
   );
   const inboundOf = db.prepare('SELECT id, remark, port, protocol FROM inbounds WHERE server_id = ? AND xui_id = ?');
-  const rows = [];
+  const now = Date.now();
+  const matches = [];
   const errors = [];
   let scanned = 0;
   for (const server of serverList) {
@@ -725,28 +773,49 @@ async function searchNodeClients({ q = '', serverId = 0, limit = NODE_SEARCH_LIM
     scanned += clients.length;
     for (const client of clients) {
       const uuid = clientUuidOf(client);
-      const haystack = [client.email, uuid, client.subId, client.comment, client.id]
-        .map((value) => String(value || '').toLowerCase());
-      if (!haystack.some((value) => value && value.includes(needle))) continue;
+      if (needle) {
+        const parts = {
+          email: String(client.email || '').toLowerCase(),
+          uuid: uuid.toLowerCase(),
+          subid: String(client.subId || '').toLowerCase(),
+          remark: String(client.comment || '').toLowerCase(),
+        };
+        const haystack = wantField === 'all'
+          ? [...Object.values(parts), String(client.id || '').toLowerCase()]
+          : [parts[wantField]];
+        if (!haystack.some((value) => value && value.includes(needle))) continue;
+      }
+      const clientStatus = clientStatusOf(client, now);
+      if (wantStatus && clientStatus !== wantStatus) continue;
+      const totalBytes = Number(client.totalBytes || 0);
+      if (wantQuota === 'limited' && totalBytes <= 0) continue;
+      if (wantQuota === 'unlimited' && totalBytes > 0) continue;
+      const expiryAt = Number(client.expiryAt || 0);
+      if (wantExpiring && !(expiryAt > now && expiryAt <= now + wantExpiring * DAY_MS)) continue;
       const owned = ownersOf.all(String(client.email || '').toLowerCase());
+      if (wantOwnership === 'adopted' && !owned.length) continue;
+      if (wantOwnership === 'free' && owned.length) continue;
       const inbounds = (client.inboundIds || [])
         .map((xuiId) => inboundOf.get(Number(server.id), Number(xuiId)))
         .filter(Boolean)
         .map((row) => ({
           id: Number(row.id), remark: String(row.remark || ''), port: Number(row.port || 0), protocol: String(row.protocol || ''),
         }));
-      rows.push({
+      if (wantInbound && !inbounds.some((row) => row.id === wantInbound)) continue;
+      matches.push({
         serverId: Number(server.id),
         serverName: String(server.name || ''),
         email: String(client.email || ''),
         uuid,
         subId: String(client.subId || ''),
         remark: String(client.comment || ''),
-        totalBytes: Number(client.totalBytes || 0),
-        expiryAt: Number(client.expiryAt || 0),
+        totalBytes,
+        expiryAt,
         enabled: client.enabled !== false,
         up: Number(client.up || 0),
         down: Number(client.down || 0),
+        used: Number(client.up || 0) + Number(client.down || 0),
+        status: clientStatus,
         inboundIds: (client.inboundIds || []).map(Number),
         inbounds,
         knownInbounds: inbounds.length,
@@ -755,12 +824,35 @@ async function searchNodeClients({ q = '', serverId = 0, limit = NODE_SEARCH_LIM
         })),
         adopted: owned.length > 0,
       });
-      if (rows.length >= cap) break;
     }
-    if (rows.length >= cap) break;
   }
+  if (wantSort) {
+    const valueOf = (row) => {
+      if (wantSort === 'email') return row.email.toLowerCase();
+      if (wantSort === 'server') return row.serverName.toLowerCase() + '|' + row.email.toLowerCase();
+      return Number(row[wantSort] || 0);
+    };
+    matches.sort((a, b) => {
+      const va = valueOf(a);
+      const vb = valueOf(b);
+      if (va < vb) return -1 * dir;
+      if (va > vb) return 1 * dir;
+      return Number(a.serverId) - Number(b.serverId) || a.email.localeCompare(b.email);
+    });
+  }
+  const rows = matches.slice(0, cap);
   return {
-    rows, errors, scanned, query: String(q || '').trim(), limit: cap, truncated: rows.length >= cap,
+    rows,
+    errors,
+    scanned,
+    query: String(q || '').trim(),
+    limit: cap,
+    matched: matches.length,
+    truncated: matches.length > cap,
+    filters: {
+      field: wantField, status: wantStatus, ownership: wantOwnership, inboundId: wantInbound,
+      quota: wantQuota, expiringDays: wantExpiring, sortBy: wantSort, sortDir: dir === -1 ? 'desc' : 'asc',
+    },
   };
 }
 
@@ -2607,7 +2699,7 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
  * of rows this panel created get `clients/del`. Every x-ui call happens before any
  * row is touched, so a node that refuses leaves the package exactly as it was.
  */
-async function deletePackage(id, req, viewer) {
+async function deletePackage(id, req, viewer, opts = {}) {
   const { row } = configDetail(id, viewer);
   const db = getDb();
   const members = packageRows(row);
@@ -2656,7 +2748,9 @@ async function deletePackage(id, req, viewer) {
   for (const member of members) softDelete.run(now, now, Number(member.id));
 
   const resellerId = Number(row.user_id || 0);
-  if (resellerId) {
+  // v2.0.0: the scheduled sweep may run with the reseller notice silenced
+  // (settings.cleanup.notifyReseller); a person deleting always notifies.
+  if (resellerId && opts.notify !== false) {
     notifyUser(resellerId, {
       type: 'info',
       title: 'اشتراک حذف شد',
@@ -2666,14 +2760,21 @@ async function deletePackage(id, req, viewer) {
       link: '/reseller/configs',
     });
   }
-  audit(req, 'config.package_delete', 'config', row.id, {
+  const details = {
     email: row.email,
     rows: members.length,
     configs: members.map((item) => Number(item.id)),
     xuiDeleted,
     forgotten,
     alreadyGone,
-  });
+  };
+  if (opts.auto) {
+    // A sweep has no request and no logged-in actor: the audit trail says
+    // «system» and records WHY the package was removed, not who clicked.
+    systemAudit('config.auto_delete', 'config', row.id, { ...details, reason: String(opts.reason || '') });
+  } else {
+    audit(req, 'config.package_delete', 'config', row.id, details);
+  }
   return {
     ok: true,
     rows: members.length,
@@ -2685,6 +2786,115 @@ async function deletePackage(id, req, viewer) {
     // What the drawer has to say about it: nothing remotely was deleted exactly
     // when every client of the package belonged to another panel.
     remoteDeleted: xuiDeleted.length > 0,
+  };
+}
+
+// ---- v2.0.0: send a subscription to the reseller's own Telegram -------------
+// One message, one photo: the QR of the subscription link with the link itself
+// and the customer's numbers in the caption, ready to forward to the customer.
+// A short per-user cooldown keeps a double-click from sending twice.
+const SEND_COOLDOWN_MS = 10000;
+const lastTelegramSendAt = new Map();
+
+function escHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function faNumber(value) {
+  try {
+    return new Intl.NumberFormat('fa-IR', { maximumFractionDigits: 1 }).format(Number(value) || 0);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function faDate(ms) {
+  try {
+    return new Intl.DateTimeFormat('fa-IR', { dateStyle: 'medium' }).format(new Date(Number(ms)));
+  } catch (_) {
+    return String(ms);
+  }
+}
+
+// The caption is what the customer sees after the reseller forwards it, so it
+// carries the facts a customer asks about (who, how much, until when) and the
+// link in a <code> block Telegram makes tap-to-copy. Kept under 1024 chars —
+// Telegram's photo-caption limit — by construction: the only unbounded piece
+// is the URL, and a subscription URL that long could not be QR-encoded anyway.
+function subscriptionCaption(config, url) {
+  const general = settings.getSetting('general');
+  const lines = [];
+  lines.push('📡 <b>اشتراک آمادهٔ استفاده</b>');
+  lines.push('━━━━━━━━━━━━━━');
+  const who = String(config.customerName || '').trim() || String(config.email || '');
+  lines.push('👤 مشتری: <b>' + escHtml(who) + '</b>');
+  const totalGb = Number(config.totalBytes || 0) > 0 ? bytesToGb(Number(config.totalBytes)) : 0;
+  lines.push('📦 حجم: ' + (totalGb > 0 ? faNumber(totalGb) + ' گیگابایت' : 'نامحدود'));
+  const expiryAt = Number(config.expiryAt || 0);
+  if (expiryAt > 0) {
+    const left = Math.max(0, Math.ceil((expiryAt - Date.now()) / DAY_MS));
+    lines.push('⏳ اعتبار: ' + (left > 0 ? faNumber(left) + ' روز مانده' : 'پایان یافته') + ' (تا ' + faDate(expiryAt) + ')');
+  } else {
+    lines.push('⏳ اعتبار: نامحدود');
+  }
+  const serverName = String(config.inbound?.serverName || '').trim();
+  if (serverName) lines.push('🌐 نود: ' + escHtml(serverName));
+  lines.push('━━━━━━━━━━━━━━');
+  lines.push('🔗 <b>لینک اشتراک:</b>');
+  lines.push('<code>' + escHtml(url) + '</code>');
+  lines.push('');
+  lines.push('📷 کیوآرکد تصویر بالا همین لینک است — با اپلیکیشن اسکن کنید یا لینک را کپی و در اپ وارد کنید.');
+  lines.push('🔁 این پیام را می‌توانید مستقیم برای مشتری فوروارد کنید.');
+  lines.push('🛡 ' + escHtml(general.panelName));
+  return lines.join('\n').slice(0, 1024);
+}
+
+/**
+ * «ارسال به تلگرام من» — the reseller (or admin) asks the bot to hand him this
+ * package's subscription as one forwardable message. The chat is ALWAYS the
+ * caller's own numeric Telegram id from his account row, never a value from the
+ * request body, so nobody can make the bot write to a third party's chat.
+ */
+async function sendToTelegram(id, req, viewer) {
+  const { row, config } = detailView(id, viewer);
+  const chatId = String(viewer?.telegram_id || '').trim();
+  if (!/^\d{4,20}$/.test(chatId)) {
+    throw new ApiError(422, 'telegram_id_required',
+      'آیدی عددی تلگرام روی حساب شما ثبت نشده است؛ اول آن را در پروفایل/ویرایش کاربر وارد کنید / Save your numeric Telegram id on your account first');
+  }
+  if (!telegram.botConfig().enabled) {
+    throw new ApiError(422, 'bot_disabled',
+      'ربات تلگرام غیرفعال است؛ مدیر باید توکن ربات را در تنظیمات تلگرام ذخیره و ربات را روشن کند / The Telegram bot is not enabled');
+  }
+  const url = subscriptionsOf(row).primary;
+  if (!url) {
+    throw new ApiError(422, 'no_subscription_link',
+      'برای این کانفیگ لینک اشتراک ساخته نمی‌شود؛ آدرس سابسکرایب نود را تنظیم کنید / This config has no subscription link yet');
+  }
+  const now = Date.now();
+  const last = Number(lastTelegramSendAt.get(Number(viewer.id)) || 0);
+  if (now - last < SEND_COOLDOWN_MS) {
+    throw new ApiError(429, 'send_cooldown', 'چند لحظه صبر کنید و دوباره بزنید / Wait a few seconds before sending again');
+  }
+  let qr;
+  try {
+    qr = qrcode.qrPng(url, { scale: 8, margin: 4 });
+  } catch (_) {
+    throw new ApiError(422, 'qr_too_long', 'لینک اشتراک برای ساخت کیوآرکد بیش از حد بلند است / The subscription link is too long for a QR code');
+  }
+  const caption = subscriptionCaption(config, url);
+  const sent = await telegram.sendPhotoTo(chatId, qr.buffer, 'subscription-' + Number(row.id) + '.png', caption);
+  lastTelegramSendAt.set(Number(viewer.id), now);
+  audit(req, 'config.send_telegram', 'config', row.id, {
+    email: row.email, chatId, url, qrVersion: qr.version, ecl: qr.ecl,
+  });
+  return {
+    sent: true,
+    chatId,
+    url,
+    messageId: Number(sent?.message_id || 0),
+    qrVersion: qr.version,
   };
 }
 
@@ -3712,6 +3922,8 @@ module.exports = {
   transferCustomer,
   removeConfig,
   deletePackage,
+  sendToTelegram,
+  packageStatusSql,
   groupFor,
   updateIdentity,
   addInbound,

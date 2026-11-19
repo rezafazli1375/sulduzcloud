@@ -393,6 +393,11 @@ function migrate(db) {
   // existing client but stays a row of ours ('panel'), which is what lets removing it
   // undo our own write instead of deleting something on the seller's panel.
   ensureColumn(db, 'configs', 'origin', "TEXT NOT NULL DEFAULT 'panel'");
+  // Panel v2.0.0: when the cleanup sweep first sees a package whose shared
+  // quota is fully used, it stamps this moment on every member row. The grace
+  // period for «تمام‌شده» counts from the stamp, because x-ui counters carry no
+  // "became full at" time of their own. 0 = never seen depleted.
+  ensureColumn(db, 'configs', 'depleted_at', 'INTEGER NOT NULL DEFAULT 0');
   // Panel v1.5.4 — the four new surfaces, all additive:
   //
   //   topup_requests.method/reference/card_number/paid_at/auto_approved

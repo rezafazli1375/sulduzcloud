@@ -19,6 +19,7 @@ import {
   QrCode,
   RefreshCw,
   RotateCcw,
+  Send,
   Server,
   Ticket,
   Trash2,
@@ -327,6 +328,17 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
       refresh();
       detail.refetch();
     },
+    onError,
+  });
+
+  // v2.0.0: hand this subscription to the viewer's OWN Telegram — the bot sends
+  // ONE message carrying the link and its QR, styled so it can be forwarded
+  // straight to the customer. The chat id is read from the account row on the
+  // server, never from the request; a missing id or a switched-off bot is a
+  // clear refusal, not a silent failure.
+  const sendTelegram = useMutation({
+    mutationFn: () => api.post(`${base}/${configId}/send-telegram`),
+    onSuccess: () => toast.success(t('configs.detail.sendTelegramDone')),
     onError,
   });
 
@@ -698,6 +710,14 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
                       {t('common.subscription')}
                     </span>
                     <div className="flex items-center gap-1">
+                      <IconButton
+                        icon={sendTelegram.isPending ? Loader2 : Send}
+                        variant="ghost"
+                        label={t('configs.detail.sendTelegram')}
+                        disabled={sendTelegram.isPending}
+                        className={sendTelegram.isPending ? 'animate-pulse text-cyan-300' : 'text-cyan-300'}
+                        onClick={() => sendTelegram.mutate()}
+                      />
                       <IconButton icon={QrCode} variant="ghost" label={t('common.qr')} onClick={() => setQr({ title: t('common.subscription'), value: subUrl })} />
                       <CopyButton value={subUrl} iconOnly />
                     </div>

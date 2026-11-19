@@ -143,6 +143,36 @@ const DEFAULTS = {
     minute: 30,
     keep: 14,
   },
+  // v2.0.0: scheduled removal of finished subscriptions. Off by default — an
+  // upgrade must never start deleting anyone's customers by itself. The sweep
+  // (services/cleanup.js) runs every `intervalHours` while `enabled`, and only
+  // touches packages that have been expired / fully used for `graceDays` days,
+  // so a customer who renews within the grace window keeps his subscription.
+  //
+  //   expired / depleted   — which finished states are swept at all;
+  //   graceDays            — days a package must have STAYED finished. Expiry
+  //                          counts from expiry_at; depletion from the moment
+  //                          the sweep first saw it full (configs.depleted_at);
+  //   includeExternal      — adopted packages (origin='external') belong to a
+  //                          client on ANOTHER operator's panel. Off means they
+  //                          are never swept; on means their rows are forgotten
+  //                          here (deletePackage never deletes remotely anyway);
+  //   notifyReseller       — the in-panel «اشتراک حذف شد» notice per deletion;
+  //   maxPerRun            — ceiling per sweep, so one tick cannot wipe a fleet;
+  //   lastRunAt/lastSummary— written by the sweep itself, read by the settings
+  //                          tab. Not user-editable through the form guards.
+  cleanup: {
+    enabled: false,
+    expired: true,
+    depleted: true,
+    graceDays: 7,
+    intervalHours: 6,
+    includeExternal: false,
+    notifyReseller: true,
+    maxPerRun: 50,
+    lastRunAt: 0,
+    lastSummary: '',
+  },
   telegram: {
     enabled: false,
     botToken: '',
@@ -460,6 +490,7 @@ function allRedacted() {
     billing: redactSection('billing', getSetting('billing')),
     payment: redactSection('payment', getSetting('payment')),
     backup: redactSection('backup', getSetting('backup')),
+    cleanup: redactSection('cleanup', getSetting('cleanup')),
     telegram: redactSection('telegram', getSetting('telegram')),
     security: redactSection('security', getSetting('security')),
   };

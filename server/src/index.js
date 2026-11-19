@@ -239,6 +239,34 @@ function startAutoApproveTimer() {
   }, 60000).unref();
 }
 
+function startCleanupTimer() {
+  // v2.0.0: «زمان‌بندی حذف اشتراک‌های تمام‌شده و منقضی». Same shape as the other
+  // schedules: a cheap 60s tick that re-reads its settings, so the owner's switch
+  // takes effect within a minute without a restart. Unlike the auto-approve
+  // sweep, lastRunAt is PERSISTED on the settings row — a restart must not let a
+  // six-hour schedule fire again six seconds after boot.
+  const cleanup = require('./services/cleanup');
+  let running = false;
+  setInterval(async () => {
+    if (running) return;
+    try {
+      const cfg = settings.getSetting('cleanup');
+      if (!cfg.enabled) return;
+      const everyMs = Math.min(168, Math.max(1, Number(cfg.intervalHours) || 6)) * 3600000;
+      if (Date.now() - Number(cfg.lastRunAt || 0) < everyMs) return;
+      running = true;
+      const summary = await cleanup.runCleanup();
+      if (summary.deleted || summary.stamped || summary.failed) {
+        log(`[cleanup] checked ${summary.checked}, deleted ${summary.deleted}, stamped ${summary.stamped}, grace ${summary.skippedGrace}, external ${summary.skippedExternal}, capped ${summary.capped}, failed ${summary.failed}`);
+      }
+    } catch (err) {
+      logError('[cleanup] sweep failed:', err.message);
+    } finally {
+      running = false;
+    }
+  }, 60000).unref();
+}
+
 function start() {
   getDb();
   settings.ensureDefaults();
@@ -249,6 +277,7 @@ function start() {
     startAutoBackupTimer();
     startDailyReportTimer();
     startAutoApproveTimer();
+    startCleanupTimer();
     // v1.5.2: the reseller bot. It never blocks the boot — start() only checks
     // the webhook and then polls in the background, and a bot that is switched
     // off in settings stays idle without a single network call.
