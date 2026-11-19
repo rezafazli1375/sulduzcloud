@@ -4840,8 +4840,12 @@ function startMockXui(inboundRows) {
           tables.includes('plans') && tables.includes('topup_requests') && planCols.includes('price')
             && planCols.includes('inbound_ids') && planCols.includes('visible') && planCols.includes('server_id'),
           `tables=${tables.length} planCols=${planCols.length}`);
-        check('the plans table is the nineteenth, beside the eighteen of 1.5.3',
-          tables.length === 19, tables.join(','));
+        // v1.5.8: plan_purchases is the twentieth table, and plans grew the three
+        // shelf columns (category / per_user_limit / allowed_users).
+        check('v1.5.8 adds the take-ledger beside the nineteen tables of 1.5.4',
+          tables.length === 20 && tables.includes('plan_purchases')
+            && planCols.includes('category') && planCols.includes('per_user_limit') && planCols.includes('allowed_users'),
+          tables.join(','));
 
         await request('PATCH', '/api/admin/settings/payment', {
           cookies, csrf,
@@ -5215,10 +5219,646 @@ function startMockXui(inboundRows) {
             && onNode25(pkgEmail25) === LINE25('برچسب نماینده'),
           `status=${newOwnerRename25.status} node="${onNode25(pkgEmail25)}"`);
         const wireVersion25 = (await request('GET', '/api/health')).json?.version;
-        check('this build is v1.5.5 on the wire too', wireVersion25 === '1.5.5', `version=${wireVersion25}`);
+        check('this build is v1.5.8 on the wire too', wireVersion25 === '1.5.8', `version=${wireVersion25}`);
       } finally {
         if (lifted25) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit25 } });
         tdb.close();
+      }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════ v1.5.6
+    //
+    // «امکان انتقال چند کانفینگ به یک نماینده» — the tick boxes on جستجوی کانفینگ.
+    //
+    // One endpoint, two verbs, because the search page mixes both kinds of hit: a
+    // client this panel already holds is MOVED (the whole package, ledger and all),
+    // a client nobody here holds is ADOPTED. The batch reuses transferCustomer and
+    // adoptNodeClient untouched, so every guard they have decides each item here
+    // too. The checks read the same fact from panel.db AND from mockXui.clients and
+    // refuse a release where the two disagree — or where a preview wrote anything.
+    {
+      const bdb = new Database(path.join(DATA_DIR, 'panel.db'));
+      const P26 = 'Bulk-Pass-12345';
+      const cfg26 = (id) => bdb.prepare('SELECT * FROM configs WHERE id = ?').get(Number(id)) || {};
+      const rowsOf26 = (email) => bdb.prepare('SELECT * FROM configs WHERE email = ? ORDER BY id').all(String(email));
+      const liveOf26 = (email) => rowsOf26(email).filter((row) => Number(row.deleted_at) === 0);
+      const live26 = (userId) => Number(bdb.prepare(
+        'SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND deleted_at = 0'
+      ).get(Number(userId)).c);
+      const booked26 = (userId) => Number(bdb.prepare(
+        'SELECT COUNT(*) AS c FROM usage_daily WHERE user_id = ?'
+      ).get(Number(userId)).c);
+      const notes26 = (userId, title) => bdb.prepare(
+        'SELECT * FROM notifications WHERE user_id = ? AND title = ?'
+      ).all(Number(userId), String(title));
+      const noteCount26 = () => Number(bdb.prepare('SELECT COUNT(*) AS c FROM notifications').get().c);
+      const audits26 = (action) => Number(bdb.prepare(
+        'SELECT COUNT(*) AS c FROM audit_logs WHERE action = ?'
+      ).get(String(action)).c);
+      const configCount26 = () => Number(bdb.prepare('SELECT COUNT(*) AS c FROM configs').get().c);
+      const owners26 = () => JSON.stringify(bdb.prepare(
+        'SELECT id, user_id FROM configs ORDER BY id'
+      ).all().map((row) => [Number(row.id), Number(row.user_id)]));
+      const code26 = (res) => String(res.json?.error?.code || '');
+      const dayKey26 = (ts) => new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Tehran', year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date(ts));
+      const WRITE26 = /\/clients\/(add|update\/|del\/|bulkAttach|bulkEnable|bulkDisable|bulkAdjust|resetTraffic\/)|\/detach$/;
+      const writes26 = (from) => mockXui.calls.slice(from).filter((call) => WRITE26.test(call.route)).map((call) => call.route);
+      const mkUser26 = async (username, extra = {}) => {
+        const created = await request('POST', '/api/admin/users', {
+          cookies, csrf, body: { username, password: P26, role: 'reseller', balance: 0, ...extra },
+        });
+        return { id: Number(created.json?.data?.user?.id || 0), status: created.status };
+      };
+      const login26 = async (username) => {
+        const res = await request('POST', '/api/auth/login', { body: { username, password: P26 } });
+        return { status: res.status, cookies: cookiesFrom(res.headers), csrf: res.json?.data?.csrf };
+      };
+      const bulk26 = (items, toUserId, extra = {}, who) => request('POST', '/api/admin/configs/bulk-assign', {
+        ...(who || { cookies, csrf }),
+        body: { items, toUserId, ...extra },
+      });
+      const item26 = (email) => ({ email, serverId: primaryId });
+      const seed26 = (email, comment, inboundIds, gb = 10) => {
+        mockXui.clients.set(email, {
+          email, id: `uuid-${email}`, subId: `sub-${email}`, comment,
+          totalGB: gb * 1024 ** 3, expiryTime: Date.now() + 30 * 86400000, enable: true,
+          up: 1024, down: 2048, inboundIds,
+        });
+        return email;
+      };
+
+      let limit26 = 10;
+      let lifted26 = false;
+      // Marked AFTER the fixtures: building the three test packages really does
+      // call /clients/add, and that is the point of a package — what must never
+      // touch the node is the handing-over itself.
+      let blockStart26 = 0;
+      try {
+        const secRead26 = await request('GET', '/api/admin/settings', { cookies });
+        limit26 = Number(secRead26.json?.data?.settings?.security?.loginRateLimit || 10);
+        lifted26 = (await request('PATCH', '/api/admin/settings/security', {
+          cookies, csrf, body: { loginRateLimit: 100 },
+        })).status === 200;
+        await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } });
+
+        const src26 = await mkUser26('bulksrc');
+        const dst26 = await mkUser26('bulkdst');
+        const capped26 = await mkUser26('bulkcapped', { max_configs: 1 });
+        const off26 = await mkUser26('bulkoff');
+        const perm26 = await mkUser26('bulkperm');
+        const permSess26 = await login26('bulkperm');
+        bdb.prepare('UPDATE users SET import_configs = 0 WHERE id = ?').run(off26.id);
+
+        const build26 = async (name) => {
+          const res = await request('POST', '/api/admin/configs', {
+            cookies, csrf,
+            body: { userId: src26.id, inboundIds: [901, 902], gb: 10, days: 30, label: name, customerName: name },
+          });
+          const rows = res.json?.data?.configs || [];
+          return { status: res.status, id: Number(rows[0]?.id || 0), email: String(rows[0]?.email || ''), ids: rows.map((row) => Number(row.id)) };
+        };
+        const pkgA26 = await build26('بستهٔ الف');
+        const pkgB26 = await build26('بستهٔ ب');
+        const pkgC26 = await build26('بستهٔ ج');
+        const book26 = bdb.prepare(
+          'INSERT INTO usage_daily (config_id, user_id, day, up_bytes, down_bytes) VALUES (?, ?, ?, ?, ?)'
+        );
+        for (const pkg of [pkgA26, pkgB26, pkgC26]) {
+          for (const id of pkg.ids) {
+            book26.run(id, src26.id, dayKey26(Date.now() - 86400000), 1024, 2048);
+            book26.run(id, src26.id, dayKey26(Date.now()), 4096, 8192);
+          }
+        }
+        const nodeA26 = seed26('v156node-a', 'مشتری آمادهٔ الف', [901, 902], 20);
+        const nodeB26 = seed26('v156node-b', 'مشتری آمادهٔ ب', [901], 5);
+        const nodeC26 = seed26('v156node-c', 'مشتری آمادهٔ ج', [902], 5);
+        const nodeD26 = seed26('v156node-d', 'مشتری آمادهٔ د', [901], 5);
+        const nodeE26 = seed26('v156node-e', 'مشتری آمادهٔ ه', [902], 5);
+        const nodeF26 = seed26('v156node-f', 'مشتری آمادهٔ و', [901, 902], 15);
+        const orphan26 = seed26('v156node-orphan', 'کانال ناشناخته', [4242], 0);
+        const missing26 = 'v156node-not-there';
+        blockStart26 = mockXui.calls.length;
+
+        check('v1.5.6 the fixtures exist: five resellers, three two-channel packages, six node clients, the monitor parked',
+          [src26.id, dst26.id, capped26.id, off26.id, perm26.id].every((id) => id > 0)
+            && permSess26.status === 200 && lifted26
+            && [pkgA26, pkgB26, pkgC26].every((pkg) => pkg.status === 201 && pkg.ids.length === 2)
+            && live26(src26.id) === 6 && booked26(src26.id) === 12,
+          `src=${src26.id} dst=${dst26.id} login=${permSess26.status} live=${live26(src26.id)} booked=${booked26(src26.id)}`);
+
+        // ───────────────────────────── the preview: a question, not an action
+        const mixed26 = [item26(pkgA26.email), item26(pkgB26.email), item26(nodeA26), item26(nodeB26)];
+        const before26 = {
+          configs: configCount26(), owners: owners26(), notes: noteCount26(),
+          transfer: audits26('config.transfer'), adopt: audits26('config.adopt'), bulk: audits26('config.bulk_assign'),
+          bookedSrc: booked26(src26.id), bookedDst: booked26(dst26.id),
+        };
+        const markPreview26 = mockXui.calls.length;
+        const preview26 = await bulk26(mixed26, dst26.id, { dryRun: true, note: 'پیش‌نمایش' });
+        const pv26 = preview26.json?.data || {};
+        const pvRows26 = pv26.results || [];
+        check('v1.5.6 one preview classifies a mixed selection: two moves and two adoptions, each with its own rows',
+          preview26.status === 200 && pv26.dryRun === true && pv26.total === 4
+            && pv26.moved === 2 && pv26.adopted === 2 && pv26.failed === 0 && pv26.already === 0
+            && pvRows26[0].action === 'transfer' && pvRows26[1].action === 'transfer'
+            && pvRows26[2].action === 'adopt' && pvRows26[3].action === 'adopt'
+            && pvRows26[0].configs.length === 2 && pvRows26[2].inboundCount === 2 && pvRows26[3].inboundCount === 1
+            && String(pvRows26[0].from[0]) === 'bulksrc',
+          `status=${preview26.status} moved=${pv26.moved} adopted=${pv26.adopted} actions=${pvRows26.map((row) => row.action).join(',')} counts=${pvRows26.map((row) => row.inboundCount).join(',')}`);
+        check('and the preview wrote NOTHING: no row, no owner, no ledger, no notification, no audit, no node call',
+          configCount26() === before26.configs && owners26() === before26.owners
+            && noteCount26() === before26.notes && booked26(src26.id) === before26.bookedSrc
+            && booked26(dst26.id) === before26.bookedDst
+            && audits26('config.transfer') === before26.transfer && audits26('config.adopt') === before26.adopt
+            && audits26('config.bulk_assign') === before26.bulk
+            && writes26(markPreview26).length === 0,
+          `configs=${configCount26()}/${before26.configs} notes=${noteCount26()}/${before26.notes} bulk=${audits26('config.bulk_assign')} writes=${writes26(markPreview26).join(',') || 'none'}`);
+
+        const badPreview26 = await bulk26([item26(pkgC26.email), item26(missing26), item26(orphan26)], dst26.id, { dryRun: true });
+        const bp26 = badPreview26.json?.data || {};
+        const bpRows26 = bp26.results || [];
+        check('a preview names the two that cannot land — a client the node no longer has and a channel nobody knows',
+          badPreview26.status === 200 && bp26.moved === 1 && bp26.failed === 2
+            && bpRows26[0].ok === true && bpRows26[1].code === 'xui_client_missing' && bpRows26[2].code === 'no_known_inbound'
+            && configCount26() === before26.configs && owners26() === before26.owners,
+          `moved=${bp26.moved} failed=${bp26.failed} codes=${bpRows26.map((row) => row.code || 'ok').join(',')}`);
+
+        // ───────────────────────────── the real batch
+        const markRun26 = mockXui.calls.length;
+        const run26 = await bulk26(mixed26, dst26.id, { note: 'واگذاری گروهی' });
+        const rn26 = run26.json?.data || {};
+        check('v1.5.6 the real batch hands all four over in one click, and every row of each package moves',
+          run26.status === 200 && rn26.moved === 2 && rn26.adopted === 2 && rn26.failed === 0 && rn26.rows === 7
+            && [pkgA26, pkgB26].every((pkg) => rowsOf26(pkg.email).every((row) => Number(row.user_id) === dst26.id))
+            && live26(dst26.id) === 7 && live26(src26.id) === 2
+            && booked26(dst26.id) === 8 && booked26(src26.id) === 4,
+          `status=${run26.status} moved=${rn26.moved} adopted=${rn26.adopted} rows=${rn26.rows} dst=${live26(dst26.id)} booked=${booked26(dst26.id)}/${booked26(src26.id)}`);
+        const adoptedA26 = liveOf26(nodeA26);
+        const adoptedB26 = liveOf26(nodeB26);
+        check('the adopted customers are external rows, one group token each, named after the remark they already carried',
+          adoptedA26.length === 2 && adoptedB26.length === 1
+            && [...adoptedA26, ...adoptedB26].every((row) => row.origin === 'external' && Number(row.user_id) === dst26.id)
+            && new Set(adoptedA26.map((row) => row.sub_id)).size === 1
+            && String(adoptedA26[0].label) === 'مشتری آمادهٔ الف' && String(adoptedB26[0].label) === 'مشتری آمادهٔ ب'
+            && Number(adoptedA26[0].total_bytes) === 20 * 1024 ** 3,
+          `rows=${adoptedA26.length}/${adoptedB26.length} label=${adoptedA26[0]?.label} origin=${adoptedA26[0]?.origin}`);
+        check('a hand-over never writes to x-ui: every client is still on the node, exactly as it was',
+          writes26(markRun26).length === 0
+            && [pkgA26.email, pkgB26.email, nodeA26, nodeB26].every((email) => mockXui.clients.has(email)),
+          `writes=${writes26(markRun26).join(',') || 'none'}`);
+        const toBulk26 = notes26(dst26.id, 'چند کانفیگ به لیست شما اضافه شد');
+        const fromBulk26 = notes26(src26.id, 'چند مشتری منتقل شد');
+        check('twenty customers are not twenty pings: ONE notification to the target and ONE to the source',
+          toBulk26.length === 1 && fromBulk26.length === 1
+            && notes26(dst26.id, 'مشتری به شما منتقل شد').length === 0
+            && notes26(dst26.id, 'کانفیگ به لیست شما اضافه شد').length === 0
+            && notes26(src26.id, 'مشتری منتقل شد').length === 0
+            && String(toBulk26[0].body).includes(nodeA26) && String(fromBulk26[0].body).includes('bulkdst'),
+          `to=${toBulk26.length} from=${fromBulk26.length} single=${notes26(dst26.id, 'مشتری به شما منتقل شد').length}`);
+        const bulkAudit26 = bdb.prepare(
+          "SELECT * FROM audit_logs WHERE action = 'config.bulk_assign' ORDER BY id DESC LIMIT 1"
+        ).get() || {};
+        const bulkDetails26 = String(bulkAudit26.details || '');
+        check('one audit line for the whole batch, with the per-customer outcome inside it',
+          audits26('config.bulk_assign') === 1 && String(bulkAudit26.entity) === 'user'
+            && Number(bulkAudit26.entity_id) === dst26.id
+            && bulkDetails26.includes('"moved":2') && bulkDetails26.includes('"adopted":2')
+            && bulkDetails26.includes('واگذاری گروهی') && bulkDetails26.includes(nodeA26),
+          `count=${audits26('config.bulk_assign')} entity=${bulkAudit26.entity} ${bulkDetails26.slice(0, 90)}`);
+
+        const again26 = await bulk26(mixed26, dst26.id);
+        const ag26 = again26.json?.data || {};
+        check('running the same batch again changes nothing: all four answer «already his»',
+          again26.status === 200 && ag26.already === 4 && ag26.moved === 0 && ag26.adopted === 0 && ag26.failed === 0
+            && configCount26() === before26.configs + 3 && live26(dst26.id) === 7,
+          `already=${ag26.already} moved=${ag26.moved} configs=${configCount26()}`);
+
+        // ───────────────────────────── partial success is the point
+        const partial26 = await bulk26([item26(nodeC26), item26(missing26), item26(orphan26)], dst26.id);
+        const pt26 = partial26.json?.data || {};
+        check('v1.5.6 one failure does not sink the batch: the good customer lands, the two bad ones keep their reason',
+          partial26.status === 200 && pt26.adopted === 1 && pt26.failed === 2
+            && liveOf26(nodeC26).length === 1 && Number(liveOf26(nodeC26)[0].user_id) === dst26.id
+            && liveOf26(missing26).length === 0 && liveOf26(orphan26).length === 0
+            && (pt26.results || [])[1].code === 'xui_client_missing' && (pt26.results || [])[2].code === 'no_known_inbound',
+          `adopted=${pt26.adopted} failed=${pt26.failed} codes=${(pt26.results || []).map((row) => row.code || 'ok').join(',')}`);
+
+        // ───────────────────────────── the ceiling is counted across the batch
+        const capPreview26 = await bulk26([item26(pkgA26.email), item26(pkgB26.email)], capped26.id, { dryRun: true });
+        const cp26 = capPreview26.json?.data || {};
+        check('a target with room for ONE package is told so in the preview, not after the second move',
+          capPreview26.status === 200 && cp26.moved === 1 && cp26.failed === 1
+            && (cp26.results || [])[0].ok === true && (cp26.results || [])[1].code === 'limit_configs'
+            && live26(capped26.id) === 0,
+          `moved=${cp26.moved} failed=${cp26.failed} code=${(cp26.results || [])[1]?.code} live=${live26(capped26.id)}`);
+        const capRun26 = await bulk26([item26(pkgA26.email), item26(pkgB26.email)], capped26.id);
+        const cr26 = capRun26.json?.data || {};
+        check('and the real run delivers exactly what the preview promised: one moves, one is refused',
+          capRun26.status === 200 && cr26.moved === 1 && cr26.failed === 1 && live26(capped26.id) === 2
+            && rowsOf26(pkgA26.email).every((row) => Number(row.user_id) === capped26.id)
+            && rowsOf26(pkgB26.email).every((row) => Number(row.user_id) === dst26.id),
+          `moved=${cr26.moved} failed=${cr26.failed} capped=${live26(capped26.id)}`);
+
+        const offRun26 = await bulk26([item26(nodeD26), item26(nodeE26)], off26.id);
+        const or26 = offRun26.json?.data || {};
+        check('a reseller who switched adoption off refuses every adoption, and nothing is written for him',
+          offRun26.status === 200 && or26.failed === 2 && or26.adopted === 0 && live26(off26.id) === 0
+            && (or26.results || []).every((row) => row.code === 'import_disabled')
+            && liveOf26(nodeD26).length === 0 && liveOf26(nodeE26).length === 0,
+          `failed=${or26.failed} codes=${(or26.results || []).map((row) => row.code).join(',')} live=${live26(off26.id)}`);
+
+        // ───────────────────────────── who may ask, and what a bad ask answers
+        const shopBulk26 = await bulk26(mixed26, dst26.id, {}, { cookies: permSess26.cookies, csrf: permSess26.csrf });
+        check('a reseller cannot hand configs to anybody, himself included', shopBulk26.status === 403, `status=${shopBulk26.status}`);
+        // v1.5.8 raised the batch ceiling from 100 to 1000 — the overflow probe
+        // must overflow the NEW ceiling, not the old one.
+        const tooMany26 = Array.from({ length: 1001 }, (_, i) => item26(`v156fake-${i}`));
+        const badAsks26 = await Promise.all([
+          bulk26([], dst26.id),
+          bulk26(tooMany26, dst26.id),
+          bulk26([item26(pkgC26.email)], 0),
+          bulk26([item26(pkgC26.email)], 999999),
+          bulk26([item26(pkgC26.email)], 1),
+        ]);
+        check('five wrong asks are five different answers, and none of them moves a row',
+          badAsks26.map((res) => `${res.status}:${code26(res)}`).join(' ')
+            === '422:items_required 422:too_many_items 422:reseller_required 404:user_not_found 409:target_is_admin'
+            && rowsOf26(pkgC26.email).every((row) => Number(row.user_id) === src26.id),
+          badAsks26.map((res) => `${res.status}:${code26(res)}`).join(' '));
+        const dup26 = await bulk26([item26(pkgC26.email), item26(pkgC26.email)], dst26.id, { dryRun: true });
+        check('the same customer ticked twice is one customer, not two',
+          dup26.status === 200 && dup26.json?.data?.total === 1 && dup26.json?.data?.moved === 1,
+          `total=${dup26.json?.data?.total}`);
+
+        // ───────────────────────────── one item still behaves like v1.5.5
+        // Earlier batches in this block already sent dst the aggregated note, so
+        // the promise is «a single move adds none of them», not «exactly one ever».
+        const bulkNotesBefore26 = notes26(dst26.id, 'چند کانفیگ به لیست شما اضافه شد').length;
+        const soloMove26 = await bulk26([item26(pkgC26.email)], dst26.id, { note: 'تکی' });
+        const sm26 = soloMove26.json?.data || {};
+        check('a single move keeps the v1.5.5 notifications: each side is told about that one customer',
+          soloMove26.status === 200 && sm26.moved === 1
+            && notes26(dst26.id, 'مشتری به شما منتقل شد').length === 1
+            && notes26(src26.id, 'مشتری منتقل شد').length === 1
+            && notes26(dst26.id, 'چند کانفیگ به لیست شما اضافه شد').length === bulkNotesBefore26
+            && rowsOf26(pkgC26.email).every((row) => Number(row.user_id) === dst26.id),
+          `moved=${sm26.moved} to=${notes26(dst26.id, 'مشتری به شما منتقل شد').length} from=${notes26(src26.id, 'مشتری منتقل شد').length} bulk=${notes26(dst26.id, 'چند کانفیگ به لیست شما اضافه شد').length}/${bulkNotesBefore26}`);
+        const soloAdopt26 = await bulk26([item26(nodeF26)], dst26.id, {
+          label: 'برچسب تکی', customerName: 'مشتری تکی', customerPhone: '09120000000',
+        });
+        const sa26 = soloAdopt26.json?.data || {};
+        const soloRows26 = liveOf26(nodeF26);
+        check('a single adoption still takes the typed label, name and phone — a batch never stamps one name on everybody',
+          soloAdopt26.status === 200 && sa26.adopted === 1 && soloRows26.length === 2
+            && soloRows26.every((row) => String(row.label) === 'برچسب تکی'
+              && String(row.customer_name) === 'مشتری تکی' && String(row.customer_phone) === '09120000000')
+            && notes26(dst26.id, 'کانفیگ به لیست شما اضافه شد').length === 1,
+          `adopted=${sa26.adopted} label=${soloRows26[0]?.label} note=${notes26(dst26.id, 'کانفیگ به لیست شما اضافه شد').length}`);
+        check('the whole v1.5.6 block never wrote to a node: handing over is a panel-only fact',
+          writes26(blockStart26).length === 0,
+          `writes=${writes26(blockStart26).join(',') || 'none'}`);
+      } finally {
+        if (lifted26) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit26 } });
+        bdb.close();
+      }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════ v1.5.8
+    //
+    // The owner's three sentences, each proven against a running server:
+    //   ۱) «۲۱۰ تا کانفینگ با پیشوند speed دارم ولی جستجو ۶۰ تا میاره» — the search
+    //      must return EVERY hit, and say so honestly when a caller caps it.
+    //   ۲) «کانفیگ‌هایی که روی نود ثبت نشده رو هم به فیلتر وضعیت اضافه کن» — the
+    //      mark comes from a REAL refresh against the mock node (client deleted →
+    //      «record not found»), not from a hand-written column, and the grouped
+    //      list, the reseller list, API v1 and the CSV must agree about it.
+    //   ۳) «پلن‌های تست / عمومی / اختصاصی + محدودیت گرفتن برای هر نماینده» — the
+    //      exclusive shelf exists only for its named resellers, the take limit
+    //      counts new AND renewal, and a refusal moves neither money nor a node.
+    {
+      const bdb = new Database(path.join(DATA_DIR, 'panel.db'));
+      const P28 = 'Shelf-Pass-12345';
+      const code28 = (res) => String(res.json?.error?.code || '');
+      const mkUser28 = async (username, extra = {}) => {
+        const created = await request('POST', '/api/admin/users', {
+          cookies, csrf, body: { username, password: P28, role: 'reseller', balance: 0, max_configs: 100, ...extra },
+        });
+        return { id: Number(created.json?.data?.user?.id || 0), status: created.status };
+      };
+      const login28 = async (username) => {
+        const res = await request('POST', '/api/auth/login', { body: { username, password: P28 } });
+        return { status: res.status, cookies: cookiesFrom(res.headers), csrf: res.json?.data?.csrf };
+      };
+      const seed28 = (email, comment, inboundIds, gb = 5) => {
+        mockXui.clients.set(email, {
+          email, id: `uuid-${email}`, subId: `sub-${email}`, comment,
+          totalGB: gb * 1024 ** 3, expiryTime: Date.now() + 30 * 86400000, enable: true,
+          up: 0, down: 0, inboundIds,
+        });
+        return email;
+      };
+      const build28 = async (userId, name) => {
+        const res = await request('POST', '/api/admin/configs', {
+          cookies, csrf,
+          body: { userId, inboundIds: [901, 902], gb: 5, days: 30, label: name, customerName: name },
+        });
+        const rows = res.json?.data?.configs || [];
+        return { status: res.status, id: Number(rows[0]?.id || 0), email: String(rows[0]?.email || ''), ids: rows.map((row) => Number(row.id)) };
+      };
+      const syncOf28 = (email) => bdb.prepare(
+        'SELECT sync_status FROM configs WHERE email = ? AND deleted_at = 0 ORDER BY id'
+      ).all(String(email)).map((row) => String(row.sync_status));
+      const takes28 = (planId, userId) => bdb.prepare(
+        'SELECT * FROM plan_purchases WHERE plan_id = ? AND user_id = ? ORDER BY id'
+      ).all(Number(planId), Number(userId));
+      const live28 = (userId) => Number(bdb.prepare(
+        'SELECT COUNT(*) AS c FROM configs WHERE user_id = ? AND deleted_at = 0'
+      ).get(Number(userId)).c);
+      const bal28 = (userId) => Number(bdb.prepare('SELECT balance FROM users WHERE id = ?').get(Number(userId))?.balance || 0);
+      const WRITE28 = /\/clients\/(add|update\/|del\/|bulkAttach|bulkEnable|bulkDisable|bulkAdjust|resetTraffic\/)|\/detach$/;
+
+      const speedEmails28 = [];
+      let limit28 = 10;
+      let lifted28 = false;
+      let parked28 = false;
+      try {
+        const secRead28 = await request('GET', '/api/admin/settings', { cookies });
+        limit28 = Number(secRead28.json?.data?.settings?.security?.loginRateLimit || 10);
+        lifted28 = (await request('PATCH', '/api/admin/settings/security', {
+          cookies, csrf, body: { loginRateLimit: 100 },
+        })).status === 200;
+        parked28 = (await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 3600 } })).status === 200;
+        // The money assertions below need billing ON and commission OFF — the
+        // state v1.5.4 left behind, stated here so the block does not depend on it.
+        await request('PATCH', '/api/admin/settings/billing', { cookies, csrf, body: { enabled: true, commissionPercent: 0 } });
+
+        // ───────────────────────────── ۱) the 210 «speed» clients, all of them
+        for (let i = 0; i < 210; i += 1) {
+          speedEmails28.push(seed28(`v158speed-${String(i).padStart(3, '0')}`, 'مشتری سرعت', [901, 902], 10));
+        }
+        seed28('v158plain-one', 'کانال بی‌ربط', [901], 5);
+        const markSearch28 = mockXui.calls.length;
+        const all28 = await request('GET', `/api/admin/node-clients?q=v158speed&serverId=${primaryId}`, { cookies });
+        const ad28 = all28.json?.data || {};
+        check('the owner\'s 210 «speed» clients all come back — no silent page of 60',
+          all28.status === 200 && (ad28.rows || []).length === 210 && ad28.truncated === false && ad28.limit === 1000,
+          `rows=${(ad28.rows || []).length} truncated=${ad28.truncated} limit=${ad28.limit}`);
+        const small28 = await request('GET', `/api/admin/node-clients?q=v158speed&serverId=${primaryId}&limit=50`, { cookies });
+        check('a caller that names a small limit still gets it, and is told the list was cut',
+          small28.status === 200 && (small28.json?.data?.rows || []).length === 50 && small28.json?.data?.truncated === true,
+          `rows=${(small28.json?.data?.rows || []).length} truncated=${small28.json?.data?.truncated}`);
+        const huge28 = await request('GET', `/api/admin/node-clients?q=v158speed&serverId=${primaryId}&limit=999999`, { cookies });
+        check('even a greedy limit is capped at 5000, and the match is still the whole 210',
+          huge28.status === 200 && huge28.json?.data?.limit === 5000
+            && (huge28.json?.data?.rows || []).length === 210 && huge28.json?.data?.truncated === false,
+          `limit=${huge28.json?.data?.limit} rows=${(huge28.json?.data?.rows || []).length}`);
+        check('the search stayed a read: not one write reached the node',
+          mockXui.calls.slice(markSearch28).filter((call) => WRITE28.test(call.route)).length === 0,
+          `writes=${mockXui.calls.slice(markSearch28).filter((call) => WRITE28.test(call.route)).map((call) => call.route).join(',') || 'none'}`);
+
+        // ───────────────────────────── ۲) «روی نود ثبت نشده» from a real refresh
+        const shop28 = await mkUser28('v158shop', { balance: 1000000 });
+        const other28 = await mkUser28('v158other', { balance: 1000000 });
+        const shopSess28 = await login28('v158shop');
+        const otherSess28 = await login28('v158other');
+        const pkgOk28 = await build28(shop28.id, 'بسته سالم');
+        const pkgGone28 = await build28(shop28.id, 'بسته گم‌شده');
+        const goneClient28 = mockXui.clients.get(pkgGone28.email);
+        mockXui.clients.delete(pkgGone28.email);
+        const refreshGone28 = await request('POST', `/api/admin/configs/${pkgGone28.id}/refresh`, { cookies, csrf });
+        check('a refresh that finds no client marks EVERY row of the package, not just the opened one',
+          refreshGone28.status === 200 && refreshGone28.json?.data?.missingRows === 2
+            && syncOf28(pkgGone28.email).every((s) => s === 'missing') && syncOf28(pkgOk28.email).every((s) => s === ''),
+          `missingRows=${refreshGone28.json?.data?.missingRows} gone=${syncOf28(pkgGone28.email).join(',')} ok=${syncOf28(pkgOk28.email).join(',')}`);
+        const missList28 = await request('GET', `/api/admin/configs?status=missing&userId=${shop28.id}`, { cookies });
+        const md28 = missList28.json?.data || {};
+        check('the status filter finds the broken package whole and leaves the healthy one alone',
+          missList28.status === 200 && md28.total === 1 && (md28.rows || []).length === 1
+            && md28.rows[0].email === pkgGone28.email && md28.rows[0].missingCount === 2
+            && md28.rows[0].syncStatus === 'missing' && md28.rows[0].groupCount === 2,
+          `total=${md28.total} missingCount=${md28.rows?.[0]?.missingCount} sync=${md28.rows?.[0]?.syncStatus}`);
+        const bothList28 = await request('GET', `/api/admin/configs?userId=${shop28.id}`, { cookies });
+        check('without the filter both packages are still listed', bothList28.json?.data?.total === 2, `total=${bothList28.json?.data?.total}`);
+        mockXui.quirks.failGet.add(pkgOk28.email);
+        const refreshSick28 = await request('POST', `/api/admin/configs/${pkgOk28.id}/refresh`, { cookies, csrf });
+        mockXui.quirks.failGet.delete(pkgOk28.email);
+        check('a node that answers with an error is «cannot tell», not «not there»',
+          refreshSick28.status === 200 && refreshSick28.json?.data?.errorRows === 2
+            && refreshSick28.json?.data?.missingRows === 0 && syncOf28(pkgOk28.email).every((s) => s === ''),
+          `errorRows=${refreshSick28.json?.data?.errorRows} missingRows=${refreshSick28.json?.data?.missingRows}`);
+        const shopMiss28 = await request('GET', '/api/reseller/configs?status=missing', { cookies: shopSess28.cookies });
+        check('the reseller\'s own list has the same filter and the same answer',
+          shopMiss28.status === 200 && shopMiss28.json?.data?.total === 1
+            && shopMiss28.json?.data?.rows?.[0]?.email === pkgGone28.email,
+          `total=${shopMiss28.json?.data?.total}`);
+        const key28 = await request('POST', '/api/auth/api-key', { cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: {} });
+        const apiKey28 = key28.json?.data?.apiKey || '';
+        const flatMiss28 = await request('GET', '/api/v1/configs?status=missing', { headers: { 'x-api-key': apiKey28 } });
+        check('API v1 keeps row semantics: both broken channels, one row each',
+          flatMiss28.status === 200 && flatMiss28.json?.data?.total === 2
+            && (flatMiss28.json?.data?.rows || []).every((row) => row.email === pkgGone28.email),
+          `total=${flatMiss28.json?.data?.total}`);
+        const csvMiss28 = await request('GET', `/api/admin/configs/export.csv?status=missing&userId=${shop28.id}`, { cookies });
+        const csvText28 = String(csvMiss28.raw || '');
+        check('the CSV export obeys the same filter: the broken package only, one line per channel',
+          csvMiss28.status === 200 && csvText28.includes(pkgGone28.email) && !csvText28.includes(pkgOk28.email)
+            && csvText28.trim().split('\n').length === 3,
+          `lines=${csvText28.trim().split('\n').length}`);
+        mockXui.clients.set(pkgGone28.email, goneClient28);
+        const refreshBack28 = await request('POST', `/api/admin/configs/${pkgGone28.id}/refresh`, { cookies, csrf });
+        const missAfter28 = await request('GET', `/api/admin/configs?status=missing&userId=${shop28.id}`, { cookies });
+        check('putting the client back and refreshing clears the mark — the filter follows the node',
+          refreshBack28.status === 200 && refreshBack28.json?.data?.refreshedRows === 2
+            && syncOf28(pkgGone28.email).every((s) => s === '') && missAfter28.json?.data?.total === 0,
+          `refreshedRows=${refreshBack28.json?.data?.refreshedRows} total=${missAfter28.json?.data?.total}`);
+
+        // ───────────────────────────── ۳) the three shelves and the take limit
+        const PLAN28 = { name: 'پلن پایه ۱۵۸', gb: 2, days: 30, price: 0, inboundIds: [901] };
+        const badShape28 = await Promise.all([
+          request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN28, category: 'vip' } }),
+          request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN28, per_user_limit: 100001 } }),
+          request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN28, category: 'exclusive', allowed_users: [] } }),
+          request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN28, category: 'exclusive', allowed_users: [1] } }),
+          request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN28, category: 'exclusive', allowed_users: [999999] } }),
+          request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN28, category: 'exclusive', allowed_users: Array.from({ length: 501 }, (_, i) => i + 1) } }),
+        ]);
+        check('six wrong plan shapes are six honest refusals, none of them stored',
+          badShape28.map((res) => `${res.status}:${code28(res)}`).join(' ')
+            === '422:invalid_plan_category 422:invalid_plan_limit 422:exclusive_needs_reseller 422:invalid_plan_reseller 422:invalid_plan_reseller 422:too_many_resellers',
+          badShape28.map((res) => `${res.status}:${code28(res)}`).join(' '));
+        const mkPlan28 = async (body) => {
+          const res = await request('POST', '/api/admin/plans', { cookies, csrf, body: { ...PLAN28, ...body } });
+          return { status: res.status, plan: res.json?.data?.plan || {}, code: code28(res) };
+        };
+        const test28 = await mkPlan28({ name: 'پلن تست ۱۵۸', gb: 1, days: 7, price: 0, category: 'test', per_user_limit: 1 });
+        const pub28 = await mkPlan28({ name: 'پلن عمومی ۱۵۸', gb: 2, days: 30, price: 100, inboundIds: [901, 902], category: 'public', per_user_limit: 2, allowed_users: [shop28.id] });
+        const excl28 = await mkPlan28({ name: 'پلن اختصاصی ۱۵۸', gb: 3, days: 30, price: 50, category: 'exclusive', allowed_users: [shop28.id] });
+        check('the three shelves are written with their limit and their activation list',
+          test28.status === 201 && test28.plan.category === 'test' && test28.plan.perUserLimit === 1
+            && pub28.status === 201 && pub28.plan.category === 'public' && pub28.plan.perUserLimit === 2
+            && excl28.status === 201 && excl28.plan.category === 'exclusive'
+            && (excl28.plan.allowedUsers || []).length === 1 && excl28.plan.allowedUsers[0].username === 'v158shop'
+            && excl28.plan.sold === 0,
+          `test=${test28.code || test28.plan.category} pub=${pub28.code || pub28.plan.category} excl=${excl28.code || excl28.plan.category}`);
+        check('a non-exclusive plan cannot keep a restriction list that nothing enforces',
+          Array.isArray(pub28.plan.allowedUsers) && pub28.plan.allowedUsers.length === 0,
+          JSON.stringify(pub28.plan.allowedUsers));
+        // A row as 1.5.6 would have left it: no shelf, no limit, no list.
+        const legacyIns28 = bdb.prepare(
+          `INSERT INTO plans (name, description, gb, days, price, inbound_ids, server_id, visible, sort, category, per_user_limit, allowed_users, created_at, updated_at)
+           VALUES ('پلن قدیمی ۱۵۸', '', 1, 7, 0, '[901]', ?, 1, 0, '', 0, '', ?, ?)`
+        ).run(primaryId, Date.now(), Date.now());
+        const legacyId28 = Number(legacyIns28.lastInsertRowid);
+        const adminList28 = await request('GET', '/api/admin/plans', { cookies });
+        const legacyView28 = (adminList28.json?.data?.plans || []).find((p) => Number(p.id) === legacyId28) || {};
+        check('a plan written before 1.5.8 lands on the public shelf, unlimited, for everyone',
+          legacyView28.category === 'public' && legacyView28.perUserLimit === 0,
+          `category=${legacyView28.category} limit=${legacyView28.perUserLimit}`);
+        const shopPlans28 = await request('GET', '/api/reseller/plans', { cookies: shopSess28.cookies });
+        const otherPlans28 = await request('GET', '/api/reseller/plans', { cookies: otherSess28.cookies });
+        const planIds28 = (res) => (res.json?.data?.plans || []).map((p) => Number(p.id));
+        const shopIds28 = planIds28(shopPlans28);
+        const otherIds28 = planIds28(otherPlans28);
+        check('the exclusive plan is in its reseller\'s window and in nobody else\'s',
+          shopIds28.includes(excl28.plan.id) && !otherIds28.includes(excl28.plan.id)
+            && shopIds28.includes(test28.plan.id) && otherIds28.includes(test28.plan.id)
+            && shopIds28.includes(pub28.plan.id) && otherIds28.includes(pub28.plan.id),
+          `shop=${JSON.stringify(shopIds28)} other=${JSON.stringify(otherIds28)}`);
+        const shopExcl28 = (shopPlans28.json?.data?.plans || []).find((p) => Number(p.id) === excl28.plan.id) || {};
+        check('a reseller never reads the activation list or the sales counter, only his own quota',
+          !('allowedUsers' in shopExcl28) && !('sold' in shopExcl28) && shopExcl28.taken === 0 && shopExcl28.remaining === null,
+          `keys=${Object.keys(shopExcl28).join(',')}`);
+        const otherCfg28 = await build28(other28.id, 'مشتری بیرونی');
+        const outsider28 = await Promise.all([
+          request('POST', '/api/reseller/plans/quote', { cookies: otherSess28.cookies, csrf: otherSess28.csrf, body: { planId: excl28.plan.id } }),
+          request('POST', '/api/reseller/plans/new', { cookies: otherSess28.cookies, csrf: otherSess28.csrf, body: { planId: excl28.plan.id, customerName: 'دور زدن' } }),
+          request('POST', '/api/reseller/plans/renew', { cookies: otherSess28.cookies, csrf: otherSess28.csrf, body: { planId: excl28.plan.id, configId: otherCfg28.id } }),
+        ]);
+        check('quoting, buying and renewing an exclusive plan are all refused for an outsider, even by id',
+          outsider28.every((res) => res.status === 403 && code28(res) === 'plan_not_for_you'),
+          outsider28.map((res) => `${res.status}:${code28(res)}`).join(' '));
+        const outsiderPrev28 = await request('POST', '/api/reseller/plans/renew/preview', {
+          cookies: otherSess28.cookies, csrf: otherSess28.csrf, body: { planId: excl28.plan.id, configId: otherCfg28.id },
+        });
+        check('the renewal preview says «not usable» instead of offering a dead button',
+          outsiderPrev28.status === 200 && outsiderPrev28.json?.data?.usable === false,
+          `usable=${outsiderPrev28.json?.data?.usable}`);
+
+        // The take limit: one free test take, then a clean 409 on BOTH paths.
+        const quoteOf28 = (planId, sess) => request('POST', '/api/reseller/plans/quote', {
+          cookies: sess.cookies, csrf: sess.csrf, body: { planId },
+        });
+        const q0 = await quoteOf28(test28.plan.id, shopSess28);
+        check('the quote carries the reseller\'s own counter before he buys',
+          q0.status === 200 && q0.json?.data?.taken === 0 && q0.json?.data?.remaining === 1 && q0.json?.data?.limitReached === false,
+          `taken=${q0.json?.data?.taken} remaining=${q0.json?.data?.remaining}`);
+        const buyTest28 = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: test28.plan.id, customerName: 'مشتری تست' },
+        });
+        const testCfgId28 = Number(buyTest28.json?.data?.configs?.[0]?.id || 0);
+        const ledger1 = takes28(test28.plan.id, shop28.id);
+        check('one take is one ledger row, pointing at the package it built',
+          buyTest28.status === 201 && ledger1.length === 1 && ledger1[0].kind === 'new'
+            && Number(ledger1[0].config_id) === testCfgId28 && Number(ledger1[0].created_at) > 1700000000000,
+          `rows=${ledger1.length} kind=${ledger1[0]?.kind} config=${ledger1[0]?.config_id}`);
+        const q1 = await quoteOf28(test28.plan.id, shopSess28);
+        const liveBefore28 = live28(shop28.id);
+        const buyAgain28 = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: test28.plan.id, customerName: 'دوباره' },
+        });
+        const renewAgain28 = await request('POST', '/api/reseller/plans/renew', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: test28.plan.id, configId: testCfgId28 },
+        });
+        check('the second take — new OR renewal — is a clean 409 before any wallet or node write',
+          q1.json?.data?.limitReached === true && q1.json?.data?.remaining === 0
+            && buyAgain28.status === 409 && code28(buyAgain28) === 'plan_limit_reached'
+            && renewAgain28.status === 409 && code28(renewAgain28) === 'plan_limit_reached'
+            && live28(shop28.id) === liveBefore28 && takes28(test28.plan.id, shop28.id).length === 1,
+          `buy=${buyAgain28.status}:${code28(buyAgain28)} renew=${renewAgain28.status}:${code28(renewAgain28)} live=${live28(shop28.id)}/${liveBefore28}`);
+        const prevExh28 = await request('POST', '/api/reseller/plans/renew/preview', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: test28.plan.id, configId: testCfgId28 },
+        });
+        check('the renewal preview agrees: exhausted means unusable',
+          prevExh28.status === 200 && prevExh28.json?.data?.usable === false
+            && prevExh28.json?.data?.limitReached === true && prevExh28.json?.data?.remaining === 0,
+          `usable=${prevExh28.json?.data?.usable} remaining=${prevExh28.json?.data?.remaining}`);
+
+        // A priced plan with limit 2: new + renewal both count, the third is refused.
+        const balBefore28 = bal28(shop28.id);
+        const buyPub28 = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: pub28.plan.id, customerName: 'مشتری عمومی' },
+        });
+        const pubCfgId28 = Number(buyPub28.json?.data?.configs?.[0]?.id || 0);
+        const renewPub28 = await request('POST', '/api/reseller/plans/renew', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: pub28.plan.id, configId: pubCfgId28 },
+        });
+        const ledgerPub28 = takes28(pub28.plan.id, shop28.id);
+        check('buying and renewing are both «takes»: two ledger rows, two wallet debits',
+          buyPub28.status === 201 && renewPub28.status === 200
+            && ledgerPub28.map((row) => row.kind).join(',') === 'new,renew'
+            && balBefore28 - bal28(shop28.id) === 200,
+          `kinds=${ledgerPub28.map((row) => row.kind).join(',')} debit=${balBefore28 - bal28(shop28.id)}`);
+        const balAtLimit28 = bal28(shop28.id);
+        const thirdPub28 = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: pub28.plan.id, customerName: 'سومین' },
+        });
+        check('the third take is refused and a refusal never touches the wallet',
+          thirdPub28.status === 409 && code28(thirdPub28) === 'plan_limit_reached' && bal28(shop28.id) === balAtLimit28,
+          `status=${thirdPub28.status}:${code28(thirdPub28)} balance=${bal28(shop28.id)}/${balAtLimit28}`);
+        const adminPub28 = await request('GET', '/api/admin/plans', { cookies });
+        const pubAdmin28 = (adminPub28.json?.data?.plans || []).find((p) => Number(p.id) === pub28.plan.id) || {};
+        check('the owner sees the sales counter of his plan', pubAdmin28.sold === 2, `sold=${pubAdmin28.sold}`);
+
+        // Limit 0 = unlimited, on the exclusive shelf, for the named reseller.
+        const exclBuy1 = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: excl28.plan.id, customerName: 'اختصاصی یک' },
+        });
+        const exclBuy2 = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: excl28.plan.id, customerName: 'اختصاصی دو' },
+        });
+        const exclQuote28 = await quoteOf28(excl28.plan.id, shopSess28);
+        check('limit 0 means unlimited: the named reseller takes his exclusive plan twice',
+          exclBuy1.status === 201 && exclBuy2.status === 201
+            && exclQuote28.json?.data?.remaining === null && exclQuote28.json?.data?.taken === 2,
+          `buys=${exclBuy1.status}/${exclBuy2.status} remaining=${exclQuote28.json?.data?.remaining} taken=${exclQuote28.json?.data?.taken}`);
+        const raise28 = await request('PATCH', `/api/admin/plans/${test28.plan.id}`, { cookies, csrf, body: { per_user_limit: 2 } });
+        const afterRaise28 = await request('POST', '/api/reseller/plans/new', {
+          cookies: shopSess28.cookies, csrf: shopSess28.csrf, body: { planId: test28.plan.id, customerName: 'بعد از افزایش' },
+        });
+        check('raising the ceiling reopens the plan without erasing the ledger',
+          raise28.status === 200 && raise28.json?.data?.plan?.category === 'test' && raise28.json?.data?.plan?.perUserLimit === 2
+            && afterRaise28.status === 201 && takes28(test28.plan.id, shop28.id).length === 2,
+          `limit=${raise28.json?.data?.plan?.perUserLimit} buy=${afterRaise28.status} rows=${takes28(test28.plan.id, shop28.id).length}`);
+
+        // Activation is a live switch: one reseller, several resellers, then nobody.
+        const moveExcl28 = await request('PATCH', `/api/admin/plans/${excl28.plan.id}`, { cookies, csrf, body: { allowed_users: [other28.id] } });
+        const shopAfterMove28 = await quoteOf28(excl28.plan.id, shopSess28);
+        const otherAfterMove28 = await quoteOf28(excl28.plan.id, otherSess28);
+        check('moving the activation: the old reseller loses the plan and the new one gains it',
+          moveExcl28.status === 200 && shopAfterMove28.status === 403 && otherAfterMove28.status === 200,
+          `shop=${shopAfterMove28.status} other=${otherAfterMove28.status}`);
+        const bothExcl28 = await request('PATCH', `/api/admin/plans/${excl28.plan.id}`, {
+          cookies, csrf, body: { allowed_users: [shop28.id, other28.id] },
+        });
+        const qShopBoth28 = await quoteOf28(excl28.plan.id, shopSess28);
+        const qOtherBoth28 = await quoteOf28(excl28.plan.id, otherSess28);
+        check('one exclusive plan can be activated for several resellers at once',
+          bothExcl28.status === 200 && (bothExcl28.json?.data?.plan?.allowedUsers || []).length === 2
+            && qShopBoth28.status === 200 && qOtherBoth28.status === 200,
+          `list=${(bothExcl28.json?.data?.plan?.allowedUsers || []).length} shop=${qShopBoth28.status} other=${qOtherBoth28.status}`);
+        const toPublic28 = await request('PATCH', `/api/admin/plans/${excl28.plan.id}`, { cookies, csrf, body: { category: 'public' } });
+        check('moving an exclusive plan to the public shelf drops its activation list',
+          toPublic28.status === 200 && toPublic28.json?.data?.plan?.category === 'public'
+            && (toPublic28.json?.data?.plan?.allowedUsers || []).length === 0,
+          `category=${toPublic28.json?.data?.plan?.category} list=${JSON.stringify(toPublic28.json?.data?.plan?.allowedUsers)}`);
+      } finally {
+        if (lifted28) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit28 } });
+        if (parked28) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: 120 } });
+        for (const email of speedEmails28) mockXui.clients.delete(email);
+        mockXui.clients.delete('v158plain-one');
+        bdb.close();
       }
     }
 

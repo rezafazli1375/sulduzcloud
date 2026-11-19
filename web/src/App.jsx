@@ -115,6 +115,8 @@ function AppRoutes() {
           <Route index element={<Overview />} />
           <Route path="configs" element={<Configs />} />
           <Route path="plans" element={<Plans />} />
+          {/* v1.5.8: the three plan shelves — /plans/test | /plans/public | /plans/exclusive */}
+          <Route path="plans/:category" element={<Plans />} />
           <Route path="stats" element={<Stats />} />
           <Route path="tickets" element={<Tickets />} />
           <Route path="notifications" element={<Notifications />} />

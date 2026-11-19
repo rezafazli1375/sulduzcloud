@@ -102,11 +102,32 @@ CREATE TABLE IF NOT EXISTS plans (
   server_id INTEGER NOT NULL DEFAULT 0,
   visible INTEGER NOT NULL DEFAULT 1,
   sort INTEGER NOT NULL DEFAULT 0,
+  -- v1.5.8: three shelves (test | public | exclusive), a per-reseller take
+  -- limit (0 = unlimited) and, for an exclusive plan, the JSON list of reseller
+  -- ids it is activated for. Existing plans stay 'public' with no limit.
+  category TEXT NOT NULL DEFAULT 'public',
+  per_user_limit INTEGER NOT NULL DEFAULT 0,
+  allowed_users TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL DEFAULT 0,
   deleted_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_plans_visible ON plans(visible, deleted_at, sort);
+
+-- v1.5.8: every time a reseller TAKES a plan — a new customer or a reset-renewal
+-- of an existing one — one row lands here. This is what the per-reseller limit
+-- counts; the configs table never recorded which plan built a package, and a
+-- wallet description is not a ledger. History written before 1.5.8 is not
+-- back-filled: the limit counts takes made from this version on.
+CREATE TABLE IF NOT EXISTS plan_purchases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  config_id INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL DEFAULT 'new',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_purchases_plan_user ON plan_purchases(plan_id, user_id);
 
 CREATE TABLE IF NOT EXISTS configs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -400,6 +421,13 @@ function migrate(db) {
   // Panel v1.4.17: the old column-level UNIQUE(email) is replaced by
   // UNIQUE(email, inbound_id). See rebuildConfigs().
   rebuildConfigs(db);
+  // Panel v1.5.8 — the plan shelves. All additive: every existing plan keeps
+  // selling exactly as before (public, unlimited, for everyone) until the owner
+  // moves it to another shelf or sets a limit himself. plan_purchases is created
+  // by the schema above (CREATE TABLE IF NOT EXISTS runs on every boot).
+  ensureColumn(db, 'plans', 'category', "TEXT NOT NULL DEFAULT 'public'");
+  ensureColumn(db, 'plans', 'per_user_limit', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'plans', 'allowed_users', "TEXT NOT NULL DEFAULT '[]'");
 }
 
 /**

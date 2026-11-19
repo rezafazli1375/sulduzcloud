@@ -669,7 +669,12 @@ async function importTelegramClients(user, req) {
 // renamed, attached or deleted on x-ui, which is what makes them safe to point at
 // a panel the owner has placed out of bounds.
 
-const NODE_SEARCH_LIMIT = 60;
+// v1.5.8: the owner searched «speed» on a node holding 210 such clients and got
+// 60 — the old default AND the old hard cap (200) were both below his real list.
+// The default now covers a whole node's worth of hits and the ceiling only exists
+// to keep a pathological query from shipping tens of thousands of rows.
+const NODE_SEARCH_LIMIT = 1000;
+const NODE_SEARCH_MAX = 5000;
 
 // /clients/list carries the identity in `id` on some x-ui builds and in `uuid` on
 // others; for VLESS/VMess that value IS the UUID, so it has to be searchable too.
@@ -691,7 +696,7 @@ async function searchNodeClients({ q = '', serverId = 0, limit = NODE_SEARCH_LIM
   if (needle.length < 2) {
     throw new ApiError(422, 'query_too_short', 'حداقل دو نویسه برای جست‌وجو لازم است / Type at least two characters to search');
   }
-  const cap = Math.min(Math.max(Number(limit) || NODE_SEARCH_LIMIT, 1), 200);
+  const cap = Math.min(Math.max(Number(limit) || NODE_SEARCH_LIMIT, 1), NODE_SEARCH_MAX);
   const wanted = Number(serverId) || 0;
   const serverList = serversService.listServers({ includeDisabled: false })
     .filter((server) => !wanted || Number(server.id) === wanted);
@@ -768,11 +773,19 @@ async function searchNodeClients({ q = '', serverId = 0, limit = NODE_SEARCH_LIM
  * The rows are 'external' — this panel did not create the client — which means a
  * later delete forgets them here and never sends a delete to the node. The wallet
  * is not touched either: the subscription was paid for before it arrived here.
+ *
+ * v1.5.6: `opts` lets the bulk hand-over reuse this exact function instead of
+ * copying its guards. `dryRun` answers with the same counts without writing a row
+ * (and without syncing channels, which IS a write), `notify: false` silences the
+ * per-customer notification so a twenty-customer move sends one message instead
+ * of twenty, and `labelFromRemark` names an adopted customer after the remark he
+ * already carries on the node when the admin typed no label of his own.
  */
-async function adoptNodeClient(payload = {}, req, viewer) {
+async function adoptNodeClient(payload = {}, req, viewer, opts = {}) {
   if (viewer?.role !== 'admin') {
     throw new ApiError(403, 'forbidden', 'فقط مدیر می‌تواند کانفیگ آماده را به نماینده بدهد / Only the admin can adopt a node client');
   }
+  const dryRun = Boolean(opts.dryRun);
   const targetEmail = String(payload.email || '').trim();
   if (!targetEmail) throw new ApiError(422, 'email_required', 'ایمیل کلاینت لازم است / Client email is required');
   const user = getResellerRow(Number(payload.userId) || 0);
@@ -803,12 +816,20 @@ async function adoptNodeClient(payload = {}, req, viewer) {
     return list;
   };
   let attached = mapInbounds();
-  if (!attached.length && inboundIds.length) {
+  let needsSync = false;
+  if (!attached.length && inboundIds.length && !dryRun) {
     // A client can sit on a channel this panel has not discovered yet.
     await inboundsService.syncInbounds({ serverId: Number(server.id) });
     attached = mapInbounds();
+  } else if (!attached.length && inboundIds.length) {
+    // Previewing must not write anything, and discovering channels does. So ask
+    // the node instead — a READ: if it really carries one of these channels the
+    // real run will sync and take the customer, and if it carries none of them,
+    // say so now instead of promising an adoption the run would refuse.
+    const onNode = new Set((await xui.inbounds(server)).map((row) => Number(row.id)));
+    needsSync = inboundIds.some((xuiId) => onNode.has(Number(xuiId)));
   }
-  if (!attached.length) {
+  if (!attached.length && !needsSync) {
     throw new ApiError(422, 'no_known_inbound',
       'هیچ‌کدام از اینباندهای این کلاینت در پنل شناخته‌شده نیست؛ اول اینباندها را همگام کنید / None of this client’s inbounds is known here — sync the inbounds first');
   }
@@ -829,7 +850,7 @@ async function adoptNodeClient(payload = {}, req, viewer) {
   const now = Date.now();
   const up = Number(client.up || 0);
   const down = Number(client.down || 0);
-  const label = String(payload.label || '').slice(0, 120);
+  const label = String(payload.label || (opts.labelFromRemark ? client.comment : '') || '').slice(0, 120);
   const customerName = String(payload.customerName || '').slice(0, 120);
   const customerPhone = String(payload.customerPhone || '').slice(0, 40);
   const note = String(payload.note || '').slice(0, 500);
@@ -850,26 +871,48 @@ async function adoptNodeClient(payload = {}, req, viewer) {
   const summary = {
     email: targetEmail, userId: Number(user.id), serverId: Number(server.id),
     imported: 0, restored: 0, alreadyHis: 0, configs: [], inbounds: attached.map((item) => Number(item.id)),
+    totalBytes: Number(client.totalBytes || 0), expiryAt: Number(client.expiryAt || 0),
   };
-  const write = db.transaction(() => {
-    for (const inbound of attached) {
-      const existing = rows.find((item) => Number(item.inbound_id) === Number(inbound.id));
-      const common = [
-        Number(user.id), Number(inbound.id), Number(server.id), targetEmail, groupToken,
-        String(client.subId || ''), String(client.uuid || clientUuidOf(client) || ''), String(client.flow || ''),
-        label, customerName, customerPhone, note,
-        Number(client.totalBytes || 0), Number(client.expiryAt || 0), client.enabled === false ? 0 : 1,
-        up, down, up, down, Number(client.lastOnlineAt || 0), now,
-      ];
-      if (existing && !existing.deleted_at) {
+  // One plan, read once, used by both answers: the preview counts exactly what
+  // the write would do, so the admin is never shown a number the run contradicts.
+  const plan = attached.map((inbound) => {
+    const existing = rows.find((item) => Number(item.inbound_id) === Number(inbound.id));
+    const mode = existing && !existing.deleted_at ? 'already' : existing ? 'restore' : 'import';
+    return { inbound, existing, mode };
+  });
+  const commonOf = (inbound) => [
+    Number(user.id), Number(inbound.id), Number(server.id), targetEmail, groupToken,
+    String(client.subId || ''), String(client.uuid || clientUuidOf(client) || ''), String(client.flow || ''),
+    label, customerName, customerPhone, note,
+    Number(client.totalBytes || 0), Number(client.expiryAt || 0), client.enabled === false ? 0 : 1,
+    up, down, up, down, Number(client.lastOnlineAt || 0), now,
+  ];
+  if (dryRun) {
+    for (const step of plan) {
+      if (step.mode === 'already') {
         summary.alreadyHis += 1;
-        summary.configs.push(Number(existing.id));
+        summary.configs.push(Number(step.existing.id));
+      } else if (step.mode === 'restore') {
+        summary.restored += 1;
+        summary.configs.push(Number(step.existing.id));
+      } else {
+        summary.imported += 1;
+      }
+    }
+    return { ok: true, ...summary, dryRun: true, needsSync, label, groupToken };
+  }
+  const write = db.transaction(() => {
+    for (const step of plan) {
+      const common = commonOf(step.inbound);
+      if (step.mode === 'already') {
+        summary.alreadyHis += 1;
+        summary.configs.push(Number(step.existing.id));
         continue;
       }
-      if (existing) {
-        restoreConfig.run(...common, now, Number(existing.id));
+      if (step.mode === 'restore') {
+        restoreConfig.run(...common, now, Number(step.existing.id));
         summary.restored += 1;
-        summary.configs.push(Number(existing.id));
+        summary.configs.push(Number(step.existing.id));
       } else {
         const info = insertConfig.run(...common, Number(client.createdAt || now), now);
         summary.imported += 1;
@@ -879,7 +922,7 @@ async function adoptNodeClient(payload = {}, req, viewer) {
   });
   write();
 
-  if (summary.imported || summary.restored) {
+  if ((summary.imported || summary.restored) && opts.notify !== false) {
     notifyUser(Number(user.id), {
       type: 'info',
       title: 'کانفیگ به لیست شما اضافه شد',
@@ -1149,6 +1192,12 @@ function buildWhere(filters, viewer, { withStatus = true } = {}) {
     where.push(`${statusExpr} = ?`);
     params.push(String(filters.status));
   }
+  // v1.5.8 «روی نود ثبت نشده»: not a computed status but a sync fact — the last
+  // refresh asked x-ui for this client and the node no longer has it. It filters
+  // on sync_status so a missing client is findable whatever its quota/expiry say.
+  if (withStatus && String(filters.status) === 'missing') {
+    where.push("c.sync_status = 'missing'");
+  }
   if (filters.expiringDays) {
     const until = now + Number(filters.expiringDays) * DAY_MS;
     where.push(`c.expiry_at > 0 AND c.expiry_at > ${now} AND c.expiry_at <= ${until}`);
@@ -1212,6 +1261,11 @@ function mergeGroup(members, base = null) {
     groupCount: members.length,
     groupIds: members.map((m) => m.id),
     groupStatus: status,
+    // v1.5.8: the package carries the missing-client warning of ANY member, not
+    // just the row the caller opened — the list badge and the «روی نود ثبت نشده»
+    // filter must agree about the same customer.
+    missingCount: members.filter((m) => m.syncStatus === 'missing').length,
+    syncStatus: members.some((m) => m.syncStatus === 'missing') ? 'missing' : first.syncStatus,
     expiryMixed: members.some((m) => Number(m.expiryAt || 0) !== Number(first.expiryAt || 0)),
     inbounds: members.map((m) => ({
       id: m.inboundId,
@@ -1248,6 +1302,9 @@ function listConfigs(filters = {}, viewer) {
   // Grouped listings filter whole packages; flat listings keep row semantics.
   const { clause, params, statusExpr } = buildWhere(filters, viewer, { withStatus: Boolean(filters.flat) });
   const wantedStatus = !filters.flat && CONFIG_STATUSES.includes(String(filters.status)) ? String(filters.status) : '';
+  // v1.5.8: a package is «روی نود ثبت نشده» when ANY of its members lost its
+  // client on the node — one broken channel breaks the customer's subscription.
+  const wantMissing = !filters.flat && String(filters.status) === 'missing';
   const inboundCache = new Map();
   const resellerCache = new Map();
   const sanitizeRow = (row) => {
@@ -1267,8 +1324,10 @@ function listConfigs(filters = {}, viewer) {
     return { total, page, pageSize, rows: rows.map(sanitizeRow) };
   }
 
-  const having = wantedStatus ? `HAVING ${packageStatusSql()} = ?` : '';
-  const havingParams = wantedStatus ? [wantedStatus] : [];
+  const having = wantMissing
+    ? "HAVING SUM(CASE WHEN c.sync_status = 'missing' THEN 1 ELSE 0 END) > 0"
+    : (wantedStatus ? `HAVING ${packageStatusSql()} = ?` : '');
+  const havingParams = !wantMissing && wantedStatus ? [wantedStatus] : [];
   const total = Number(db.prepare(
     `SELECT COUNT(*) AS c FROM (
        SELECT ${GROUP_KEY_SQL} AS gkey FROM configs c ${clause} GROUP BY gkey ${having}
@@ -2078,7 +2137,7 @@ async function updateMeta(id, patch, req, viewer) {
  * paid stays his, and the new owner is neither charged nor refunded for a customer
  * the panel owner handed him.
  */
-async function transferCustomer(id, payload = {}, req, viewer) {
+async function transferCustomer(id, payload = {}, req, viewer, opts = {}) {
   if (viewer?.role !== 'admin') {
     throw new ApiError(403, 'forbidden',
       'فقط مدیر می‌تواند مشتری را به نماینده دیگری بدهد / Only the admin can move a customer between resellers');
@@ -2169,6 +2228,9 @@ async function transferCustomer(id, payload = {}, req, viewer) {
       return inbound ? `${inbound.remark || `#${inbound.xui_id}`} · ${inbound.protocol}` : `#${item.inbound_id}`;
     }),
     totalGb: Number(packageGb.toFixed(3)),
+    // checkLimits counts packages this panel made, never 'external' ones. The
+    // bulk preview needs the same distinction to project a ceiling honestly.
+    external: members.every((item) => String(item.origin || '') === 'external'),
     daysLeft: Number(row.expiry_at) > 0 ? Math.max(0, Math.ceil((Number(row.expiry_at) - Date.now()) / DAY_MS)) : 0,
   };
   if (dryRun) return { ...preview, dryRun: true, moved: 0, usageRows: 0 };
@@ -2186,20 +2248,24 @@ async function transferCustomer(id, payload = {}, req, viewer) {
 
   // Both sides have to see why their numbers moved — his customer count, his
   // traffic chart and the nightly Telegram report all change with this one click.
+  // A bulk hand-over (v1.5.6) silences these and sends one message per person
+  // instead, so twenty customers do not become twenty pings.
   const line = `${preview.email}${preview.label ? ` — ${preview.label}` : ''} · ${preview.inbounds.length} کانال`;
-  notifyUser(toId, {
-    type: 'info',
-    title: 'مشتری به شما منتقل شد',
-    body: `از «${preview.fromReseller}»: ${line}`,
-    link: '/reseller/configs',
-  });
-  if (source) {
-    notifyUser(Number(source.id), {
+  if (opts.notify !== false) {
+    notifyUser(toId, {
       type: 'info',
-      title: 'مشتری منتقل شد',
-      body: `به «${target.username}»: ${line}`,
+      title: 'مشتری به شما منتقل شد',
+      body: `از «${preview.fromReseller}»: ${line}`,
       link: '/reseller/configs',
     });
+    if (source) {
+      notifyUser(Number(source.id), {
+        type: 'info',
+        title: 'مشتری منتقل شد',
+        body: `به «${target.username}»: ${line}`,
+        link: '/reseller/configs',
+      });
+    }
   }
 
   audit(req, 'config.transfer', 'config', Number(row.id), {
@@ -2213,6 +2279,225 @@ async function transferCustomer(id, payload = {}, req, viewer) {
   });
 
   return { ...preview, dryRun: false, moved: members.length, usageRows };
+}
+
+// --------------------------------------------------------------------- v1.5.6
+// The owner's ask: «امکان انتقال چند کانفینگ به یک نماینده» — tick the customers
+// the search found and hand them all to one reseller in one go.
+//
+// One function, two verbs, because the search page mixes both kinds of hit: a
+// client this panel already holds belongs to somebody and has to be MOVED
+// (transferCustomer, whole package, ledger follows), while a client nobody here
+// holds has to be ADOPTED (adoptNodeClient, one row per known channel). Both are
+// called as they are, so every guard those two already have — channel permission,
+// the target's ceilings, the UNIQUE(email, inbound_id) clash, adoption switched
+// off, a client the node no longer has — decides each item here too. Nothing is
+// re-implemented and nothing is loosened for the batch.
+//
+// A batch is deliberately NOT one transaction. Twenty customers can fail for
+// twenty different reasons (one channel the target may not sell, one ceiling, one
+// client deleted on the node an hour ago), and rolling all of them back would
+// throw away the nineteen that were fine. Each item stands on its own, and the
+// answer says which ones landed and which did not, with the reason.
+// v1.5.8: raised with the search cap — «select all» on a 210-hit search must be
+// one hand-over, not a refusal. Each item still passes every per-customer guard.
+const BULK_ASSIGN_LIMIT = 1000;
+
+async function bulkAssignNodeClients(payload = {}, req, viewer) {
+  if (viewer?.role !== 'admin') {
+    throw new ApiError(403, 'forbidden',
+      'فقط مدیر می‌تواند کانفیگ‌ها را به نماینده بدهد / Only the admin can hand configs to a reseller');
+  }
+  const raw = Array.isArray(payload.items) ? payload.items : [];
+  const seen = new Set();
+  const items = [];
+  for (const item of raw) {
+    const email = String(item?.email || '').trim();
+    if (!email) continue;
+    const serverId = Number(item?.serverId) || 0;
+    const key = `${serverId}:${email.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({ email, serverId });
+  }
+  if (!items.length) {
+    throw new ApiError(422, 'items_required', 'هیچ کانفیگی انتخاب نشده است / No config was selected');
+  }
+  if (items.length > BULK_ASSIGN_LIMIT) {
+    throw new ApiError(422, 'too_many_items',
+      `در هر بار حداکثر ${BULK_ASSIGN_LIMIT} کانفیگ / At most ${BULK_ASSIGN_LIMIT} configs at a time`);
+  }
+  const toId = Number(payload.toUserId || payload.userId || 0);
+  if (!toId) throw new ApiError(422, 'reseller_required', 'نمایندهٔ مقصد مشخص نشده است / Target reseller is required');
+  const target = getResellerRow(toId);
+  if (!target) throw new ApiError(404, 'user_not_found', 'نمایندهٔ مقصد پیدا نشد / Target reseller not found');
+  if (String(target.role) === 'admin') {
+    throw new ApiError(409, 'target_is_admin', 'مقصد باید یک نماینده باشد، نه مدیر / The target must be a reseller');
+  }
+  if (String(target.status) !== 'active') {
+    throw new ApiError(409, 'reseller_inactive', `نمایندۀ «${target.username}» غیرفعال است / That reseller is not active`);
+  }
+
+  const dryRun = Boolean(payload.dryRun);
+  const note = String(payload.note || '').slice(0, 500);
+  // A label, a customer name and a phone belong to ONE customer. Typing them for
+  // a batch would stamp twenty people with one name, so they are only read when
+  // exactly one config is selected.
+  const solo = items.length === 1 ? payload : {};
+  const one = items.length === 1;
+  const db = getDb();
+  const liveByEmail = db.prepare(
+    'SELECT id, user_id, inbound_id, server_id, sub_id, origin FROM configs WHERE lower(email) = ? AND deleted_at = 0 ORDER BY id'
+  );
+  const results = [];
+  const tally = { moved: 0, adopted: 0, already: 0, failed: 0, rows: 0, usageRows: 0 };
+  // What the batch would add to the target's own ceilings, so the PREVIEW can say
+  // «the fifth one crosses your limit» instead of promising twenty and delivering
+  // four. Only panel-made packages count — checkLimits ignores 'external' ones.
+  const projected = { count: 0, gb: 0 };
+  const sources = new Map();
+
+  for (const item of items) {
+    const entry = {
+      email: item.email, serverId: item.serverId, action: '', ok: false,
+      code: '', message: '', configs: [], from: [], totalGb: 0, needsSync: false,
+      // How many channels this customer will sit on. A fresh adoption has no row
+      // ids yet, so `configs` alone would read as «zero» in the preview.
+      inboundCount: 0,
+    };
+    try {
+      const owned = liveByEmail.all(item.email.toLowerCase())
+        .filter((row) => !item.serverId || Number(row.server_id) === item.serverId);
+      const strangers = owned.filter((row) => Number(row.user_id) !== toId);
+      if (owned.length && !strangers.length) {
+        entry.action = 'already';
+        entry.ok = true;
+        entry.configs = owned.map((row) => Number(row.id));
+        entry.inboundCount = owned.length;
+        tally.already += 1;
+        results.push(entry);
+        continue;
+      }
+      if (strangers.length) {
+        entry.action = 'transfer';
+        // packageRows() keys on user_id, so a customer whose rows were split over
+        // two owners is two packages: one call per current owner moves each whole.
+        const byOwner = new Map();
+        for (const row of strangers) {
+          if (!byOwner.has(Number(row.user_id))) byOwner.set(Number(row.user_id), row);
+        }
+        for (const [ownerId, row] of byOwner) {
+          const moved = await transferCustomer(
+            Number(row.id), { toUserId: toId, note, dryRun }, req, viewer, { notify: one ? undefined : false }
+          );
+          const gb = Number(moved.totalGb || 0);
+          if (dryRun && !moved.external) {
+            try {
+              usersService.checkLimits(target, {
+                gb: projected.gb + gb, days: 0, count: projected.count + 1, gbEach: gb,
+              });
+            } catch (err) {
+              if (err instanceof ApiError && /^limit_/.test(String(err.code || ''))) {
+                throw new ApiError(403, err.code,
+                  `سقف «${target.username}» با این تعداد پر می‌شود: ${err.message} / The target's ceiling is crossed by this batch`);
+              }
+              throw err;
+            }
+            projected.count += 1;
+            projected.gb += gb;
+          }
+          entry.configs.push(...(moved.rows || []).map(Number));
+          entry.inboundCount += (moved.rows || []).length;
+          entry.from.push(String(moved.fromReseller || ownerId));
+          entry.totalGb = Number((entry.totalGb + gb).toFixed(3));
+          tally.rows += Number(dryRun ? (moved.rows || []).length : moved.moved || 0);
+          tally.usageRows += Number(moved.usageRows || 0);
+          if (!dryRun) {
+            const held = sources.get(ownerId) || { username: String(moved.fromReseller || ownerId), emails: [] };
+            held.emails.push(item.email);
+            sources.set(ownerId, held);
+          }
+        }
+        entry.ok = true;
+        tally.moved += 1;
+      } else {
+        entry.action = 'adopt';
+        const adopted = await adoptNodeClient(
+          {
+            email: item.email,
+            serverId: item.serverId,
+            userId: toId,
+            label: String(solo.label || ''),
+            customerName: String(solo.customerName || ''),
+            customerPhone: String(solo.customerPhone || ''),
+            note,
+          },
+          req,
+          viewer,
+          { dryRun, notify: one ? undefined : false, labelFromRemark: true },
+        );
+        entry.configs = (adopted.configs || []).map(Number);
+        entry.inboundCount = (adopted.inbounds || []).length;
+        entry.needsSync = Boolean(adopted.needsSync);
+        entry.totalGb = Number(bytesToGb(Number(adopted.totalBytes || 0)).toFixed(3));
+        tally.rows += Number(adopted.imported || 0) + Number(adopted.restored || 0);
+        tally.adopted += 1;
+        entry.ok = true;
+      }
+    } catch (err) {
+      entry.ok = false;
+      entry.code = String(err?.code || 'error');
+      entry.message = String(err?.message || 'خطای نامشخص / unknown error').slice(0, 300);
+      tally.failed += 1;
+    }
+    results.push(entry);
+  }
+
+  if (!dryRun && !one && (tally.moved || tally.adopted)) {
+    const names = results.filter((row) => row.ok && row.action !== 'already').map((row) => row.email);
+    notifyUser(toId, {
+      type: 'info',
+      title: 'چند کانفیگ به لیست شما اضافه شد',
+      body: `${names.length} مشتری: ${names.slice(0, 6).join(' · ')}${names.length > 6 ? ' …' : ''}`,
+      link: '/reseller/configs',
+    });
+    for (const [ownerId, held] of sources) {
+      notifyUser(Number(ownerId), {
+        type: 'info',
+        title: 'چند مشتری منتقل شد',
+        body: `به «${target.username}»: ${held.emails.length} مشتری — ${held.emails.slice(0, 6).join(' · ')}${held.emails.length > 6 ? ' …' : ''}`,
+        link: '/reseller/configs',
+      });
+    }
+  }
+
+  // A preview is a question, not an action: it leaves no audit line, exactly like
+  // the single-customer dryRun above.
+  if (!dryRun) {
+    audit(req, 'config.bulk_assign', 'user', toId, {
+      total: items.length,
+      moved: tally.moved,
+      adopted: tally.adopted,
+      already: tally.already,
+      failed: tally.failed,
+      rows: tally.rows,
+      note,
+      items: results.map((row) => ({
+        email: row.email, action: row.action, ok: row.ok, code: row.code, configs: row.configs,
+      })),
+    });
+  }
+
+  return {
+    ok: true,
+    dryRun,
+    toUserId: toId,
+    toReseller: String(target.username || ''),
+    total: items.length,
+    limit: BULK_ASSIGN_LIMIT,
+    ...tally,
+    results,
+  };
 }
 
 /**
@@ -3441,4 +3726,6 @@ module.exports = {
   importTelegramClients,
   searchNodeClients,
   adoptNodeClient,
+  bulkAssignNodeClients,
+  BULK_ASSIGN_LIMIT,
 };

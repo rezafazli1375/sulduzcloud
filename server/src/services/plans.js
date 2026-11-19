@@ -41,6 +41,14 @@ const MAX_GB = 1024;
 const MAX_DAYS = 3650;
 const MAX_PRICE = 100000000000;
 
+// v1.5.8 — the owner's three shelves: پلن‌های تست / عمومی / اختصاصی. A test plan
+// is usually free and limited to one take per reseller; a public plan is for
+// everyone; an exclusive plan is activated for a NAMED list of resellers and is
+// invisible to everybody else. The per-reseller take limit applies to all three.
+const PLAN_CATEGORIES = ['test', 'public', 'exclusive'];
+const MAX_PER_USER_LIMIT = 100000;
+const MAX_ALLOWED_USERS = 500;
+
 function planRow(id) {
   return getDb().prepare('SELECT * FROM plans WHERE id = ? AND deleted_at = 0').get(Number(id));
 }
@@ -54,6 +62,60 @@ function idsOf(row) {
   const raw = safeJsonParse(row?.inbound_ids, []);
   if (!Array.isArray(raw)) return [];
   return [...new Set(raw.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+}
+
+/** v1.5.8: the JSON list of reseller ids an exclusive plan is activated for. */
+function allowedUsersOf(row) {
+  const raw = safeJsonParse(row?.allowed_users, []);
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(raw.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+}
+
+function categoryOf(row) {
+  const value = String(row?.category || 'public');
+  return PLAN_CATEGORIES.includes(value) ? value : 'public';
+}
+
+/**
+ * Validate the activation list of an exclusive plan: every id must be a live
+ * reseller, because a typo would silently lock the plan away from the person it
+ * was meant for. Admins are refused — the owner buys nothing from his own shop.
+ */
+function cleanAllowedUsers(value) {
+  const list = Array.isArray(value) ? value : [value];
+  const ids = [...new Set(list.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+  if (ids.length > MAX_ALLOWED_USERS) {
+    throw new ApiError(422, 'too_many_resellers', `حداکثر ${MAX_ALLOWED_USERS} نماینده / At most ${MAX_ALLOWED_USERS} resellers`);
+  }
+  const db = getDb();
+  const find = db.prepare('SELECT id, role FROM users WHERE id = ? AND deleted_at = 0');
+  for (const id of ids) {
+    const user = find.get(id);
+    if (!user || String(user.role) !== 'reseller') {
+      throw new ApiError(422, 'invalid_plan_reseller', `کاربر #${id} یک نمایندهٔ فعال نیست / User ${id} is not an active reseller`);
+    }
+  }
+  return ids;
+}
+
+/** How many times this reseller has already taken this plan (new + renewal). */
+function countTakes(planId, userId) {
+  return Number(getDb()
+    .prepare('SELECT COUNT(*) AS c FROM plan_purchases WHERE plan_id = ? AND user_id = ?')
+    .get(Number(planId), Number(userId)).c || 0);
+}
+
+/** null = unlimited; otherwise how many more takes this reseller has left. */
+function remainingFor(row, userId) {
+  const limit = Math.max(0, Number(row?.per_user_limit || 0));
+  if (!limit) return null;
+  return Math.max(0, limit - countTakes(row.id, userId));
+}
+
+function recordTake(row, userId, configId, kind) {
+  getDb().prepare(
+    'INSERT INTO plan_purchases (plan_id, user_id, config_id, kind, created_at) VALUES (?, ?, ?, ?, ?)'
+  ).run(Number(row.id), Number(userId), Number(configId || 0), String(kind), Date.now());
 }
 
 function cleanIds(value) {
@@ -157,6 +219,30 @@ function toStored(data = {}, existing = null) {
     : (data.visible ? 1 : 0);
   const sort = Math.round(num(keep('sort', 0)));
 
+  // v1.5.8 — the shelf, the take limit and the activation list. PATCH stays
+  // partial here too: a field that is absent keeps the value it had.
+  const category = String(keep('category', 'public'));
+  if (!PLAN_CATEGORIES.includes(category)) {
+    throw new ApiError(422, 'invalid_plan_category', 'دستهٔ پلن باید تست، عمومی یا اختصاصی باشد / Plan category must be test, public or exclusive');
+  }
+  const rawLimit = data.per_user_limit !== undefined ? data.per_user_limit
+    : (data.perUserLimit !== undefined ? data.perUserLimit
+      : (existing ? Number(existing.per_user_limit || 0) : 0));
+  const perUserLimit = Math.max(0, Math.round(num(rawLimit)));
+  if (perUserLimit > MAX_PER_USER_LIMIT) {
+    throw new ApiError(422, 'invalid_plan_limit', 'محدودیت دریافت پلن منطقی نیست / The per-reseller limit is out of range');
+  }
+  const rawAllowed = data.allowed_users !== undefined ? data.allowed_users
+    : (data.allowedUsers !== undefined ? data.allowedUsers
+      : (existing ? allowedUsersOf(existing) : []));
+  let allowedUsers = cleanAllowedUsers(rawAllowed);
+  if (category === 'exclusive' && !allowedUsers.length) {
+    throw new ApiError(422, 'exclusive_needs_reseller', 'پلن اختصاصی باید حداقل برای یک نماینده فعال شود / An exclusive plan must be activated for at least one reseller');
+  }
+  // The list only MEANS something on the exclusive shelf; keeping it on a public
+  // plan would read as a restriction that is not enforced.
+  if (category !== 'exclusive') allowedUsers = [];
+
   return {
     name,
     description,
@@ -167,15 +253,20 @@ function toStored(data = {}, existing = null) {
     serverId,
     visible,
     sort,
+    category,
+    perUserLimit,
+    allowedUsers,
   };
 }
 
-function view(row, { inbounds = null } = {}) {
+function view(row, { inbounds = null, viewer = null } = {}) {
   const ids = idsOf(row);
   const list = inbounds === null
     ? ids.map((id) => inboundRow(id)).filter(Boolean)
     : inbounds;
-  return {
+  const category = categoryOf(row);
+  const perUserLimit = Math.max(0, Number(row.per_user_limit || 0));
+  const out = {
     id: Number(row.id),
     name: String(row.name || ''),
     description: String(row.description || ''),
@@ -194,9 +285,26 @@ function view(row, { inbounds = null } = {}) {
     })),
     visible: Number(row.visible ? 1 : 0),
     sort: Number(row.sort || 0),
+    category,
+    perUserLimit,
     createdAt: Number(row.created_at || 0),
     updatedAt: Number(row.updated_at || 0),
   };
+  // WHO an exclusive plan is activated for is the owner's business decision —
+  // a reseller must not be able to read the list of his competitors. He only ever
+  // sees plans already filtered to himself.
+  if (viewer?.role === 'admin') {
+    const allowed = allowedUsersOf(row);
+    const find = getDb().prepare('SELECT id, username, name FROM users WHERE id = ?');
+    out.allowedUsers = allowed.map((id) => {
+      const user = find.get(id);
+      return { id, username: String(user?.username || ''), name: String(user?.name || '') };
+    });
+    out.sold = Number(getDb()
+      .prepare('SELECT COUNT(*) AS c FROM plan_purchases WHERE plan_id = ?')
+      .get(Number(row.id)).c || 0);
+  }
+  return out;
 }
 
 /**
@@ -221,10 +329,14 @@ function listPlans({ viewer = null, includeHidden = null } = {}) {
     // The switch can ask for hidden rows, but it can never hand them to someone
     // who is not an admin — hiding a plan is the owner saying "not for sale yet".
     if (!isAdmin && !Number(row.visible)) continue;
-    const item = view(row);
+    const item = view(row, { viewer });
     if (!isAdmin) {
       if (!item.inbounds.length || item.inbounds.length !== item.inboundIds.length) continue;
       if (!canResell(row, viewer)) continue;
+      // v1.5.8: the reseller sees his own counter, so the card can say «۱ بار
+      // دیگر می‌توانید بگیرید» instead of letting the buy button fail on him.
+      item.taken = countTakes(row.id, viewer.id);
+      item.remaining = remainingFor(row, viewer.id);
     }
     out.push(item);
   }
@@ -238,6 +350,9 @@ function listPlans({ viewer = null, includeHidden = null } = {}) {
  * question a reseller is asking about himself.
  */
 function canResell(row, reseller) {
+  // v1.5.8: an exclusive plan exists only for the resellers it names. This one
+  // gate covers the shop window, the quote, the purchase and the renewal alike.
+  if (categoryOf(row) === 'exclusive' && !allowedUsersOf(row).includes(Number(reseller?.id || 0))) return false;
   const ids = idsOf(row);
   if (!ids.length) return false;
   const allowed = usersService.allowedInboundIds(reseller);
@@ -263,16 +378,17 @@ function createPlan(data, req) {
   const now = Date.now();
   const info = db
     .prepare(
-      `INSERT INTO plans (name, description, gb, days, price, inbound_ids, server_id, visible, sort, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO plans (name, description, gb, days, price, inbound_ids, server_id, visible, sort, category, per_user_limit, allowed_users, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       stored.name, stored.description, stored.gb, stored.days, stored.price,
-      JSON.stringify(stored.inboundIds), stored.serverId, stored.visible, stored.sort, now, now
+      JSON.stringify(stored.inboundIds), stored.serverId, stored.visible, stored.sort,
+      stored.category, stored.perUserLimit, JSON.stringify(stored.allowedUsers), now, now
     );
   const row = planRow(info.lastInsertRowid);
-  audit(req, 'plan.create', 'plan', Number(row.id), { name: row.name, gb: row.gb, days: row.days, price: row.price, inboundIds: stored.inboundIds });
-  return view(row, { inbounds: stored.inboundIds.map(inboundRow) });
+  audit(req, 'plan.create', 'plan', Number(row.id), { name: row.name, gb: row.gb, days: row.days, price: row.price, inboundIds: stored.inboundIds, category: stored.category, perUserLimit: stored.perUserLimit, allowedUsers: stored.allowedUsers });
+  return view(row, { inbounds: stored.inboundIds.map(inboundRow), viewer: req?.user });
 }
 
 function updatePlan(id, data, req) {
@@ -283,14 +399,15 @@ function updatePlan(id, data, req) {
   const now = Date.now();
   db.prepare(
     `UPDATE plans SET name = ?, description = ?, gb = ?, days = ?, price = ?, inbound_ids = ?,
-      server_id = ?, visible = ?, sort = ?, updated_at = ? WHERE id = ?`
+      server_id = ?, visible = ?, sort = ?, category = ?, per_user_limit = ?, allowed_users = ?, updated_at = ? WHERE id = ?`
   ).run(
     stored.name, stored.description, stored.gb, stored.days, stored.price,
-    JSON.stringify(stored.inboundIds), stored.serverId, stored.visible, stored.sort, now, Number(existing.id)
+    JSON.stringify(stored.inboundIds), stored.serverId, stored.visible, stored.sort,
+    stored.category, stored.perUserLimit, JSON.stringify(stored.allowedUsers), now, Number(existing.id)
   );
   const row = planRow(existing.id);
-  audit(req, 'plan.update', 'plan', Number(row.id), { name: row.name, gb: row.gb, days: row.days, price: row.price, inboundIds: stored.inboundIds });
-  return view(row, { inbounds: stored.inboundIds.map(inboundRow) });
+  audit(req, 'plan.update', 'plan', Number(row.id), { name: row.name, gb: row.gb, days: row.days, price: row.price, inboundIds: stored.inboundIds, category: stored.category, perUserLimit: stored.perUserLimit, allowedUsers: stored.allowedUsers });
+  return view(row, { inbounds: stored.inboundIds.map(inboundRow), viewer: req?.user });
 }
 
 /** Soft delete: the plan leaves the shop window, its history stays. */
@@ -329,6 +446,10 @@ function quote(planId, reseller) {
   const balance = Number(reseller.balance || 0);
   const billing = pricing.billingInfo();
   const charged = Boolean(billing.enabled && price > 0);
+  // v1.5.8: how many times this reseller already took this plan, and how many
+  // takes are left. `remaining === null` means "no limit configured".
+  const taken = countTakes(row.id, reseller.id);
+  const remaining = remainingFor(row, reseller.id);
   return {
     plan: view(row),
     gb,
@@ -341,7 +462,25 @@ function quote(planId, reseller) {
     charged,
     balance,
     sufficient: !charged || balance >= price,
+    taken,
+    remaining,
+    limitReached: remaining === 0,
   };
+}
+
+/**
+ * v1.5.8 per-reseller take limit. Both buying paths (new customer and renewal)
+ * call this BEFORE any wallet movement or x-ui write, so an exhausted plan is a
+ * clean 409 and never a half-charged package.
+ */
+function assertTakeAvailable(row, reseller) {
+  if (remainingFor(row, reseller.id) === 0) {
+    throw new ApiError(
+      409,
+      'plan_limit_reached',
+      'سهمیهٔ دریافت این پلن برای شما تمام شده است / You have reached your limit for this plan'
+    );
+  }
 }
 
 /**
@@ -360,6 +499,7 @@ async function applyNew({ planId, customerName = '', customerPhone = '', label =
     throw new ApiError(403, 'plan_not_for_you', 'این پلن برای شما قابل استفاده نیست / This plan is not available to you');
   }
   const quoteData = quote(row.id, reseller);
+  assertTakeAvailable(row, reseller);
   const configs = await configsService.createConfigs(
     {
       userId: Number(reseller.id),
@@ -377,6 +517,9 @@ async function applyNew({ planId, customerName = '', customerPhone = '', label =
     },
     req
   );
+  // One ledger row per successful take — the package itself may span several
+  // inbounds, but the reseller took the plan ONCE.
+  recordTake(row, reseller.id, Number(configs?.[0]?.id || 0), 'new');
   return { plan: view(row), configs, price: quoteData.price, tariff: quoteData.tariff };
 }
 
@@ -399,6 +542,7 @@ async function applyRenew({ planId, configId } = {}, req) {
     throw new ApiError(403, 'plan_not_for_you', 'این پلن برای شما قابل استفاده نیست / This plan is not available to you');
   }
   const quoteData = quote(row.id, reseller);
+  assertTakeAvailable(row, reseller);
   const config = await configsService.extendConfig(
     Number(configId),
     {
@@ -412,6 +556,9 @@ async function applyRenew({ planId, configId } = {}, req) {
     req,
     reseller
   );
+  // A renewal is a take too — the owner's limit counts buying the plan again,
+  // not only new customers.
+  recordTake(row, reseller.id, Number(config?.id || configId), 'renew');
   return {
     plan: view(row),
     config,
@@ -426,6 +573,7 @@ function renewalPreview(planId, row, reseller) {
   const plan = planRow(planId);
   if (!plan) throw new ApiError(404, 'plan_not_found', 'پلن پیدا نشد / Plan not found');
   const members = configsService.packageRows ? configsService.packageRows(row) : [row];
+  const remaining = remainingFor(plan, reseller.id);
   return {
     plan: view(plan),
     gb: Number(plan.gb || 0),
@@ -439,7 +587,10 @@ function renewalPreview(planId, row, reseller) {
       totalGb: bytesToGb(Number(member.total_bytes || 0)),
       expiryAt: Number(member.expiry_at || 0),
     })),
-    usable: canResell(plan, reseller),
+    // v1.5.8: an exhausted take limit makes the plan unusable for renewal too.
+    usable: canResell(plan, reseller) && remaining !== 0,
+    remaining,
+    limitReached: remaining === 0,
   };
 }
 
@@ -447,8 +598,13 @@ module.exports = {
   MAX_INBOUNDS,
   MAX_GB,
   MAX_DAYS,
+  PLAN_CATEGORIES,
   planRow,
   idsOf,
+  allowedUsersOf,
+  categoryOf,
+  countTakes,
+  remainingFor,
   view,
   canResell,
   listPlans,

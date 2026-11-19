@@ -8,10 +8,12 @@ import {
   ChevronDown,
   CreditCard,
   DatabaseBackup,
+  FlaskConical,
   Globe2,
   HelpCircle,
   Layers,
   LayoutDashboard,
+  Lock,
   LogOut,
   Menu,
   MessageSquare,
@@ -35,6 +37,14 @@ import { formatBytes, formatDate, formatMoney, formatNumber, relativeTime } from
 import { Avatar, Badge, ThemeToggle, cx } from './ui.jsx';
 import { useConfirm, useToast } from './feedback.jsx';
 
+// v1.5.8: «پلن‌های آماده» سه زیرشاخهٔ همیشگی دارد — تست / عمومی / اختصاصی.
+// هر شاخه یک مسیر واقعی است (/plans/test …) تا رفرش و لینک مستقیم هم کار کند.
+const PLAN_CHILDREN = [
+  { to: '/plans/test', label: 'nav.plansTest', icon: FlaskConical },
+  { to: '/plans/public', label: 'nav.plansPublic', icon: Globe2 },
+  { to: '/plans/exclusive', label: 'nav.plansExclusive', icon: Lock },
+];
+
 const ADMIN_GROUPS = [
   {
     key: 'groupMain',
@@ -42,7 +52,7 @@ const ADMIN_GROUPS = [
       { to: '/', end: true, label: 'nav.overview', icon: LayoutDashboard, perm: 'stats' },
       { to: '/resellers', label: 'nav.resellers', icon: Users, perm: 'users' },
       { to: '/configs', label: 'nav.configs', icon: Boxes, perm: 'configs' },
-      { to: '/plans', label: 'nav.plans', icon: Layers, perm: 'configs' },
+      { to: '/plans', end: true, label: 'nav.plans', icon: Layers, perm: 'configs', children: PLAN_CHILDREN },
       { to: '/inbounds', label: 'nav.inbounds', icon: Network, perm: 'inbounds' },
       { to: '/stats', label: 'nav.stats', icon: Activity, perm: 'stats' },
     ],
@@ -73,7 +83,7 @@ const RESELLER_GROUPS = [
     items: [
       { to: '/', end: true, label: 'nav.overview', icon: LayoutDashboard },
       { to: '/configs', label: 'nav.configs', icon: Boxes },
-      { to: '/plans', label: 'nav.plans', icon: Layers },
+      { to: '/plans', end: true, label: 'nav.plans', icon: Layers, children: PLAN_CHILDREN },
       { to: '/stats', label: 'nav.stats', icon: Activity },
       { to: '/tickets', label: 'nav.tickets', icon: MessageSquare },
       { to: '/wallet', label: 'nav.wallet', icon: CreditCard },
@@ -113,6 +123,9 @@ function Logo({ compact = false }) {
 
 function NavSection({ groupKey, items, onNavigate, showBroadcastBadge = false }) {
   const { t } = useI18n();
+  const location = useLocation();
+  // When a shelf child is the current page, the parent «پلن‌های آماده» stays lit too.
+  const childActive = (item) => Boolean(item.children?.some((child) => location.pathname === child.to || location.pathname.startsWith(`${child.to}/`)));
 
   // v1.5.4, item 5: the red number in front of «اعلان‌ها». It counts ONLY the
   // owner's own messages (type 'broadcast' — the /broadcast endpoint is the only
@@ -133,29 +146,49 @@ function NavSection({ groupKey, items, onNavigate, showBroadcastBadge = false })
       <p className="mb-2 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-600">{t(`nav.${groupKey}`)}</p>
       <nav className="space-y-1">
         {items.map((item) => (
-          <NavLink
-            key={item.to}
-            to={item.to}
-            end={item.end}
-            onClick={onNavigate}
-            className={({ isActive }) => cx('sidebar-item', isActive && 'active')}
-          >
-            {({ isActive }) => (
-              <>
-                <item.icon className={cx('h-[18px] w-[18px] transition', isActive ? 'text-emerald-300' : 'text-slate-500')} />
-                <span className="truncate">{t(item.label)}</span>
-                {showBroadcastBadge && item.to === '/notifications' && ownerUnread > 0 ? (
-                  <span
-                    dir="ltr"
-                    title={t('notifications.ownerUnread')}
-                    className="ms-auto flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-gradient-to-r from-rose-500 to-red-600 px-1.5 text-[9.5px] font-bold text-white shadow-[0_0_12px_rgba(244,63,94,.85)]"
+          <div key={item.to}>
+            <NavLink
+              to={item.to}
+              end={item.end}
+              onClick={onNavigate}
+              className={({ isActive }) => cx('sidebar-item', (isActive || childActive(item)) && 'active')}
+            >
+              {({ isActive }) => (
+                <>
+                  <item.icon className={cx('h-[18px] w-[18px] transition', isActive || childActive(item) ? 'text-emerald-300' : 'text-slate-500')} />
+                  <span className="truncate">{t(item.label)}</span>
+                  {showBroadcastBadge && item.to === '/notifications' && ownerUnread > 0 ? (
+                    <span
+                      dir="ltr"
+                      title={t('notifications.ownerUnread')}
+                      className="ms-auto flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-gradient-to-r from-rose-500 to-red-600 px-1.5 text-[9.5px] font-bold text-white shadow-[0_0_12px_rgba(244,63,94,.85)]"
+                    >
+                      {ownerUnread > 99 ? '99+' : ownerUnread}
+                    </span>
+                  ) : null}
+                </>
+              )}
+            </NavLink>
+            {item.children ? (
+              <div className="mt-0.5 space-y-0.5 border-s border-white/[0.06] ps-3 ms-5">
+                {item.children.map((child) => (
+                  <NavLink
+                    key={child.to}
+                    to={child.to}
+                    onClick={onNavigate}
+                    className={({ isActive }) => cx('sidebar-item !py-1.5 !text-[12px]', isActive && 'active')}
                   >
-                    {ownerUnread > 99 ? '99+' : ownerUnread}
-                  </span>
-                ) : null}
-              </>
-            )}
-          </NavLink>
+                    {({ isActive }) => (
+                      <>
+                        <child.icon className={cx('h-3.5 w-3.5 transition', isActive ? 'text-emerald-300' : 'text-slate-500')} />
+                        <span className="truncate">{t(child.label)}</span>
+                      </>
+                    )}
+                  </NavLink>
+                ))}
+              </div>
+            ) : null}
+          </div>
         ))}
       </nav>
     </div>

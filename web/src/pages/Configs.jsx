@@ -183,6 +183,9 @@ export default function Configs() {
         <Select value={status} onChange={(e) => setStatus(e.target.value)} className="w-auto min-w-[132px]">
           <option value="">{t('common.allStatuses')}</option>
           {STATUSES.map((item) => <option key={item} value={item}>{t(`common.${item}`)}</option>)}
+          {/* v1.5.8: a sync fact, not a computed status — the client is gone from
+              the node, whatever its quota and expiry still say. */}
+          <option value="missing">{t('configs.filterMissing')}</option>
         </Select>
         <Select value={origin} onChange={(e) => setOrigin(e.target.value)} className="w-auto max-w-[200px]">
           <option value="">{t('configs.originFilter')}</option>

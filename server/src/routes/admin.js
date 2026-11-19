@@ -1391,7 +1391,9 @@ router.get('/node-clients', auth.requirePerm('configs'), asyncH(async (req, res)
   const data = await configsService.searchNodeClients({
     q: String(req.query.q || ''),
     serverId: num(req.query.serverId, 0),
-    limit: num(req.query.limit, 60),
+    // v1.5.8: no route-level cap of its own — the service default (a whole node's
+    // worth of hits) applies unless the caller names a limit.
+    limit: num(req.query.limit, 0),
   });
   res.json({ ok: true, data });
 }));
@@ -1412,6 +1414,30 @@ router.post('/configs/adopt', auth.requirePerm('configs'), asyncH(async (req, re
     req.user
   );
   res.status(201).json({ ok: true, data: result });
+}));
+
+// v1.5.6: the same hand-over for everything the admin ticked on the search page.
+// One item per client, each decided by the adopt/transfer guards it already had;
+// dryRun answers with the per-item plan and writes nothing.
+router.post('/configs/bulk-assign', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const body = req.body || {};
+  const result = await configsService.bulkAssignNodeClients(
+    {
+      // v1.5.8: no silent slice here — a truncated batch is the same lie as a
+      // truncated search. The service dedupes and refuses anything over its own
+      // ceiling (BULK_ASSIGN_LIMIT) with a named 422.
+      items: Array.isArray(body.items) ? body.items : [],
+      toUserId: num(body.toUserId ?? body.userId, 0),
+      note: String(body.note || ''),
+      label: String(body.label || ''),
+      customerName: String(body.customerName || ''),
+      customerPhone: String(body.customerPhone || ''),
+      dryRun: Boolean(body.dryRun),
+    },
+    req,
+    req.user,
+  );
+  res.json({ ok: true, data: result });
 }));
 
 // ------------------------------------------------------------------ sync

@@ -1,12 +1,16 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Boxes,
   Clock,
   Eye,
   EyeOff,
+  FlaskConical,
+  Globe2,
   HardDrive,
   Layers,
+  Lock,
   Pencil,
   Plus,
   RefreshCw,
@@ -68,7 +72,37 @@ const EMPTY_PLAN = {
   inboundIds: [],
   visible: 1,
   sort: 0,
+  category: 'public',
+  perUserLimit: 0,
+  allowedUsers: [],
 };
+
+// v1.5.8: the three shelves of the plans menu. `key` is the URL segment AND the
+// value stored in plans.category — one vocabulary everywhere.
+const CATEGORIES = [
+  { key: 'test', label: 'plans.catTest', icon: FlaskConical, tone: 'amber' },
+  { key: 'public', label: 'plans.catPublic', icon: Globe2, tone: 'cyan' },
+  { key: 'exclusive', label: 'plans.catExclusive', icon: Lock, tone: 'violet' },
+];
+const categoryMeta = (key) => CATEGORIES.find((item) => item.key === key) || CATEGORIES[1];
+const planCategory = (plan) => (CATEGORIES.some((item) => item.key === plan?.category) ? plan.category : 'public');
+
+/** The shelf switcher: real links, so refresh and deep links keep the shelf. */
+function CategoryTabs({ active }) {
+  const { t } = useI18n();
+  const navigate = useNavigate();
+  return (
+    <Tabs
+      className="mb-4"
+      active={active || 'all'}
+      onChange={(value) => navigate(value === 'all' ? '/plans' : `/plans/${value}`)}
+      tabs={[
+        { value: 'all', label: t('plans.catAll'), icon: Layers },
+        ...CATEGORIES.map((item) => ({ value: item.key, label: t(item.label), icon: item.icon })),
+      ]}
+    />
+  );
+}
 
 // Same ceilings the service enforces; the form uses them for its hints, not to
 // hide a rule the owner would otherwise only learn from a red toast.
@@ -115,7 +149,7 @@ function InboundChips({ inbounds, lang, max = 4 }) {
 // Admin: authoring
 // ─────────────────────────────────────────────────────────────────────────────
 
-function PlanForm({ open, onClose, editing }) {
+function PlanForm({ open, onClose, editing, presetCategory = 'public' }) {
   const { t, lang } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
@@ -127,6 +161,15 @@ function PlanForm({ open, onClose, editing }) {
     enabled: open,
   });
   const inbounds = (inboundsQuery.data?.rows || []).filter((row) => row.enabled);
+
+  // v1.5.8: an exclusive plan is a whitelist — the owner ticks exactly which
+  // resellers may see and buy it. Same list the transfer drawer uses.
+  const resellersQuery = useQuery({
+    queryKey: ['plan-resellers'],
+    queryFn: () => api.get('/admin/users?role=reseller&pageSize=200'),
+    enabled: open,
+  });
+  const resellers = resellersQuery.data?.rows || [];
 
   useEffect(() => {
     if (!open) return;
@@ -140,9 +183,12 @@ function PlanForm({ open, onClose, editing }) {
         inboundIds: (editing.inbounds || []).map((item) => Number(item.id)),
         visible: Number(editing.visible ? 1 : 0),
         sort: Number(editing.sort || 0),
+        category: planCategory(editing),
+        perUserLimit: Number(editing.perUserLimit || 0),
+        allowedUsers: (editing.allowedUsers || []).map((item) => Number(item.id)),
       }
-      : EMPTY_PLAN);
-  }, [open, editing]);
+      : { ...EMPTY_PLAN, category: presetCategory });
+  }, [open, editing, presetCategory]);
 
   const save = useMutation({
     mutationFn: (payload) => (editing
@@ -163,10 +209,18 @@ function PlanForm({ open, onClose, editing }) {
       : [...prev.inboundIds, id],
   }));
 
+  const toggleUser = (id) => setForm((prev) => ({
+    ...prev,
+    allowedUsers: prev.allowedUsers.includes(id)
+      ? prev.allowedUsers.filter((value) => value !== id)
+      : [...prev.allowedUsers, id],
+  }));
+
   const selected = inbounds.filter((row) => form.inboundIds.includes(row.id));
   const servers = [...new Set(selected.map((row) => Number(row.serverId || row.server_id || 0)))];
   const mixedServer = servers.length > 1;
-  const canSave = form.name.trim() && form.inboundIds.length > 0 && !mixedServer && !save.isPending;
+  const exclusiveEmpty = form.category === 'exclusive' && form.allowedUsers.length === 0;
+  const canSave = form.name.trim() && form.inboundIds.length > 0 && !mixedServer && !exclusiveEmpty && !save.isPending;
 
   const submit = (event) => {
     event.preventDefault();
@@ -180,6 +234,9 @@ function PlanForm({ open, onClose, editing }) {
       inbound_ids: form.inboundIds,
       visible: Boolean(form.visible),
       sort: Number(form.sort || 0),
+      category: form.category,
+      per_user_limit: Math.max(0, Math.round(Number(form.perUserLimit || 0))),
+      allowed_users: form.category === 'exclusive' ? form.allowedUsers : [],
     });
   };
 
@@ -208,6 +265,60 @@ function PlanForm({ open, onClose, editing }) {
         <Field label={t('plans.form.description')} hint={t('plans.form.descriptionHint')}>
           <Textarea rows={2} maxLength={300} value={form.description} onChange={(e) => setForm((prev) => ({ ...prev, description: e.target.value }))} />
         </Field>
+        {/* v1.5.8: which shelf this plan lives on, and how many times each
+            reseller may take it (0 = no ceiling; new buys AND renewals count). */}
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label={t('plans.form.category')} hint={t(`plans.form.categoryHint_${form.category}`)}>
+            <Select value={form.category} onChange={(e) => setForm((prev) => ({ ...prev, category: e.target.value }))}>
+              {CATEGORIES.map((item) => (
+                <option key={item.key} value={item.key}>{t(item.label)}</option>
+              ))}
+            </Select>
+          </Field>
+          <Field label={t('plans.form.perUserLimit')} hint={t('plans.form.perUserLimitHint')}>
+            <Input
+              type="number"
+              min={0}
+              dir="ltr"
+              value={form.perUserLimit}
+              onChange={(e) => setForm((prev) => ({ ...prev, perUserLimit: e.target.value }))}
+            />
+          </Field>
+        </div>
+        {form.category === 'exclusive' ? (
+          <div>
+            <span className="label">{t('plans.form.allowedResellers')}</span>
+            <div className="max-h-[180px] overflow-y-auto rounded-xl border border-violet-400/20 bg-violet-500/[0.03] p-2.5">
+              {resellers.length ? (
+                <div className="grid gap-1.5 sm:grid-cols-2">
+                  {resellers.map((user) => (
+                    <Checkbox
+                      key={user.id}
+                      checked={form.allowedUsers.includes(Number(user.id))}
+                      onChange={() => toggleUser(Number(user.id))}
+                      label={(
+                        <span className="flex min-w-0 items-center gap-1.5">
+                          <span className="truncate">{user.name || user.username}</span>
+                          {user.name ? <span className="shrink-0 text-slate-500" dir="ltr">@{user.username}</span> : null}
+                        </span>
+                      )}
+                      className="rounded-md px-1.5 py-1 hover:bg-white/[0.03]"
+                    />
+                  ))}
+                </div>
+              ) : (
+                <p className="py-2 text-center text-[11px] text-slate-500">{t('plans.form.noResellers')}</p>
+              )}
+            </div>
+            {exclusiveEmpty ? (
+              <p className="mt-1.5 rounded-lg border border-rose-400/25 bg-rose-500/[0.07] px-2.5 py-1.5 text-[10.5px] text-rose-200">
+                {t('plans.form.allowedResellersRequired')}
+              </p>
+            ) : (
+              <p className="mt-1.5 text-[10.5px] leading-5 text-slate-500">{t('plans.form.allowedResellersHint')}</p>
+            )}
+          </div>
+        ) : null}
         <div className="grid gap-3 sm:grid-cols-3">
           <Field label={t('plans.form.gb')} hint={`${t('plans.form.maxGb')} ${formatNumber(LIMITS.maxGb, lang)}`}>
             <Input type="number" min={0} step="0.5" dir="ltr" value={form.gb} onChange={(e) => setForm((prev) => ({ ...prev, gb: e.target.value }))} />
@@ -269,7 +380,7 @@ function PlanForm({ open, onClose, editing }) {
   );
 }
 
-function AdminPlans() {
+function AdminPlans({ category = null }) {
   const { t, lang } = useI18n();
   const toast = useToast();
   const confirm = useConfirm();
@@ -284,7 +395,12 @@ function AdminPlans() {
     queryFn: () => api.get('/admin/plans'),
   });
 
-  const plans = data?.plans || [];
+  const allPlans = data?.plans || [];
+  // v1.5.8: a shelf shows only its own category; /plans keeps showing everything.
+  const plans = useMemo(
+    () => (category ? allPlans.filter((plan) => planCategory(plan) === category) : allPlans),
+    [allPlans, category]
+  );
   const filtered = useMemo(() => {
     const term = debounced.trim().toLowerCase();
     if (!term) return plans;
@@ -320,10 +436,11 @@ function AdminPlans() {
   return (
     <>
       <PageHeader
-        title={t('plans.title')}
+        title={category ? `${t('plans.title')} · ${t(categoryMeta(category).label)}` : t('plans.title')}
         subtitle={t('plans.subtitleAdmin')}
         actions={<Button icon={Plus} onClick={() => { setEditing(null); setFormOpen(true); }}>{t('plans.new')}</Button>}
       />
+      <CategoryTabs active={category} />
 
       {isLoading ? (
         <div className="table-wrap"><TableSkeleton rows={6} cols={6} /></div>
@@ -370,6 +487,24 @@ function AdminPlans() {
                           {plan.description ? (
                             <p className="max-w-[260px] truncate text-[9.5px] text-slate-500">{plan.description}</p>
                           ) : null}
+                          {/* v1.5.8: shelf, per-reseller ceiling, whitelist size and
+                              how many times the plan was actually taken. */}
+                          <div className="mt-1 flex flex-wrap items-center gap-1">
+                            <Badge tone={categoryMeta(planCategory(plan)).tone}>{t(categoryMeta(planCategory(plan)).label)}</Badge>
+                            {Number(plan.perUserLimit || 0) > 0 ? (
+                              <Badge tone="slate">{t('plans.limitPerUser', { n: formatNumber(plan.perUserLimit, lang) })}</Badge>
+                            ) : null}
+                            {planCategory(plan) === 'exclusive' ? (
+                              <span title={(plan.allowedUsers || []).map((user) => user.name || user.username).join('، ')}>
+                                <Badge tone="violet">
+                                  {t('plans.exclusiveFor', { n: formatNumber((plan.allowedUsers || []).length, lang) })}
+                                </Badge>
+                              </span>
+                            ) : null}
+                            {Number(plan.sold || 0) > 0 ? (
+                              <Badge tone="emerald">{t('plans.soldCount', { n: formatNumber(plan.sold, lang) })}</Badge>
+                            ) : null}
+                          </div>
                           <p className="mt-0.5 text-[9px] text-slate-600">#{formatNumber(plan.id, lang)} · {t('plans.sortValue', { n: formatNumber(plan.sort, lang) })}</p>
                         </td>
                         <td><PlanNumbers plan={plan} lang={lang} /></td>
@@ -412,7 +547,7 @@ function AdminPlans() {
             <div className="card">
               <EmptyState
                 icon={Layers}
-                title={plans.length ? t('plans.noMatch') : t('plans.emptyAdmin')}
+                title={plans.length ? t('plans.noMatch') : (category ? t('plans.emptyCategory') : t('plans.emptyAdmin'))}
                 action={plans.length ? null : <Button size="sm" icon={Plus} onClick={() => { setEditing(null); setFormOpen(true); }}>{t('plans.new')}</Button>}
               />
             </div>
@@ -420,7 +555,7 @@ function AdminPlans() {
         </>
       )}
 
-      <PlanForm open={formOpen} onClose={() => setFormOpen(false)} editing={editing} />
+      <PlanForm open={formOpen} onClose={() => setFormOpen(false)} editing={editing} presetCategory={category || 'public'} />
     </>
   );
 }
@@ -463,6 +598,20 @@ function QuoteLines({ quote, lang, t }) {
           {t('plans.notEnough')}
         </p>
       ) : null}
+      {/* v1.5.8: the per-reseller ceiling, straight from the server's ledger. */}
+      {quote.remaining !== null && quote.remaining !== undefined ? (
+        <div className="flex items-center justify-between gap-2 text-[11px]">
+          <span className="text-slate-400">{t('plans.yourQuota')}</span>
+          <span className={cx('font-semibold', quote.limitReached ? 'text-rose-300' : 'text-slate-200')}>
+            {t('plans.quotaValue', { taken: formatNumber(quote.taken || 0, lang), remaining: formatNumber(quote.remaining || 0, lang) })}
+          </span>
+        </div>
+      ) : null}
+      {quote.limitReached ? (
+        <p className="rounded-lg border border-rose-400/25 bg-rose-500/[0.07] px-2.5 py-1.5 text-[10.5px] text-rose-200">
+          {t('plans.limitReached')}
+        </p>
+      ) : null}
       {!quote.charged ? (
         <p className="text-[10.5px] leading-5 text-slate-500">{t('plans.notCharged')}</p>
       ) : null}
@@ -495,14 +644,17 @@ function BuyNewModal({ open, onClose, plan }) {
       toast.success(t('plans.boughtNew', { n: formatNumber((result?.configs || []).length, lang) }));
       queryClient.invalidateQueries({ queryKey: ['configs'] });
       queryClient.invalidateQueries({ queryKey: ['reseller'] });
+      // The take ledger changed — refresh the shelf so «remaining» is honest.
+      queryClient.invalidateQueries({ queryKey: ['plans'] });
       onClose?.();
     },
     onError: (err) => toast.error(translateError(err, t)),
   });
 
   // The button waits for the real quote: until the server has said his wallet
-  // covers the plan, there is nothing honest to enable.
-  const canBuy = Boolean(customer.customerName.trim()) && Boolean(quote) && quote.sufficient !== false && !buy.isPending;
+  // covers the plan AND his take quota is not exhausted, there is nothing honest
+  // to enable.
+  const canBuy = Boolean(customer.customerName.trim()) && Boolean(quote) && quote.sufficient !== false && quote.limitReached !== true && !buy.isPending;
 
   return (
     <Modal
@@ -608,6 +760,7 @@ function RenewModal({ open, onClose, plans }) {
       toast.success(t('plans.renewed', { name: result?.plan?.name || '' }));
       queryClient.invalidateQueries({ queryKey: ['configs'] });
       queryClient.invalidateQueries({ queryKey: ['reseller'] });
+      queryClient.invalidateQueries({ queryKey: ['plans'] });
       onClose?.();
     },
     onError: (err) => toast.error(translateError(err, t)),
@@ -628,7 +781,7 @@ function RenewModal({ open, onClose, plans }) {
 
   const rows = customers.data?.rows || [];
   const chosen = rows.find((row) => Number(row.id) === Number(configId)) || null;
-  const canApply = Boolean(planId && configId) && preview?.usable !== false && quote?.sufficient !== false && !apply.isPending;
+  const canApply = Boolean(planId && configId) && preview?.usable !== false && quote?.sufficient !== false && quote?.limitReached !== true && !apply.isPending;
 
   return (
     <Modal
@@ -650,7 +803,7 @@ function RenewModal({ open, onClose, plans }) {
             <option value="">{t('plans.pickPlanNone')}</option>
             {plans.map((item) => (
               <option key={item.id} value={item.id}>
-                {`${item.name} · ${formatNumber(item.gb, lang, 2)} GB · ${formatNumber(item.days, lang)} ${t_day(lang)}`}
+                {`${item.name} · ${formatNumber(item.gb, lang, 2)} GB · ${formatNumber(item.days, lang)} ${t_day(lang)}${item.remaining === 0 ? ` · ${t('plans.exhaustedShort')}` : ''}`}
               </option>
             ))}
           </Select>
@@ -700,7 +853,9 @@ function RenewModal({ open, onClose, plans }) {
             )}>
               <p className="text-[12px] font-medium text-slate-200">{t('plans.resetTitle')}</p>
               <p className="mt-1 text-[10.5px] leading-5 text-slate-400">
-                {preview.usable ? t('plans.resetBody', { name: preview.plan?.name || '', gb: formatNumber(preview.gb, lang, 2), days: formatNumber(preview.days, lang) }) : t('plans.notUsable')}
+                {preview.usable
+                  ? t('plans.resetBody', { name: preview.plan?.name || '', gb: formatNumber(preview.gb, lang, 2), days: formatNumber(preview.days, lang) })
+                  : (preview.limitReached ? t('plans.limitReached') : t('plans.notUsable'))}
               </p>
             </div>
 
@@ -738,7 +893,7 @@ function RenewModal({ open, onClose, plans }) {
   );
 }
 
-function ResellerPlans() {
+function ResellerPlans({ category = null }) {
   const { t, lang } = useI18n();
   const [buyPlan, setBuyPlan] = useState(null);
   const [renewOpen, setRenewOpen] = useState(false);
@@ -749,6 +904,9 @@ function ResellerPlans() {
   });
 
   const plans = data?.plans || [];
+  // The shelf filters the window, but the renewal drawer keeps the FULL list —
+  // a customer can be renewed with any plan he is allowed to take.
+  const shown = category ? plans.filter((plan) => planCategory(plan) === category) : plans;
 
   if (isLoading) {
     return (
@@ -762,7 +920,7 @@ function ResellerPlans() {
   return (
     <>
       <PageHeader
-        title={t('plans.title')}
+        title={category ? `${t('plans.title')} · ${t(categoryMeta(category).label)}` : t('plans.title')}
         subtitle={t('plans.subtitleReseller')}
         actions={(
           <>
@@ -771,43 +929,60 @@ function ResellerPlans() {
           </>
         )}
       />
+      <CategoryTabs active={category} />
 
       {isError ? (
         <div className="card"><ErrorState message={error?.message} onRetry={refetch} /></div>
-      ) : plans.length ? (
+      ) : shown.length ? (
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {plans.map((plan) => (
-            <div key={plan.id} className="card flex flex-col gap-3 p-4">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="truncate text-[13.5px] font-bold text-white">{plan.name}</p>
-                  <p className="mt-0.5 text-[9.5px] text-slate-500">{t('plans.sortValue', { n: formatNumber(plan.sort, lang) })} · #{formatNumber(plan.id, lang)}</p>
+          {shown.map((plan) => {
+            const exhausted = plan.remaining === 0;
+            return (
+              <div key={plan.id} className={cx('card flex flex-col gap-3 p-4', exhausted && 'opacity-80')}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-[13.5px] font-bold text-white">{plan.name}</p>
+                    <p className="mt-0.5 text-[9.5px] text-slate-500">{t('plans.sortValue', { n: formatNumber(plan.sort, lang) })} · #{formatNumber(plan.id, lang)}</p>
+                  </div>
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500/15 to-cyan-500/10 text-emerald-300">
+                    <Layers className="h-4 w-4" />
+                  </span>
                 </div>
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500/15 to-cyan-500/10 text-emerald-300">
-                  <Layers className="h-4 w-4" />
-                </span>
-              </div>
 
-              {plan.description ? <p className="text-[11px] leading-5 text-slate-400">{plan.description}</p> : null}
+                {plan.description ? <p className="text-[11px] leading-5 text-slate-400">{plan.description}</p> : null}
 
-              <PlanNumbers plan={plan} lang={lang} />
-              <InboundChips inbounds={plan.inbounds} lang={lang} />
+                <PlanNumbers plan={plan} lang={lang} />
+                <InboundChips inbounds={plan.inbounds} lang={lang} />
 
-              <div className="mt-auto flex items-end justify-between gap-2 border-t border-white/[0.06] pt-3">
-                <div>
-                  <p className="text-[9.5px] text-slate-500">{t('plans.price')}</p>
-                  {plan.price > 0
-                    ? <p className="text-[15px] font-bold text-emerald-300">{formatMoney(plan.price, lang)}</p>
-                    : <Badge tone="violet">{t('plans.free')}</Badge>}
+                {/* v1.5.8: his personal quota for this plan, counted by the server. */}
+                {plan.remaining !== null && plan.remaining !== undefined ? (
+                  exhausted ? (
+                    <Badge tone="rose">{t('plans.limitReached')}</Badge>
+                  ) : (
+                    <Badge tone="cyan">{t('plans.remainingTimes', { n: formatNumber(plan.remaining, lang) })}</Badge>
+                  )
+                ) : null}
+
+                <div className="mt-auto flex items-end justify-between gap-2 border-t border-white/[0.06] pt-3">
+                  <div>
+                    <p className="text-[9.5px] text-slate-500">{t('plans.price')}</p>
+                    {plan.price > 0
+                      ? <p className="text-[15px] font-bold text-emerald-300">{formatMoney(plan.price, lang)}</p>
+                      : <Badge tone="violet">{t('plans.free')}</Badge>}
+                  </div>
+                  <Button size="sm" icon={Boxes} disabled={exhausted} onClick={() => setBuyPlan(plan)}>{t('plans.buy')}</Button>
                 </div>
-                <Button size="sm" icon={Boxes} onClick={() => setBuyPlan(plan)}>{t('plans.buy')}</Button>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       ) : (
         <div className="card">
-          <EmptyState icon={Layers} title={t('plans.emptyReseller')} hint={t('plans.emptyResellerHint')} />
+          <EmptyState
+            icon={Layers}
+            title={category ? t('plans.emptyCategory') : t('plans.emptyReseller')}
+            hint={category ? undefined : t('plans.emptyResellerHint')}
+          />
         </div>
       )}
 
@@ -819,5 +994,8 @@ function ResellerPlans() {
 
 export default function Plans() {
   const { isAdmin } = useAuth();
-  return isAdmin ? <AdminPlans /> : <ResellerPlans />;
+  const params = useParams();
+  // Only the three real shelves are routes; anything else falls back to «all».
+  const category = CATEGORIES.some((item) => item.key === params.category) ? params.category : null;
+  return isAdmin ? <AdminPlans category={category} /> : <ResellerPlans category={category} />;
 }
