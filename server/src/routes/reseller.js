@@ -14,7 +14,7 @@ const plansService = require('../services/plans');
 const settings = require('../settings');
 const telegram = require('../services/telegram');
 const bot = require('../services/bot');
-const { ApiError, asyncH, bytesToGb, toCsv, pageParams } = require('../utils');
+const { ApiError, asyncH, bytesToGb, toCsv, pageParams, txMoney } = require('../utils');
 
 const router = express.Router();
 router.use(auth.requireAuth);
@@ -299,6 +299,38 @@ router.delete('/configs/:id/package', asyncH(async (req, res) => {
   res.json({ ok: true, data: result });
 }));
 
+// v2.3.0, item 6: the same two bulk actions for the rows a reseller ticked on his
+// own list. No `charge` is forwarded (v1.4.25 rule: a reseller always pays), and
+// every package still passes configDetail()'s ownership check inside the service,
+// so a ticked id that is not his comes back as that item's failure — never as
+// someone else's renewal.
+router.post('/configs/bulk-extend', asyncH(async (req, res) => {
+  const result = await configsService.bulkExtendConfigs(
+    {
+      ids: Array.isArray(req.body?.ids) ? req.body.ids : [],
+      gb: num(req.body?.gb),
+      days: num(req.body?.days),
+      resetUsage: Boolean(req.body?.resetUsage),
+      dryRun: Boolean(req.body?.dryRun),
+    },
+    req,
+    req.user
+  );
+  res.json({ ok: true, data: result });
+}));
+
+router.post('/configs/bulk-delete', asyncH(async (req, res) => {
+  const result = await configsService.bulkDeletePackages(
+    {
+      ids: Array.isArray(req.body?.ids) ? req.body.ids : [],
+      dryRun: Boolean(req.body?.dryRun),
+    },
+    req,
+    req.user
+  );
+  res.json({ ok: true, data: result });
+}));
+
 router.get('/stats', (req, res) => {
   const days = Math.min(90, Math.max(1, num(req.query.days, 30)));
   res.json({
@@ -333,7 +365,10 @@ router.get('/transactions', (req, res) => {
       rows: rows.map((r) => ({
         id: r.id,
         type: r.type,
-        amount: r.amount,
+        // v2.3.0, item 3: same rule as the admin book. `amount` used to be the raw
+        // column, which a purchase wrote NEGATIVE — so the wallet page, that also
+        // prints its own sign from the type, showed a renewal as "− -349,000".
+        ...txMoney(r),
         balanceAfter: r.balance_after,
         description: r.description,
         createdAt: r.created_at,
@@ -365,6 +400,11 @@ router.get('/topups', (req, res) => {
         caption: row.caption,
         decisionNote: row.decisionNote,
         decidedAt: row.decidedAt,
+        // v2.3.0, item 4: a receipt the admin voided has to read as voided here,
+        // with the reason he recorded — but not with his username; the reseller
+        // settles the dispute through support, he does not pick a quarrel.
+        reverseNote: row.reverseNote,
+        reversedAt: row.reversedAt,
         source: row.source,
         createdAt: row.createdAt,
       })),

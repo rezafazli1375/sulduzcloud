@@ -28,6 +28,7 @@ import NodeSearch from './pages/admin/NodeSearch.jsx';
 import Backups from './pages/admin/Backups.jsx';
 import Audit from './pages/admin/Audit.jsx';
 import Trash from './pages/admin/Trash.jsx';
+import Transactions from './pages/admin/Transactions.jsx';
 import Settings from './pages/admin/Settings.jsx';
 import Wallet from './pages/reseller/Wallet.jsx';
 import ApiPage from './pages/reseller/ApiPage.jsx';
@@ -138,6 +139,8 @@ function AppRoutes() {
           <Route path="servers" element={<Protected adminOnly perm="servers"><Servers /></Protected>} />
           <Route path="broadcasts" element={<Protected adminOnly perm="broadcasts"><Broadcasts /></Protected>} />
           <Route path="topups" element={<Protected adminOnly perm="users"><Topups /></Protected>} />
+          {/* v2.3.0, item 3: the whole money ledger in one place (perm: stats). */}
+          <Route path="transactions" element={<Protected adminOnly perm="stats"><Transactions /></Protected>} />
           <Route path="node-search" element={<Protected adminOnly perm="configs"><NodeSearch /></Protected>} />
           {/* v2.1.0: the Trash — the undo for a deleted package (perm: configs). */}
           <Route path="trash" element={<Protected adminOnly perm="configs"><Trash /></Protected>} />

@@ -592,10 +592,10 @@ fi
 # the sha256 fingerprint of each partner, nothing else.
 ACT_STATE="$(sc_cli activation check 2>/dev/null || echo unknown)"
 MALE_KEY="$(sc_cli activation male 2>/dev/null || true)"
-log "Activation: ${ACT_STATE}   male key of this install: ${MALE_KEY:-unknown}"
+log "Activation: ${ACT_STATE}   serial of this install: ${MALE_KEY:-unknown}"
 
 if [ "$ACT_STATE" = "required" ]; then
-  warn "  کلید مادگیِ همین کلید نر را از مالک پروژه بگیرید (کلید نر: $MALE_KEY)."
+  warn "  کلید فعالسازیِ همین سریال را از مالک پروژه بگیرید (سریال: $MALE_KEY)."
   warn "  با Enter رد شوید؛ همان سؤال در اولین باز کردن پنل در مرورگر هم پرسیده می‌شود."
   KEY_TRIES=0
   TRY_KEY=""
@@ -603,7 +603,7 @@ if [ "$ACT_STATE" = "required" ]; then
     if [ -n "$ACTIVATION_KEY" ]; then
       TRY_KEY="$ACTIVATION_KEY"; ACTIVATION_KEY=""
     else
-      ask TRY_KEY "کلید مادگی (Enter = بعداً):" ""
+      ask TRY_KEY "کلید فعالسازی (Enter = بعداً):" ""
     fi
     [ -z "$TRY_KEY" ] && break
     KEY_TRIES=$((KEY_TRIES + 1))
@@ -654,9 +654,9 @@ if [ -z "$OWNER_LINE" ]; then
 fi
 
 case "$ACT_STATE" in
-  activated) ACT_LINE="  Activation:       activated (male key $MALE_KEY)" ;;
+  activated) ACT_LINE="  Activation:       activated (serial $MALE_KEY)" ;;
   legacy)    ACT_LINE="  Activation:       an older install with accounts — no key is asked" ;;
-  required)  ACT_LINE="  Activation:       NOT activated: the panel asks for the female key of $MALE_KEY" ;;
+  required)  ACT_LINE="  Activation:       NOT activated: the panel asks for the activation key of serial $MALE_KEY" ;;
   *)         ACT_LINE="  Activation:       unknown — check with the server menu: sc -> 4" ;;
 esac
 

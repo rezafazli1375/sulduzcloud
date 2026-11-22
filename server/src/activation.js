@@ -1,6 +1,10 @@
 'use strict';
 
 // Panel v2.1.0 — activation by a male/female key pair («کلید نر و مادگی»).
+// v2.3.0 renames what the operator SEES: the male half is «سریال» (serial) and the
+// female half is «کلید فعالسازی» (activation key). The identifiers below keep the
+// old names on purpose — they are internal, and the shipped ids are already in
+// installs that are out there.
 //
 // The owner's rule, in his own words: the panel a stranger installs must not run
 // until he is shown a MALE key and types the FEMALE half that belongs to it.

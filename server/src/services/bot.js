@@ -448,6 +448,11 @@ function balanceText(user) {
     `نماینده: <code>${esc(user.username)}</code>${user.name ? ` (${esc(user.name)})` : ''}`,
     `موجودی: <b>${faNum(user.balance)}</b> ${unit}`,
   ];
+  // v2.3.0: a wallet below zero is a debt, and the reseller must hear the word —
+  // otherwise a minus sign looks like a broken number.
+  if (Number(user.balance || 0) < 0) {
+    lines.push(`⚠️ <b>بدهی شما: ${faNum(-Number(user.balance || 0))}</b> ${unit} — تا تسویه نکردن نمی‌توانید اشتراک بخرید یا تمدید کنید.`);
+  }
   if (pending > 0) lines.push(`فیش در انتظار بررسی: <b>${faNum(pending)}</b>`);
   if (rows.length) {
     lines.push('', '🧾 <b>آخرین تراکنش‌ها</b>');
@@ -544,11 +549,11 @@ function packagesText(user) {
 function receiptsText(user) {
   const data = topups.listRequests({ userId: Number(user.id), page: 1, pageSize: 8 });
   const unit = esc(currency());
-  const tone = { pending: '⏳', approved: '✅', rejected: '❌' };
+  const tone = { pending: '⏳', approved: '✅', rejected: '❌', reversed: '⛔' };
   const lines = [
     '🧾 <b>واریزی‌های شما</b>',
     `نماینده: <code>${esc(user.username)}</code>`,
-    `در انتظار: <b>${faNum(data.counts.pending)}</b> · تاییدشده: <b>${faNum(data.counts.approved)}</b> · ردشده: <b>${faNum(data.counts.rejected)}</b>`,
+    `در انتظار: <b>${faNum(data.counts.pending)}</b> · تاییدشده: <b>${faNum(data.counts.approved)}</b> · ردشده: <b>${faNum(data.counts.rejected)}</b> · باطل‌شده: <b>${faNum(data.counts.reversed || 0)}</b>`,
     '',
   ];
   if (!data.rows.length) {
@@ -565,6 +570,12 @@ function receiptsText(user) {
     if (row.status === 'approved') {
       const by = row.autoApproved ? 'به صورت خودکار' : row.decidedByName ? `توسط ${esc(row.decidedByName)}` : '';
       lines.push(`  <i>تایید شد${by ? ` ${by}` : ''} · موجودی آن لحظه ${faNum(row.balance)} ${unit}</i>`);
+    } else if (row.status === 'reversed') {
+      // v2.3.0: the reseller must be able to read the claw-back here, or a wallet
+      // that dropped on its own looks like a bug in the panel.
+      const by = row.reversedByName ? `توسط ${esc(row.reversedByName)}` : '';
+      lines.push(`  <i>⛔ باطل شد${by ? ` ${by}` : ''} · ${faNum(row.amount)} ${unit} از کیف پول کسر شد</i>`);
+      if (row.reverseNote) lines.push(`  <i>دلیل: ${esc(String(row.reverseNote).slice(0, 140))}</i>`);
     } else if (row.decisionNote) {
       lines.push(`  <i>یادداشت مدیر: ${esc(String(row.decisionNote).slice(0, 120))}</i>`);
     } else if (row.status === 'pending') {
@@ -927,7 +938,9 @@ async function askMoneyAmount(chatId, state, sign) {
   await reply(chatId, [
     `💳 <b>${minus ? 'کاهش' : 'افزایش'} موجودی</b> <code>${esc(target.username)}</code>`,
     `موجودی فعلی: <b>${faNum(Number(target.balance || 0))}</b> ${esc(currency())}`,
-    minus ? `حداکثر قابل کسر: <b>${faNum(Number(target.balance || 0))}</b> ${esc(currency())}` : '',
+    // v2.3.0: there is no «حداکثر قابل کسر» any more — going below the wallet is
+    // allowed and records a debt, which the next screen spells out.
+    Number(target.balance || 0) < 0 ? 'کیف پول این نماینده الان بدهکار است؛ کسر بیشتر بدهی را زیاد می‌کند.' : '',
     '',
     'مبلغ را فقط با عدد بفرستید؛ مثلا <code>500000</code>.',
     `با «${BTN_CANCEL}» هیچ پولی جابه‌جا نمی‌شود.`,
@@ -959,21 +972,20 @@ async function confirmMoneyAmount(chatId, state, raw) {
     return { ok: false, reason: 'amount_rejected' };
   }
   const balance = Number(target.balance || 0);
-  if (sign === '-' && amount > balance) {
-    await reply(chatId, [
-      `⚠️ موجودی <code>${esc(target.username)}</code> فقط <b>${faNum(balance)}</b> ${esc(currency())} است.`,
-      'این مبلغ را نمی‌توان کم کرد؛ مقدار کمتر را بفرستید.',
-    ].join('\n'), { reply_markup: cancelKeyboard() });
-    return { ok: false, reason: 'insufficient_balance' };
-  }
+  // v2.3.0 — «اعمال بدهی و موجودی منفی». This used to refuse a subtraction that
+  // went below the wallet, which left the admin no way to record money a reseller
+  // owes him from a chat. The move is allowed now; the confirm message below shows
+  // the negative result explicitly so the decision is still an informed one.
   setStep(chatId, { step: 'adm_confirm', amount, sign });
+  const after = sign === '-' ? balance - amount : balance + amount;
   await reply(chatId, [
     '⚠️ <b>تایید نهایی</b>',
     '',
     `نماینده: <code>${esc(target.username)}</code>`,
     `${sign === '-' ? 'کاهش' : 'افزایش'}: <b>${faNum(amount)}</b> ${esc(currency())}`,
     `موجودی فعلی: ${faNum(balance)} ${esc(currency())}`,
-    `موجودی پس از این کار: <b>${faNum(sign === '-' ? balance - amount : balance + amount)}</b> ${esc(currency())}`,
+    `موجودی پس از این کار: <b>${faNum(after)}</b> ${esc(currency())}`,
+    ...(after < 0 ? ['', `⚠️ این نماینده بعد از این کار <b>${faNum(-after)}</b> ${esc(currency())} بدهکار می‌شود.`] : []),
     '',
     'با «ثبت» موجودی تغییر می‌کند و در کیف پول یک تراکنش ثبت می‌شود.',
   ].join('\n'), { reply_markup: moneyConfirmKeyboard(target.id, sign, amount) });
@@ -1316,7 +1328,11 @@ async function syncAdminMessage(request, decision, actorName = '') {
   const stamp = `${esc(faDate(Date.now(), true))}${actorName ? ` · ${esc(actorName)}` : ''} · پنل`;
   const tail = decision === 'approved'
     ? `\n\n✅ <b>در پنل تایید شد</b> — ${faNum(request.amount)} ${unit} به کیف پول ${esc(request.username || '')} اضافه شد.\n<i>${stamp}</i>`
-    : `\n\n❌ <b>در پنل رد شد</b>\n<i>${stamp}</i>`;
+    : decision === 'reversed'
+      // v2.3.0: the admin's Telegram copy has to show the reversal too, otherwise
+      // the chat keeps saying «تایید شد» next to a receipt that no longer exists.
+      ? `\n\n⛔ <b>در پنل باطل شد</b> — ${faNum(request.amount)} ${unit} از کیف پول ${esc(request.username || '')} کسر شد.\n<i>${stamp}</i>`
+      : `\n\n❌ <b>در پنل رد شد</b>\n<i>${stamp}</i>`;
   const original = [
     `🧾 <b>فیش واریزی</b> #${Number(request.id)}`,
     `نماینده: <code>${esc(request.username || '')}</code>`,
@@ -1397,11 +1413,15 @@ async function handleAdminCallback(data, chatId, fromId, answer, messageId = 0) 
   }
   clearStep(chatId);
   const unit = esc(currency());
+  const balanceAfter = Number(moved.result.balance || 0);
   const receipt = [
     moved.delta > 0 ? '✅ <b>موجودی افزایش یافت</b>' : '✅ <b>موجودی کاهش یافت</b>',
     `نماینده: <code>${esc(moved.user.username)}</code>`,
     `${moved.delta > 0 ? 'افزایش' : 'کاهش'}: <b>${faNum(Math.abs(moved.delta))}</b> ${unit}`,
     `موجودی جدید: <b>${faNum(moved.result.balance)}</b> ${unit}`,
+    // v2.3.0: below zero the receipt has to name what happened, or a minus reads
+    // as a bug rather than as the debt the admin just recorded.
+    ...(balanceAfter < 0 ? [`⚠️ بدهی این نماینده: <b>${faNum(-balanceAfter)}</b> ${unit}`] : []),
     ``,
     `توسط: ${esc(actor.username)} · ${esc(faDate(Date.now(), true))}`,
     '<i>این کار در پنل هم در تراکنش‌های کیف پول ثبت شد.</i>',
@@ -1418,6 +1438,9 @@ async function handleAdminCallback(data, chatId, fromId, answer, messageId = 0) 
         moved.delta > 0 ? '💰 <b>موجودی شما افزایش یافت</b>' : '💸 <b>موجودی شما کاهش یافت</b>',
         `مبلغ: <b>${faNum(Math.abs(moved.delta))}</b> ${unit}`,
         `موجودی جدید: <b>${faNum(moved.result.balance)}</b> ${unit}`,
+        ...(Number(moved.result.balance || 0) < 0
+          ? [`⚠️ موجودی شما <b>${faNum(-Number(moved.result.balance))}</b> ${unit} بدهی است؛ تا تسویه نکردن خرید و تمدید انجام نمی‌شود.`]
+          : []),
         '<i>توسط مدیر پنل · در صورت اشتباه با پشتیبانی تماس بگیرید.</i>',
       ].join('\n'));
     } catch (err) {

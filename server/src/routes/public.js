@@ -80,7 +80,7 @@ router.post('/activation', activationLimiter, asyncH(async (req, res) => {
   const result = activation.activate(key, { source: 'web' });
   if (!result.ok) {
     audit({ ...req, user: null }, 'activation.failed', 'activation', result.male, {});
-    throw new ApiError(403, 'activation_invalid', 'این کلید با کلید نر این نصب سازگار نیست / this key does not match the male key of this install');
+    throw new ApiError(403, 'activation_invalid', 'این کلید فعالسازی با سریال این نصب سازگار نیست / this activation key does not match the serial of this install');
   }
   audit({ ...req, user: null }, 'activation.success', 'activation', result.male, {});
   res.json({ ok: true, data: { ...activation.status(), unlocked: true } });

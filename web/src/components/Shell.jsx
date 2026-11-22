@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Activity,
   AlertTriangle,
+  ArrowLeftRight,
   Bell,
   Boxes,
   CheckCircle2,
@@ -66,6 +67,8 @@ const ADMIN_GROUPS = [
       { to: '/servers', label: 'nav.servers', icon: Server, perm: 'servers' },
       { to: '/tickets', label: 'nav.tickets', icon: MessageSquare, perm: 'tickets' },
       { to: '/topups', label: 'nav.topups', icon: Receipt, perm: 'users' },
+      // v2.3.0, item 3: the money ledger — every credit, debit, purchase and renewal.
+      { to: '/transactions', label: 'nav.transactions', icon: ArrowLeftRight, perm: 'stats' },
       { to: '/node-search', label: 'nav.nodeSearch', icon: Search, perm: 'configs' },
       // v2.1.0: «زباله‌دان» — every package deleted outright lands here with the
       // email, uuid and subscribe token it had, and can be rebuilt from that.
@@ -377,13 +380,22 @@ function LiveBalance() {
           ? 'border-emerald-400/50 bg-emerald-500/15 text-emerald-200 shadow-[0_0_18px_-6px_rgba(16,185,129,.9)]'
           : flash === 'down'
             ? 'border-rose-400/50 bg-rose-500/15 text-rose-200'
-            : 'border-white/[0.08] bg-white/[0.04] text-slate-200 hover:border-emerald-400/30 hover:text-white'
+            // v2.3.0: a wallet the owner put below zero is a debt, and the chip
+            // says so instead of showing a green number that hides it.
+            : Number(balance) < 0
+              ? 'border-rose-400/40 bg-rose-500/10 text-rose-200 hover:border-rose-400/60'
+              : 'border-white/[0.08] bg-white/[0.04] text-slate-200 hover:border-emerald-400/30 hover:text-white'
       )}
     >
-      <Wallet className="h-[15px] w-[15px] text-emerald-300" />
+      <Wallet className={cx('h-[15px] w-[15px]', Number(balance) < 0 ? 'text-rose-300' : 'text-emerald-300')} />
       <span dir="ltr" className="tabular-nums">
         {balance === null ? '—' : formatMoney(balance, lang, data.currency)}
       </span>
+      {Number(balance) < 0 ? (
+        <span className="rounded-md bg-rose-400/15 px-1.5 py-0.5 text-[10px] font-bold text-rose-200">
+          {t('common.debt')}
+        </span>
+      ) : null}
       {Number(data?.pending || 0) > 0 ? (
         <span className="hidden rounded-md bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-bold text-amber-200 sm:inline-block">
           {t('wallet.receiptPending')} {formatNumber(data.pending, lang)}

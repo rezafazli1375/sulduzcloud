@@ -44,6 +44,9 @@ const TX_LABEL = {
   debit: 'stats.typeDebit',
   purchase: 'stats.typePurchase',
   renew: 'stats.typeRenew',
+  // v2.3.0: the commission a referrer earns is a ledger line like any other, and
+  // until now it fell through to «دستی» — the chart said money moved by hand.
+  commission: 'stats.typeCommission',
   manual: 'stats.typeManual',
   refund: 'stats.typeRefund',
 };
@@ -193,11 +196,14 @@ function AdminStats() {
                   {tx.data.rows.map((row) => (
                     <tr key={row.id}>
                       <td className="text-[11.5px] text-slate-300">@{row.username || '—'}</td>
-                      <td><Badge tone={row.amount > 0 ? 'emerald' : 'rose'}>{t(TX_LABEL[row.type] || 'stats.typeManual')}</Badge></td>
-                      <td className={cx('text-[11.5px] font-semibold', row.amount > 0 ? 'text-emerald-300' : 'text-rose-300')}>
-                        {row.amount > 0 ? '+' : ''}{formatNumber(row.amount, lang)}
+                      {/* v2.3.0: the direction comes from the server, not from the sign
+                          of `amount` — a wallet deduction was written as a positive
+                          number and this table coloured it green as income. */}
+                      <td><Badge tone={row.direction === 'in' ? 'emerald' : 'rose'}>{t(TX_LABEL[row.type] || 'stats.typeManual')}</Badge></td>
+                      <td className={cx('text-[11.5px] font-semibold', row.direction === 'in' ? 'text-emerald-300' : 'text-rose-300')} dir="ltr">
+                        {row.direction === 'in' ? '+' : '−'}{formatNumber(row.magnitude, lang)}
                       </td>
-                      <td className="text-[11px] text-slate-400">{formatNumber(row.balanceAfter, lang)}</td>
+                      <td className="text-[11px] text-slate-400" dir="ltr">{formatNumber(row.balanceAfter, lang)}</td>
                       <td className="max-w-[240px] truncate text-[11px] text-slate-400">{row.description || '—'}</td>
                       <td className="text-[10.5px] text-slate-500">{formatDate(row.createdAt, lang, true)}</td>
                     </tr>

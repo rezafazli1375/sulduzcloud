@@ -17,8 +17,10 @@ import {
   SearchX,
   Server,
   SlidersHorizontal,
+  Trash2,
   UserRound,
   Wifi,
+  X,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth.jsx';
 import { useI18n } from '../lib/i18n.jsx';
@@ -27,6 +29,7 @@ import { daysLeft, formatBytes, formatDate, formatNumber, relativeTime } from '.
 import {
   Badge,
   Button,
+  Checkbox,
   EmptyState,
   ErrorState,
   IconButton,
@@ -44,6 +47,7 @@ import {
 } from '../components/ui.jsx';
 import ConfigForm from '../components/config/ConfigForm.jsx';
 import ConfigDetail from '../components/config/ConfigDetail.jsx';
+import { BulkDeleteModal, BulkRenewModal } from '../components/config/ConfigBulk.jsx';
 import { useToast } from '../components/feedback.jsx';
 
 const STATUSES = ['active', 'expired', 'depleted', 'disabled', 'mixed'];
@@ -93,6 +97,11 @@ export default function Configs() {
   const [page, setPage] = useState(1);
   const [formOpen, setFormOpen] = useState(params.get('new') === '1');
   const [detailId, setDetailId] = useState(null);
+  // v2.3.0, item 6: the bulk ticks. A page turn keeps them (the server folds the
+  // ids down to one entry per customer and the dialog lists every package before
+  // it touches anything), but a new filter is a new question — so they clear.
+  const [selected, setSelected] = useState([]);
+  const [bulkMode, setBulkMode] = useState('');
 
   const base = isAdmin ? '/admin' : '/reseller';
 
@@ -106,7 +115,10 @@ export default function Configs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => { setPage(1); }, [debounced, status, origin, inboundId, userId, expiringDays]);
+  useEffect(() => {
+    setPage(1);
+    setSelected([]);
+  }, [debounced, status, origin, inboundId, userId, expiringDays]);
 
   const filters = useMemo(() => {
     const query = new URLSearchParams();
@@ -143,6 +155,34 @@ export default function Configs() {
   const rows = data?.rows || [];
   const inbounds = inboundsQuery.data?.rows || [];
 
+  // v2.3.0, item 6. "All" means every row of THIS page: the list is paginated
+  // and a filter can be 2 000 customers wide, so a header tick never silently
+  // means "everything the query returns". The bulk count is always shown, and
+  // the dialog previews every package it will touch before the button is live.
+  const allOnPage = rows.length > 0 && rows.every((row) => selected.includes(row.id));
+  const toggleAll = () => setSelected((prev) => (
+    allOnPage ? prev.filter((id) => !rows.some((row) => row.id === id)) : [...new Set([...prev, ...rows.map((row) => row.id)])]
+  ));
+  const toggleRow = (id) => setSelected((prev) => (prev.includes(id) ? prev.filter((value) => value !== id) : [...prev, id]));
+  const clearSelection = () => setSelected([]);
+  // After a real batch the rows, the wallets and the ledger all moved. This only
+  // refreshes: the dialog keeps the per-package result on screen until the
+  // operator closes it himself, so a partial batch is read before it disappears.
+  const refreshAfterBulk = () => {
+    queryClient.invalidateQueries({ queryKey: ['configs'] });
+    queryClient.invalidateQueries({ queryKey: ['wallet'] });
+    queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
+    queryClient.invalidateQueries({ queryKey: ['admin', 'transactions'] });
+    queryClient.invalidateQueries({ queryKey: ['notifications'] });
+  };
+
+  // Closing is what drops the ticks: a batch that half-worked would otherwise
+  // leave the failed rows selected, ready to be run again by accident.
+  const closeBulk = () => {
+    setSelected([]);
+    setBulkMode('');
+  };
+
   const exportCsv = () => {
     const query = new URLSearchParams();
     if (debounced) query.set('search', debounced);
@@ -161,6 +201,7 @@ export default function Configs() {
     setUserId('');
     setExpiringDays(0);
     setPage(1);
+    setSelected([]);
   };
 
   const activeFilters = Boolean(search || status || origin || inboundId || userId || expiringDays);
@@ -218,6 +259,26 @@ export default function Configs() {
         </div>
       </Toolbar>
 
+      {selected.length ? (
+        // v2.3.0, item 6: the strip only appears once something is ticked, and it
+        // names the tick count in the same words the dialog uses, so the number
+        // on screen is the number the operator is about to act on.
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.06] px-3 py-1.5">
+          <span className="text-[11px] font-medium text-emerald-200">
+            {t('configs.bulk.count', { n: formatNumber(selected.length, lang) })}
+          </span>
+          <Button size="xs" variant="soft" icon={Layers} onClick={() => setBulkMode('renew')}>
+            {t('configs.bulk.renew')}
+          </Button>
+          <Button size="xs" variant="ghost" icon={Trash2} onClick={() => setBulkMode('delete')}>
+            {t('configs.bulk.delete')}
+          </Button>
+          <Button size="xs" variant="ghost" icon={X} onClick={clearSelection} className="ms-auto">
+            {t('configs.bulk.clear')}
+          </Button>
+        </div>
+      ) : null}
+
       {isLoading ? (
         <div className="table-wrap"><TableSkeleton rows={8} cols={6} /></div>
       ) : isError ? (
@@ -229,6 +290,9 @@ export default function Configs() {
               <table className="table">
                 <thead>
                   <tr>
+                    {/* v2.3.0, item 6: one tick per customer (the list row is the
+                        head of his package), plus a page-wide select-all. */}
+                    <th className="w-10"><Checkbox checked={allOnPage} onChange={toggleAll} /></th>
                     <th>{t('configs.table.customer')}</th>
                     <th>{t('configs.table.inbound')}</th>
                     <th className="w-[180px]">{t('configs.table.usage')}</th>
@@ -244,6 +308,9 @@ export default function Configs() {
                     const grouped = Number(row.groupCount || 1) > 1;
                     return (
                       <tr key={row.id} className="cursor-pointer" onClick={() => setDetailId(row.id)}>
+                        <td onClick={(event) => event.stopPropagation()}>
+                          <Checkbox checked={selected.includes(row.id)} onChange={() => toggleRow(row.id)} />
+                        </td>
                         <td>
                           <div className="flex items-center gap-2.5">
                             <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-emerald-500/20 to-cyan-500/10 text-[10px] font-bold text-emerald-300">
@@ -338,12 +405,18 @@ export default function Configs() {
               const left = daysLeft(row.expiryAt, lang);
               const grouped = Number(row.groupCount || 1) > 1;
               return (
-                <button
-                  key={row.id}
-                  type="button"
-                  onClick={() => setDetailId(row.id)}
-                  className="card w-full p-3.5 text-start transition hover:border-emerald-400/25"
-                >
+                <div key={row.id} className="card flex items-start gap-2.5 p-3.5">
+                  {/* v2.3.0, item 6: the tick sits outside the button — a label
+                      inside a button swallows the tap and opens the drawer
+                      instead of selecting. */}
+                  <div className="pt-1">
+                    <Checkbox checked={selected.includes(row.id)} onChange={() => toggleRow(row.id)} />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDetailId(row.id)}
+                    className="min-w-0 flex-1 text-start transition"
+                  >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <p className="flex items-center gap-1.5">
@@ -374,7 +447,8 @@ export default function Configs() {
                     <span className="flex shrink-0 items-center gap-1"><CalendarClock className="h-3 w-3" />{row.expiryMixed ? t('configs.variedExpiry') : row.expiryAt ? (left !== null && left > 0 ? `${formatNumber(left, lang)} ${t('common.days')}` : t('common.expired')) : '∞'}</span>
                   </div>
                   <div className="mt-2.5"><CustomerUsage row={row} compact /></div>
-                </button>
+                  </button>
+                </div>
               );
             })}
           </div>
@@ -411,6 +485,22 @@ export default function Configs() {
         onSelect={setDetailId}
         onClose={() => setDetailId(null)}
         onChanged={() => queryClient.invalidateQueries({ queryKey: ['configs'] })}
+      />
+
+      {/* v2.3.0, item 6: both dialogs preview through the same endpoint with
+          dryRun, so what the operator confirms is what the server measured. */}
+      <BulkRenewModal
+        open={bulkMode === 'renew'}
+        onClose={closeBulk}
+        ids={selected}
+        isAdmin={isAdmin}
+        onDone={refreshAfterBulk}
+      />
+      <BulkDeleteModal
+        open={bulkMode === 'delete'}
+        onClose={closeBulk}
+        ids={selected}
+        onDone={refreshAfterBulk}
       />
     </>
   );

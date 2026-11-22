@@ -155,7 +155,7 @@ function compareGroups(a, b) {
  * Since v1.4.18 a package is one client attached to every channel, so its own
  * link on the node already carries the whole package and this panel has nothing
  * to aggregate. The owner's rule for the address is explicit: what the customer
- * is handed must be the link the seller's panel (پنل ثنایی) itself shows for him,
+ * is handed must be the link the node's own panel itself shows for him,
  * never an address of this panel. That stays true for the leftovers that are
  * still spread over two clients — the customer's own client leads, and the extra
  * link is offered next to it until consolidation merges them into one.
@@ -1080,6 +1080,14 @@ async function createConfigs(input, req) {
   if (days <= 0 && input.unlimited !== true) throw new ApiError(422, 'days_required', 'Duration must be greater than zero');
 
   const allowed = usersService.allowedInboundIds(user);
+  // v2.3.0: a plan order carries the owner's own channel choice, and `planId` is
+  // only ever set from the `plans` row inside services/plans.js — no request body
+  // can put it there (the reseller route forwards plan ids to /plans/new and
+  // /plans/renew, never to /configs). When it is set, the per-channel permission
+  // list is NOT asked: the reseller was offered the plan, so he may sell it even
+  // on channels the owner never granted him. Every other rule below still applies
+  // — the channel must exist, be enabled, sit on one panel, and fit his ceilings.
+  const fromPlan = Number(input.planId) > 0;
   const priced = [];
   let totalPrice = 0;
 
@@ -1087,11 +1095,11 @@ async function createConfigs(input, req) {
     const inbound = getInboundRow(inboundId);
     if (!inbound) throw new ApiError(404, 'inbound_not_found', `Inbound ${inboundId} not found`);
     if (!inbound.enabled) throw new ApiError(422, 'inbound_disabled', `Inbound ${inbound.remark} is disabled`);
-    if (allowed && !allowed.includes(inboundId) && inboundId !== fixedId) {
+    if (!fromPlan && allowed && !allowed.includes(inboundId) && inboundId !== fixedId) {
       throw new ApiError(403, 'inbound_forbidden', 'This reseller cannot use the selected inbound');
     }
     // Same rule as the picker that offered it: an explicit grant beats visible=0.
-    if (!inboundsService.isUsableBy(inbound, { allowed, fixedId, isAdmin: req?.user?.role === 'admin' })) {
+    if (!fromPlan && !inboundsService.isUsableBy(inbound, { allowed, fixedId, isAdmin: req?.user?.role === 'admin' })) {
       throw new ApiError(403, 'inbound_hidden', 'This inbound is not available');
     }
     const price = pricing.priceFor(inbound, gb, days, user.id);
@@ -1641,7 +1649,7 @@ function packageRenewalPrice(row, { gb = 0, days = 0, price = 0, charge = true, 
   };
 }
 
-async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = false, charge, planId = 0, planName = '' } = {}, req, viewer) {
+async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = false, charge, planId = 0, planName = '' } = {}, req, viewer, opts = {}) {
   const { row } = configDetail(id, viewer);
   const addBytes = gbToBytes(Math.max(0, Number(gb || 0)));
   const addDays = Math.max(0, Math.round(Number(days || 0)));
@@ -1792,7 +1800,7 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
     groupSize: targets.length,
     applied: applied.reduce((sum, batch) => sum + batch.length, 0),
   });
-  if (reseller) {
+  if (reseller && opts.notify !== false) {
     // The reseller's confirmation of a renewal: what the package is now, what it
     // cost and until when it is valid. With the wallet switched off the amount is
     // still named but plainly marked as not deducted, so the message can never
@@ -2048,7 +2056,7 @@ async function resetUsage(id, req, viewer) {
  *
  * What it deliberately is NOT:
  *   - not a write to the node. x-ui is only READ here (`clients/get`), so this
- *     button can never hurt a customer on the پنل ثنایی — no restart, no rewrite,
+ *     button can never hurt a customer on the node's own panel — no restart, no rewrite,
  *     no counter being zeroed;
  *   - not a quota or expiry editor. It copies the same fields the background sync
  *     copies (traffic counters, online time, enabled flag, uuid, subId) and leaves
@@ -2590,6 +2598,353 @@ async function bulkAssignNodeClients(payload = {}, req, viewer) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// v2.3.0, item 6: «قسمت کانفینگ ها قابلیت انتخاب چند کانفینگ برای افزودن حجم و
+// زمان یا حذف چند کانفینگ باشه».
+//
+// Both paths take the ids ticked in the config list, collapse them to ONE entry
+// per customer (two ticked rows of the same package are the same person), and
+// then run exactly the service a single action runs — extendConfig and
+// deletePackage. Nothing about the price, the wallet, the shared pool, the x-ui
+// write, the ledger, the audit line or the Trash is re-implemented here, so a
+// bulk renewal can never disagree with the drawer.
+//
+// dryRun answers the same question and writes nothing: the operator sees, per
+// package, what will happen and which one will fail — before the button is
+// pressed for real.
+// ---------------------------------------------------------------------------
+const BULK_PACKAGE_LIMIT = 1000;
+
+function packageIdsOf(raw) {
+  const seen = new Set();
+  const ids = [];
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const id = Number(item && typeof item === 'object' ? item.id : item) || 0;
+    if (id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * Every ticked id through the same access check the single action uses
+ * (configDetail: exists, not deleted, yours unless admin), then one head per
+ * package. A bad tick does not abort the batch — it comes back as that item's
+ * failure, so nineteen good rows are not lost with the one that was stale.
+ */
+function resolvePackageHeads(raw, viewer) {
+  const ids = packageIdsOf(raw);
+  if (!ids.length) {
+    throw new ApiError(422, 'ids_required', 'هیچ کانفیگی انتخاب نشده است / No config was selected');
+  }
+  if (ids.length > BULK_PACKAGE_LIMIT) {
+    throw new ApiError(422, 'too_many_items',
+      `در هر بار حداکثر ${BULK_PACKAGE_LIMIT} کانفیگ / At most ${BULK_PACKAGE_LIMIT} configs at a time`);
+  }
+  const heads = [];
+  const rejected = [];
+  const claimed = new Set();
+  let merged = 0;
+  for (const id of ids) {
+    let row;
+    try {
+      ({ row } = configDetail(id, viewer));
+    } catch (err) {
+      rejected.push({
+        id,
+        email: '',
+        action: 'failed',
+        ok: false,
+        code: String(err?.code || 'error'),
+        message: String(err?.message || 'خطای نامشخص / unknown error').slice(0, 300),
+        rows: 0,
+      });
+      continue;
+    }
+    const key = packageKeyOf(row) || `C:${row.id}`;
+    if (claimed.has(key)) {
+      merged += 1;
+      continue;
+    }
+    claimed.add(key);
+    heads.push(row);
+  }
+  return { ids, heads, rejected, merged };
+}
+
+async function bulkExtendConfigs(payload = {}, req, viewer) {
+  const { ids, heads, rejected, merged } = resolvePackageHeads(payload.ids ?? payload.items, viewer);
+  const gb = Math.max(0, Number(payload.gb || 0));
+  const days = Math.max(0, Math.round(Number(payload.days || 0)));
+  const resetUsage = Boolean(payload.resetUsage);
+  if (!gb && !days) {
+    throw new ApiError(422, 'nothing_to_add',
+      'حجم یا روز جدید وارد کنید / Enter the GB or days to add');
+  }
+  const dryRun = Boolean(payload.dryRun);
+  // The admin's tick decides whether the resellers pay; a reseller is always
+  // charged — the same rule the single renewal applies, read from the viewer and
+  // never from the body.
+  const willCharge = shouldCharge(req, viewer, { charge: payload.charge });
+  // A tick that never even reached the loop — not his, already deleted, no such
+  // row — is still a failure the operator has to see counted. `results` already
+  // carries it, so the summary starts from that head-count instead of from zero,
+  // and renewed + failed + merged always adds up to the ticks he sent.
+  const results = [...rejected];
+  // `amount` is the money this batch really takes, and `tariff` is the money it
+  // would have taken at the same prices. They differ for a free admin renewal
+  // and while the wallet is switched off — and the summary has to be able to say
+  // both, instead of printing a total that never leaves anyone's balance.
+  const tally = { renewed: 0, failed: rejected.length, rows: 0, amount: 0, tariff: 0 };
+  const spent = new Map();
+  const owners = new Map();
+
+  for (const row of heads) {
+    const entry = {
+      id: Number(row.id),
+      email: String(row.email || ''),
+      action: 'renew',
+      ok: false,
+      code: '',
+      message: '',
+      rows: 0,
+      amount: 0,
+      charged: false,
+      resultGb: 0,
+      resultExpiryAt: 0,
+      resellerId: Number(row.user_id || 0),
+      reseller: '',
+    };
+    try {
+      const priced = packageRenewalPrice(row, { gb, days, price: 0, charge: willCharge, resetUsage });
+      const balance = Number(priced.reseller?.balance || 0);
+      const cost = priced.charged ? priced.amount : 0;
+      const soFar = spent.get(entry.resellerId) || 0;
+      entry.rows = priced.targets.length;
+      entry.amount = priced.amount;
+      entry.charged = priced.charged;
+      entry.reseller = String(priced.reseller?.username || '');
+      entry.resultGb = Number(bytesToGb(
+        priced.outcome.changeTotal ? priced.outcome.newTotal : Number(priced.targets[0]?.total_bytes || 0)
+      ).toFixed(3));
+      entry.resultExpiryAt = priced.outcome.changeExpiry ? priced.outcome.newExpiry : 0;
+      // The same 402 the single renewal throws, projected across the batch: a
+      // preview that promised twenty renewals the wallet cannot pay for would be
+      // a lie about money, and the operator would learn it one failure at a time.
+      if (cost && soFar + cost > balance) {
+        entry.code = 'insufficient_balance';
+        entry.message = `موجودی «${entry.reseller || `#${entry.resellerId}`}» تا این مورد کافی نیست (باید ${balance.toLocaleString('fa-IR')}) / The wallet runs out at this item`;
+        tally.failed += 1;
+        results.push(entry);
+        continue;
+      }
+      spent.set(entry.resellerId, soFar + cost);
+      if (!dryRun) {
+        await extendConfig(
+          entry.id,
+          { gb, days, resetUsage, charge: payload.charge },
+          req,
+          viewer,
+          // One package: the renewal's own message is the better one. A batch
+          // gets a single summary instead of thirty notifications about thirty
+          // packages of the same person.
+          { notify: heads.length === 1 ? undefined : false }
+        );
+      }
+      entry.ok = true;
+      tally.renewed += 1;
+      tally.rows += entry.rows;
+      tally.tariff += entry.amount;
+      if (entry.charged) tally.amount += entry.amount;
+      if (entry.resellerId) {
+        const held = owners.get(entry.resellerId) || { username: entry.reseller, emails: [] };
+        held.emails.push(entry.email);
+        owners.set(entry.resellerId, held);
+      }
+    } catch (err) {
+      entry.code = String(err?.code || 'error');
+      entry.message = String(err?.message || 'خطای نامشخص / unknown error').slice(0, 300);
+      tally.failed += 1;
+    }
+    results.push(entry);
+  }
+
+  if (!dryRun && owners.size && heads.length > 1) {
+    // One message per wallet owner for the whole batch. The money is not named
+    // here: each renewal wrote its own ledger line, and the reseller can read
+    // every one of them on the transactions page — a batch message that summed
+    // them would have to guess which ones were charged.
+    const size = [gb ? `${gb}GB` : '', days ? `${days} روز` : ''].filter(Boolean).join(' / ');
+    for (const [resellerId, held] of owners) {
+      notifyUser(Number(resellerId), {
+        type: 'success',
+        title: 'چند اشتراک تمدید شد',
+        body: `${held.emails.length} مشتری: ${held.emails.slice(0, 6).join(' · ')}`
+          + (held.emails.length > 6 ? ' …' : '')
+          + ` — ${resetUsage ? `به ${size} (مصرف صفر)` : `+${size}`}`,
+        link: '/reseller/configs',
+      });
+    }
+  }
+
+  // Written for every real run, including a batch that collapsed to one package:
+  // the per-row config.extend audit says what happened to a customer, this one
+  // says that the operator clicked a bulk action and how the whole batch went.
+  // A dryRun never reaches it — nothing was decided yet.
+  if (!dryRun) {
+    audit(req, 'config.bulk_extend', 'config', heads.map((row) => Number(row.id)).join(','), {
+      total: ids.length,
+      packages: heads.length,
+      merged,
+      gb,
+      days,
+      resetUsage,
+      free: !willCharge,
+      renewed: tally.renewed,
+      failed: tally.failed,
+      rows: tally.rows,
+      amount: tally.amount,
+      tariff: tally.tariff,
+      items: results.map((row) => ({
+        id: row.id, email: row.email, ok: row.ok, code: row.code, rows: row.rows, amount: row.amount,
+      })),
+    });
+  }
+
+  return {
+    ok: true,
+    dryRun,
+    total: ids.length,
+    packages: heads.length,
+    merged,
+    limit: BULK_PACKAGE_LIMIT,
+    gb,
+    days,
+    resetUsage,
+    charge: willCharge,
+    ...tally,
+    results,
+  };
+}
+
+async function bulkDeletePackages(payload = {}, req, viewer) {
+  const { ids, heads, rejected, merged } = resolvePackageHeads(payload.ids ?? payload.items, viewer);
+  const dryRun = Boolean(payload.dryRun);
+  const results = [...rejected];
+  // Same rule as the bulk renewal: a tick that was refused before the loop is a
+  // failure in the summary, not a silent gap between what was sent and what ran.
+  const tally = { deleted: 0, failed: rejected.length, rows: 0, remote: 0, localOnly: 0, alreadyGone: 0 };
+  const owners = new Map();
+
+  for (const row of heads) {
+    const entry = {
+      id: Number(row.id),
+      email: String(row.email || ''),
+      action: 'delete',
+      ok: false,
+      code: '',
+      message: '',
+      rows: 0,
+      xuiDeleted: 0,
+      forgotten: 0,
+      alreadyGone: 0,
+      resellerId: Number(row.user_id || 0),
+      reseller: '',
+    };
+    try {
+      const members = packageRows(row);
+      const reseller = getResellerRow(row.user_id);
+      entry.rows = members.length;
+      entry.reseller = String(reseller?.username || '');
+      if (dryRun) {
+        // What the node would actually lose: a client adopted from another panel
+        // belongs over there, so deletePackage only forgets it locally — the
+        // preview has to say that, or it promises a remote delete that never
+        // happens.
+        entry.forgotten = members.filter((item) => String(item.origin || 'panel') === 'external').length;
+        entry.xuiDeleted = members.length - entry.forgotten;
+        entry.ok = true;
+        tally.deleted += 1;
+        tally.rows += entry.rows;
+        tally.remote += entry.xuiDeleted;
+        tally.localOnly += entry.forgotten;
+        if (entry.resellerId) {
+          const held = owners.get(entry.resellerId) || { username: entry.reseller, emails: [] };
+          held.emails.push(entry.email);
+          owners.set(entry.resellerId, held);
+        }
+        results.push(entry);
+        continue;
+      }
+      const out = await deletePackage(entry.id, req, viewer, {
+        // Same rule as the renewal: one package keeps its own message, a batch
+        // gets one summary per owner instead of a notification per row.
+        notify: heads.length === 1 ? undefined : false,
+      });
+      entry.ok = true;
+      entry.rows = Number(out.rows || entry.rows);
+      entry.xuiDeleted = (out.xuiDeleted || []).length;
+      entry.forgotten = (out.localOnly || []).length;
+      entry.alreadyGone = (out.alreadyGone || []).length;
+      tally.deleted += 1;
+      tally.rows += entry.rows;
+      tally.remote += entry.xuiDeleted;
+      tally.localOnly += entry.forgotten;
+      tally.alreadyGone += entry.alreadyGone;
+      if (entry.resellerId) {
+        const held = owners.get(entry.resellerId) || { username: entry.reseller, emails: [] };
+        held.emails.push(entry.email);
+        owners.set(entry.resellerId, held);
+      }
+    } catch (err) {
+      entry.code = String(err?.code || 'error');
+      entry.message = String(err?.message || 'خطای نامشخص / unknown error').slice(0, 300);
+      tally.failed += 1;
+    }
+    results.push(entry);
+  }
+
+  if (!dryRun && owners.size && heads.length > 1) {
+    for (const [resellerId, held] of owners) {
+      notifyUser(Number(resellerId), {
+        type: 'info',
+        title: 'چند اشتراک حذف شد',
+        body: `${held.emails.length} مشتری: ${held.emails.slice(0, 6).join(' · ')}${held.emails.length > 6 ? ' …' : ''}`,
+        link: '/reseller/configs',
+      });
+    }
+  }
+
+  if (!dryRun) {
+    audit(req, 'config.bulk_delete', 'config', heads.map((row) => Number(row.id)).join(','), {
+      total: ids.length,
+      packages: heads.length,
+      merged,
+      deleted: tally.deleted,
+      failed: tally.failed,
+      rows: tally.rows,
+      remote: tally.remote,
+      localOnly: tally.localOnly,
+      alreadyGone: tally.alreadyGone,
+      items: results.map((row) => ({
+        id: row.id, email: row.email, ok: row.ok, code: row.code, rows: row.rows,
+      })),
+    });
+  }
+
+  return {
+    ok: true,
+    dryRun,
+    total: ids.length,
+    packages: heads.length,
+    merged,
+    limit: BULK_PACKAGE_LIMIT,
+    ...tally,
+    results,
+  };
+}
+
 /**
  * Is this client really on the node? A READ, used before any delete so that a
  * subscription the node no longer holds is reported as "already gone" instead of
@@ -2698,14 +3053,15 @@ async function removeConfig(id, { hard = false, silent = false, force = false } 
  *
  * This is the action the fixed-inbound lock exists for. removeConfig refuses to
  * drop the base while the customer keeps other channels — that rule is the owner's
- * («Status2 ثابت و غیرقابل حذف بمونه، مگر هنگام حذف کل کلاینت و مشتری») and today it
- * leaves the operator with no way to finish the job: he had to peel the channels off
+ * («the customer's fixed channel stays and cannot be removed on its own, only when
+ * the whole client and customer go») and today it leaves the operator with no way
+ * to finish the job: he had to peel the channels off
  * one by one and delete the last row to make the client go. Here the whole
  * subscription ends at once, which is exactly the case the rule allows.
  *
  * The remote side is deliberately one-sided. A client that any adopted
  * (origin='external') row of the package stands for belongs to ANOTHER operator's
- * panel — in practice پنل ثنایی, which the owner has placed out of bounds — so it is
+ * panel — in practice the seller's own panel, which the owner has placed out of bounds — so it is
  * never deleted, not even when our own healed channel shares it: those rows are only
  * forgotten here, the same way a single adopted row is. Only clients built purely out
  * of rows this panel created get `clients/del`. Every x-ui call happens before any
@@ -3158,7 +3514,7 @@ async function attachInbound(row, inbound, req, { free = false, healed = false }
   // handed in. And there is deliberately NO "else mint emailFor(user)" fallback
   // any more — inventing a client when the package's own identity is unknown is
   // exactly what turned the fixed-inbound heal into 34 extra x-ui clients on the
-  // ثنایی panel today, one per customer, each holding only that channel. The
+  // node panel today, one per customer, each holding only that channel. The
   // channel cannot be attached without a client, so the request says so.
   const onPanel = members.filter((item) => Number(item.server_id || 0) === Number(targetServer.id));
   const host = primaryClientGroup(row, distinctClients(onPanel.length ? onPanel : members)).head || row;
@@ -3944,6 +4300,8 @@ module.exports = {
   transferCustomer,
   removeConfig,
   deletePackage,
+  bulkExtendConfigs,
+  bulkDeletePackages,
   sendToTelegram,
   packageStatusSql,
   groupFor,

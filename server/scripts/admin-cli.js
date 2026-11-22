@@ -137,7 +137,7 @@ function cmdBootstrap(username, password, name) {
   // ignored it would hand a stranger a way past the female key: the panel would
   // look activated to itself without ever having been given one.
   if (activation.isRequired()) {
-    return fail(`این نصب هنوز فعال نشده است. کلید مادگی را با «activation set <key>» یا از صفحهٔ فعال‌سازی در مرورگر وارد کنید؛ کلید نر: ${activation.challengeMale()}`);
+    return fail(`این نصب هنوز فعال نشده است. کلید فعالسازی را با «activation set <key>» یا از صفحهٔ فعال‌سازی در مرورگر وارد کنید؛ سریال: ${activation.challengeMale()}`);
   }
   const existing = getDb().prepare('SELECT COUNT(*) AS c FROM users WHERE deleted_at = 0').get().c;
   if (Number(existing) > 0) {
@@ -346,19 +346,19 @@ function cmdActivation(action, value) {
     // The key may arrive as `activation set <key>` or in the environment: the
     // installer passes it through the environment so it never appears in `ps`.
     const result = activation.activate(String(value || process.env.ACTIVATION_KEY || ''), { source: 'cli' });
-    if (!result.ok) return fail(`کلید مادگی برای این نصب معتبر نیست (کلید نر: ${result.male}).`);
-    console.log(`پنل فعال شد. کلید نر ${result.male} با همین نصب جفت شد.`);
+    if (!result.ok) return fail(`کلید فعالسازی برای این نصب معتبر نیست (سریال: ${result.male}).`);
+    console.log(`پنل فعال شد. سریال ${result.male} با همین نصب جفت شد.`);
     return true;
   }
   const status = activation.status();
   if (status.activated) {
     const when = status.activatedAt ? new Date(status.activatedAt).toISOString().slice(0, 16).replace('T', ' ') : '';
-    console.log(`وضعیت: فعال ✓   کلید نر: ${status.maleKey || '—'}   زمان: ${when || '—'}   از طریق: ${status.source || '—'}`);
+    console.log(`وضعیت: فعال ✓   سریال: ${status.maleKey || '—'}   زمان: ${when || '—'}   از طریق: ${status.source || '—'}`);
     return true;
   }
   console.log('وضعیت: فعال نشده ✗');
-  console.log(`کلید نر این نصب: ${status.maleKey}`);
-  console.log('برای فعال‌سازی: کلید مادگیِ همین کلید نر را از مالک بگیرید و بزنید  sulduzcloud activate');
+  console.log(`سریال این نصب: ${status.maleKey}`);
+  console.log('برای فعال‌سازی: کلید فعالسازیِ همین سریال را از مالک بگیرید و بزنید  sulduzcloud activate');
   if (status.legacy) console.log('نکته: این نصب از نسخهٔ پیشین ارتقا یافته؛ حساب‌ها وجود دارند و پنل کار می‌کند.');
   return true;
 }

@@ -30,7 +30,7 @@ const notify = require('../notify');
 const xui = require('../xui');
 const net = require('../net');
 const activation = require('../activation');
-const { ApiError, asyncH, sanitizeUser, pageParams, toCsv, bytesToGb } = require('../utils');
+const { ApiError, asyncH, sanitizeUser, pageParams, toCsv, bytesToGb, txMoney, TX_TYPES, TX_OUT_TYPES } = require('../utils');
 const { audit, listAudit } = require('../audit');
 
 const router = express.Router();
@@ -193,7 +193,8 @@ router.get('/users/:id', auth.requirePerm('users'), (req, res) => {
       transactions: transactions.map((t) => ({
         id: t.id,
         type: t.type,
-        amount: t.amount,
+        // v2.3.0, item 3: one direction rule for every transaction read-out.
+        ...txMoney(t),
         balanceAfter: t.balance_after,
         description: t.description,
         createdAt: t.created_at,
@@ -614,6 +615,40 @@ router.delete('/configs/:id/package', auth.requirePerm('configs'), asyncH(async 
   res.json({ ok: true, data: result });
 }));
 
+// v2.3.0, item 6: the two bulk paths for everything ticked in the config list.
+// `ids` are the config ids of the rows; a customer whose rows were ticked twice
+// counts once, and every package then goes through the SAME service the single
+// action uses — this route cannot invent its own price or its own delete.
+// dryRun answers per package what will happen and which one will fail.
+router.post('/configs/bulk-extend', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const result = await configsService.bulkExtendConfigs(
+    {
+      ids: Array.isArray(req.body?.ids) ? req.body.ids : [],
+      gb: num(req.body?.gb),
+      days: num(req.body?.days),
+      resetUsage: Boolean(req.body?.resetUsage),
+      // v1.4.25 rule, unchanged: only an admin's own tick makes the reseller pay.
+      charge: Boolean(req.body?.charge),
+      dryRun: Boolean(req.body?.dryRun),
+    },
+    req,
+    { role: 'admin' }
+  );
+  res.json({ ok: true, data: result });
+}));
+
+router.post('/configs/bulk-delete', auth.requirePerm('configs'), asyncH(async (req, res) => {
+  const result = await configsService.bulkDeletePackages(
+    {
+      ids: Array.isArray(req.body?.ids) ? req.body.ids : [],
+      dryRun: Boolean(req.body?.dryRun),
+    },
+    req,
+    { role: 'admin' }
+  );
+  res.json({ ok: true, data: result });
+}));
+
 // ---------------------------------------------------------------- inbounds
 
 router.get('/inbounds', auth.requirePerm('inbounds'), (req, res) => {
@@ -804,28 +839,92 @@ router.get('/stats', auth.requirePerm('stats'), (req, res) => {
   });
 });
 
+// v2.3.0, item 3: «منوی کناری یک گزینه تراکنش‌ها». The ledger has always held every
+// wallet move — a purchase, a renewal, a top-up, a deduction, a claw-back, a
+// commission — but until now it could only be read through a reseller's own wallet
+// page or the revenue chart. This is the fleet-wide book: two filters the owner
+// asked for (which reseller, which kind of move) plus the direction, because a
+// dispute is nearly always "show me everything that left this wallet".
+//
+// `amount` on every row is the ABSOLUTE number and `direction` says which way it
+// moved; the raw column sign is deliberately not exposed (see txMoney in utils.js).
+// `actors` is built from the ledger itself so the reseller dropdown never asks for
+// a user list this page has no permission to read.
 router.get('/transactions', auth.requirePerm('stats'), (req, res) => {
   const { page, pageSize, offset } = pageParams(req.query, 30, 200);
   const db = getDb();
-  const total = db.prepare('SELECT COUNT(*) AS c FROM transactions').get().c;
+  const userId = num(req.query.userId, 0);
+  const type = TX_TYPES.includes(String(req.query.type || '')) ? String(req.query.type) : '';
+  const direction = ['in', 'out'].includes(String(req.query.direction || '')) ? String(req.query.direction) : '';
+
+  const where = [];
+  const params = [];
+  if (userId > 0) {
+    where.push('t.user_id = ?');
+    params.push(userId);
+  }
+  if (type) {
+    where.push('t.type = ?');
+    params.push(type);
+  }
+  // Which way the money went is a property of the type, never of the stored sign.
+  const outList = [...TX_OUT_TYPES].map((item) => `'${item}'`).join(', ');
+  if (direction === 'in') where.push(`t.type NOT IN (${outList})`);
+  else if (direction === 'out') where.push(`t.type IN (${outList})`);
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const total = Number(db.prepare(`SELECT COUNT(*) AS c FROM transactions t ${clause}`).get(...params).c);
   const rows = db.prepare(
-    `SELECT t.*, u.username FROM transactions t LEFT JOIN users u ON u.id = t.user_id
-     ORDER BY t.created_at DESC LIMIT ? OFFSET ?`
-  ).all(pageSize, offset);
+    `SELECT t.*, u.username, c.username AS created_by_name
+     FROM transactions t
+     LEFT JOIN users u ON u.id = t.user_id
+     LEFT JOIN users c ON c.id = t.created_by
+     ${clause}
+     ORDER BY t.created_at DESC, t.id DESC LIMIT ? OFFSET ?`
+  ).all(...params, pageSize, offset);
+
+  const byType = {};
+  for (const r of db.prepare(`SELECT t.type, COUNT(*) AS n, SUM(ABS(t.amount)) AS sum FROM transactions t ${clause} GROUP BY t.type`).all(...params)) {
+    byType[r.type] = { count: Number(r.n), sum: Number(r.sum || 0) };
+  }
+  const sums = { in: 0, out: 0, countIn: 0, countOut: 0 };
+  for (const [kind, v] of Object.entries(byType)) {
+    const side = TX_OUT_TYPES.has(kind) ? 'out' : 'in';
+    sums[side] += v.sum;
+    sums[side === 'out' ? 'countOut' : 'countIn'] += v.count;
+  }
+  const actors = db.prepare(
+    `SELECT u.id, u.username, COUNT(t.id) AS count FROM transactions t
+     JOIN users u ON u.id = t.user_id GROUP BY u.id, u.username ORDER BY count DESC, u.username ASC LIMIT 500`
+  ).all().map((r) => ({ id: Number(r.id), username: String(r.username || ''), count: Number(r.count) }));
+
+  // v2.3.0, item 5: how many of the filtered lines left a wallet below zero.
+  // Counted over the whole filtered set, not just the 30 rows on the page, so the
+  // card on the screen is a fact about the ledger and not about pagination.
+  const debtClause = `WHERE ${[...where, 't.balance_after < 0'].join(' AND ')}`;
+  const debt = Number(db.prepare(`SELECT COUNT(*) AS c FROM transactions t ${debtClause}`).get(...params).c);
+
   res.json({
     ok: true,
     data: {
       total,
       page,
       pageSize,
+      filters: { userId, type, direction },
+      byType,
+      sums,
+      debt,
+      actors,
       rows: rows.map((r) => ({
         id: r.id,
         userId: r.user_id,
-        username: r.username,
+        username: r.username || `#${r.user_id}`,
         type: r.type,
-        amount: r.amount,
+        ...txMoney(r),
         balanceAfter: r.balance_after,
         description: r.description,
+        createdBy: r.created_by,
+        createdByName: String(r.created_by_name || ''),
         createdAt: r.created_at,
       })),
     },
@@ -1476,6 +1575,21 @@ router.post('/topups/:id/reject', auth.requirePerm('users'), asyncH(async (req, 
     req
   );
   bot.syncAdminMessage(result, 'rejected', req.user.username).catch(() => {});
+  res.json({ ok: true, data: { request: result } });
+}));
+
+// v2.3.0, item 4: void a receipt the owner only recognised as fake or duplicated
+// after it was paid out — the auto-approval sweep makes that a real case. The
+// amount the row credited is taken back through the same wallet function the
+// panel and the bot use, so the ledger, the balance and the audit trail all match
+// a manual deduction. Only an 'approved' row can be reversed, once.
+router.post('/topups/:id/reverse', auth.requirePerm('users'), asyncH(async (req, res) => {
+  const result = topups.reverse(
+    num(req.params.id, 0),
+    { note: String(req.body?.note || ''), actor: { id: req.user.id, role: 'admin' }, source: 'panel' },
+    req
+  );
+  bot.syncAdminMessage(result, 'reversed', req.user.username).catch(() => {});
   res.json({ ok: true, data: { request: result } });
 }));
 

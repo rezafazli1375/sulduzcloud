@@ -28,7 +28,9 @@
 
 const { getDb } = require('../db');
 const usersService = require('./users');
-const inboundsService = require('./inbounds');
+// v2.3.0 note: `./inbounds` is deliberately NOT required here any more. Deciding
+// whether a reseller may take a plan used to ask the channel permission layer;
+// a ready-made plan is the owner's product, so that question is no longer asked.
 const pricing = require('./pricing');
 const configsService = require('./configs');
 const { ApiError, safeJsonParse, bytesToGb } = require('../utils');
@@ -309,12 +311,12 @@ function view(row, { inbounds = null, viewer = null } = {}) {
 
 /**
  * Plans a viewer may see. An admin sees everything including hidden rows; a
- * reseller only sees visible plans whose channels he is actually allowed to
- * sell — a plan built on a channel he cannot use would be a button that fails
- * on him, so it is not offered at all.
+ * reseller sees every visible plan the OWNER put on his shelf — since v2.3.0 the
+ * channel permission list is not part of the answer, because a reseller who is
+ * offered a plan must be able to sell it (see canResell for what is still asked).
  *
  * A plan whose inbound list has since been deleted from the panel is skipped for
- * a reseller (he could not buy it) but still shown to the admin, who is the one
+ * a reseller (his order would fail) but still shown to the admin, who is the one
  * able to fix it.
  */
 function listPlans({ viewer = null, includeHidden = null } = {}) {
@@ -344,10 +346,24 @@ function listPlans({ viewer = null, includeHidden = null } = {}) {
 }
 
 /**
- * Is every channel of this plan usable by this reseller? Same three rules as
- * createConfigs: an explicit grant, the fixed-inbound exception, and the panel
- * visibility switch. `admin` is false here on purpose — this answers the
- * question a reseller is asking about himself.
+ * Can this reseller take this plan?
+ *
+ * v2.3.0 — the owner's complaint from his resellers: «امکان دریافت پلن‌های آماده
+ * رو ندارن چون اون اینباند‌های توی پنل براشون فعال نیست». A ready-made plan is
+ * the OWNER's product: he chose its channels and its price, and he put it on the
+ * shelf for the resellers to sell. Asking every reseller to also hold a per-channel
+ * grant for channels he never picked was turning the shelf into an empty room.
+ *
+ * So the channel PERMISSION is no longer part of this answer. What is still
+ * checked, because each one is a fact about the plan rather than a favour:
+ *   • an exclusive plan exists only for the resellers it names;
+ *   • the plan still has its channels, and they are still enabled on the node —
+ *     a plan built on a deleted or disabled channel would fail the order;
+ *   • a reseller with a FIXED inbound can only take plans on that inbound's panel,
+ *     because his base channel always joins the package and one subscription
+ *     cannot span two panels (createConfigs enforces the same rule).
+ * The wallet, the per-reseller take limit and the reseller's own ceilings are
+ * checked on the way in, exactly as before.
  */
 function canResell(row, reseller) {
   // v1.5.8: an exclusive plan exists only for the resellers it names. This one
@@ -355,16 +371,14 @@ function canResell(row, reseller) {
   if (categoryOf(row) === 'exclusive' && !allowedUsersOf(row).includes(Number(reseller?.id || 0))) return false;
   const ids = idsOf(row);
   if (!ids.length) return false;
-  const allowed = usersService.allowedInboundIds(reseller);
-  const fixedId = usersService.fixedInboundId(reseller);
   for (const id of ids) {
     const inbound = inboundRow(id);
     if (!inbound || !Number(inbound.enabled)) return false;
-    if (!inboundsService.isUsableBy(inbound, { allowed, fixedId, isAdmin: false })) return false;
   }
   // A package is one client on one panel, so a reseller whose fixed channel sits
   // elsewhere cannot buy a plan on this one: createConfigs would add his fixed
   // inbound to the order and then refuse the mixed-server package.
+  const fixedId = usersService.fixedInboundId(reseller);
   if (fixedId > 0) {
     const fixed = inboundRow(fixedId);
     if (fixed && Number(fixed.server_id) !== Number(row.server_id || 0)) return false;

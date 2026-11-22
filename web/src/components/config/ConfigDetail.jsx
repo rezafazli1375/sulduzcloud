@@ -313,7 +313,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
   // v1.4.26: the reseller's answer to "the numbers look wrong" is a READ. The
   // panel asks the node for this customer's counters and stores what it is told;
   // it never writes to x-ui, so the button cannot touch a plan, a quota or the
-  // ثنایی panel — it can only make the screen agree with the node. The server
+  // the node's own panel — it can only make the screen agree with the node. The server
   // answers how many rows agreed, how many it could not find, and whether a
   // sibling client errored, so the toast can say that instead of a bare "done".
   const nodeRefresh = useMutation({
@@ -346,7 +346,7 @@ export default function ConfigDetail({ open, configId, onClose, onChanged, onSel
     mutationFn: (payload) => api.patch(`${base}/${configId}`, payload),
     // v1.5.5: the label now also goes to the node panel as the client's comment.
     // The save always stands, but if the node was not told the screen has to say so
-    // instead of letting him believe پنل ثنایی shows the new name.
+    // instead of letting him believe the node panel shows the new name.
     onSuccess: (data) => {
       const sync = data?.config?.commentSync;
       if (sync && sync.pushed === false) {

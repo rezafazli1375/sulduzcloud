@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  Ban,
   Bot,
   CheckCircle2,
   Clock,
@@ -35,8 +36,14 @@ import {
 } from '../../components/ui.jsx';
 import { useToast } from '../../components/feedback.jsx';
 
-const STATUS_TONE = { pending: 'amber', approved: 'emerald', rejected: 'rose' };
-const STATUS_KEY = { pending: 'topups.pending', approved: 'topups.approved', rejected: 'topups.rejected' };
+const STATUS_TONE = { pending: 'amber', approved: 'emerald', rejected: 'rose', reversed: 'rose' };
+const STATUS_KEY = {
+  pending: 'topups.pending',
+  approved: 'topups.approved',
+  rejected: 'topups.rejected',
+  // v2.3.0, item 4: a receipt that was paid out and then cancelled.
+  reversed: 'topups.reversed',
+};
 
 // v1.5.4: money arrived four ways, and the schedule could decide without a person.
 // The API sends a Persian `methodLabel` for the bot and the ledger; the panel
@@ -84,7 +91,12 @@ function DecideModal({ open, onClose, request, mode }) {
   const queryClient = useQueryClient();
   // A decided row can only be looked at. Rendering the reject form for it (the
   // first version did) offered a button that the API answers with 409.
-  const viewing = mode === 'view' || (request && request.status !== 'pending');
+  //
+  // v2.3.0, item 4: 'reverse' is the one decision that is made *after* a
+  // decision, so it is deliberately excluded from the read-only branch — a row
+  // that is already approved has to show the cancel form, not the summary.
+  const reversing = mode === 'reverse';
+  const viewing = !reversing && (mode === 'view' || (request && request.status !== 'pending'));
   const approving = !viewing && mode === 'approve';
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
@@ -97,16 +109,29 @@ function DecideModal({ open, onClose, request, mode }) {
   }, [open, request?.id]);
 
   const decide = useMutation({
-    mutationFn: () => api.post(`/admin/topups/${request.id}/${approving ? 'approve' : 'reject'}`, {
-      ...(approving ? { amount: Number(String(amount).replace(/[^0-9-]/g, '')) || 0 } : {}),
-      note,
-    }),
+    mutationFn: () => api.post(
+      `/admin/topups/${request.id}/${reversing ? 'reverse' : approving ? 'approve' : 'reject'}`,
+      {
+        ...(approving ? { amount: Number(String(amount).replace(/[^0-9-]/g, '')) || 0 } : {}),
+        note,
+      },
+    ),
     onSuccess: (data) => {
-      toast.success(approving
-        ? t('topups.approvedToast', { n: formatMoney(Number(data?.request?.credited || 0), lang) })
-        : t('topups.rejectedToast'));
+      if (reversing) {
+        toast.success(t('topups.reversedToast', {
+          a: formatMoney(Number(data?.request?.clawedBack || 0), lang),
+          b: formatMoney(Number(data?.request?.balance || request.balance || 0), lang),
+        }));
+      } else {
+        toast.success(approving
+          ? t('topups.approvedToast', { n: formatMoney(Number(data?.request?.credited || 0), lang) })
+          : t('topups.rejectedToast'));
+      }
       queryClient.invalidateQueries({ queryKey: ['admin', 'topups'] });
       queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
+      // The claw-back is an ordinary ledger line, so the transaction list must
+      // drop its cached page too.
+      queryClient.invalidateQueries({ queryKey: ['admin', 'transactions'] });
       queryClient.invalidateQueries({ queryKey: ['notifications'] });
       onClose?.();
     },
@@ -116,12 +141,17 @@ function DecideModal({ open, onClose, request, mode }) {
   if (!request) return null;
   const value = Number(String(amount).replace(/[^0-9-]/g, '')) || 0;
   const changed = approving && value !== Number(request.amount || 0);
+  // What the server will take back is the amount stored on the row, not the
+  // number in this box — the box is only a preview of it.
+  const clawBack = Math.round(Number(request.amount || 0));
+  const current = Math.round(Number(request.balance || 0));
+  const afterReverse = current - clawBack;
 
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title={viewing ? t('topups.viewTitle') : approving ? t('topups.approveTitle') : t('topups.rejectTitle')}
+      title={viewing ? t('topups.viewTitle') : approving ? t('topups.approveTitle') : reversing ? t('topups.reverseTitle') : t('topups.rejectTitle')}
       subtitle={`#${request.id} · ${request.username}`}
       size="md"
       footer={viewing ? (
@@ -131,12 +161,12 @@ function DecideModal({ open, onClose, request, mode }) {
           <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
           <Button
             variant={approving ? 'primary' : 'danger'}
-            icon={approving ? CheckCircle2 : XCircle}
+            icon={approving ? CheckCircle2 : reversing ? Ban : XCircle}
             loading={decide.isPending}
-            disabled={approving && value <= 0}
+            disabled={(approving && value <= 0) || (reversing && clawBack <= 0)}
             onClick={() => decide.mutate()}
           >
-            {approving ? t('topups.approve') : t('topups.reject')}
+            {approving ? t('topups.approve') : reversing ? t('topups.reverseConfirm') : t('topups.reject')}
           </Button>
         </>
       )}
@@ -181,6 +211,14 @@ function DecideModal({ open, onClose, request, mode }) {
             {t('topups.autoNote')}
           </p>
         ) : null}
+        {/* v2.3.0, item 4: the one thing that gives a forged or twice-used receipt
+            away is a tracking code that already appears on another row. The count
+            comes from the list query and is read-only — nothing here decides on it. */}
+        {Number(request.sameReference || 0) > 1 ? (
+          <p className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-[11px] leading-5 text-amber-200">
+            {t('topups.duplicateRef', { n: formatNumber(Number(request.sameReference), lang) })}
+          </p>
+        ) : null}
         {viewing ? (
           <div className="space-y-2 rounded-xl border border-white/[0.07] bg-white/[0.02] p-3 text-[11.5px]">
             <div className="flex items-center justify-between gap-2">
@@ -206,6 +244,25 @@ function DecideModal({ open, onClose, request, mode }) {
             {request.decisionNote ? (
               <p className="whitespace-pre-line border-t border-white/[0.06] pt-2 text-slate-300">{request.decisionNote}</p>
             ) : null}
+            {request.status === 'reversed' ? (
+              <div className="space-y-2 border-t border-rose-400/20 pt-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-rose-300">{t('topups.reversedBy')}</span>
+                  <span className="text-slate-200">{request.reversedByName || '—'}</span>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-rose-300">{t('topups.reversedAt')}</span>
+                  <span className="text-slate-200">{request.reversedAt ? formatDate(request.reversedAt, lang, true) : '—'}</span>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-rose-300">{t('topups.clawBack')}</span>
+                  <b className="text-rose-200" dir="ltr">{formatMoney(request.amount, lang)}</b>
+                </div>
+                {request.reverseNote ? (
+                  <p className="whitespace-pre-line text-rose-200/80">{request.reverseNote}</p>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         ) : (
           <>
@@ -229,11 +286,39 @@ function DecideModal({ open, onClose, request, mode }) {
                 })}
               </p>
             ) : null}
-            <Field label={t('topups.note')}>
-              <Textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder={t('topups.notePlaceholder')} />
+            {reversing ? (
+              <div className="space-y-2 rounded-xl border border-rose-400/25 bg-rose-500/[0.06] p-3 text-[11.5px]">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-400">{t('topups.clawBack')}</span>
+                  <b className="text-rose-200" dir="ltr">{formatMoney(clawBack, lang)}</b>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-400">{t('topups.currentBalance')}</span>
+                  <span className={current < 0 ? 'text-rose-200' : 'text-slate-200'} dir="ltr">{formatMoney(current, lang)}</span>
+                </div>
+                <div className="flex items-center justify-between gap-2 border-t border-white/[0.06] pt-2">
+                  <span className="text-slate-400">{t('topups.balanceAfter')}</span>
+                  <b className={afterReverse < 0 ? 'text-rose-200' : 'text-emerald-200'} dir="ltr">
+                    {formatMoney(afterReverse, lang)}
+                  </b>
+                </div>
+                {afterReverse < 0 ? (
+                  <p className="rounded-lg bg-rose-500/10 px-2.5 py-2 text-[11px] leading-5 text-rose-200">
+                    {t('topups.reverseDebt', { n: formatMoney(-afterReverse, lang) })}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            <Field label={reversing ? t('topups.reverseReason') : t('topups.note')}>
+              <Textarea
+                rows={2}
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder={reversing ? t('topups.reversePlaceholder') : t('topups.notePlaceholder')}
+              />
             </Field>
             <p className="text-[10.5px] leading-5 text-slate-500">
-              {approving ? t('topups.approveNote') : t('topups.rejectNote')}
+              {approving ? t('topups.approveNote') : reversing ? t('topups.reverseNote') : t('topups.rejectNote')}
             </p>
           </>
         )}
@@ -289,7 +374,7 @@ export default function Topups() {
   });
 
   const rows = listQuery.data?.rows || [];
-  const counts = listQuery.data?.counts || { pending: 0, approved: 0, rejected: 0 };
+  const counts = listQuery.data?.counts || { pending: 0, approved: 0, rejected: 0, reversed: 0 };
   const bot = botQuery.data || listQuery.data?.bot || {};
   const total = Number(listQuery.data?.total || 0);
 
@@ -297,6 +382,9 @@ export default function Topups() {
     { value: 'pending', label: `${t('topups.pending')} (${formatNumber(counts.pending, lang)})` },
     { value: 'approved', label: `${t('topups.approved')} (${formatNumber(counts.approved, lang)})` },
     { value: 'rejected', label: `${t('topups.rejected')} (${formatNumber(counts.rejected, lang)})` },
+    // v2.3.0: the voided ones are their own shelf — the owner comes back to them
+    // when a reseller disputes a claw-back.
+    { value: 'reversed', label: `${t('topups.reversed')} (${formatNumber(counts.reversed || 0, lang)})` },
     { value: 'all', label: t('topups.all') },
   ]), [counts, lang, t]);
 
@@ -421,6 +509,20 @@ export default function Topups() {
                         </span>
                       </>
                     ) : null}
+                    {row.status === 'reversed' ? (
+                      <>
+                        <span>·</span>
+                        <span className="text-rose-300">
+                          {t('topups.reversedBy')}: {row.reversedByName || '—'} · {formatDate(row.reversedAt, lang, true)}
+                        </span>
+                      </>
+                    ) : null}
+                    {Number(row.sameReference || 0) > 1 ? (
+                      <>
+                        <span>·</span>
+                        <span className="text-amber-300">{t('topups.duplicateRefShort', { n: formatNumber(Number(row.sameReference), lang) })}</span>
+                      </>
+                    ) : null}
                   </div>
                   {row.caption ? (
                     <p className="mt-1.5 line-clamp-2 whitespace-pre-line text-[11.5px] text-slate-400">{row.caption}</p>
@@ -428,6 +530,11 @@ export default function Topups() {
                   {row.decisionNote ? (
                     <p className="mt-1.5 whitespace-pre-line text-[11px] text-slate-400">
                       <span className="text-slate-500">{t('topups.note')}: </span>{row.decisionNote}
+                    </p>
+                  ) : null}
+                  {row.reverseNote ? (
+                    <p className="mt-1.5 whitespace-pre-line text-[11px] text-rose-200/80">
+                      <span className="text-rose-300">{t('topups.reverseReason')}: </span>{row.reverseNote}
                     </p>
                   ) : null}
                   {row.status === 'pending' ? (
@@ -440,10 +547,19 @@ export default function Topups() {
                       </Button>
                     </div>
                   ) : (
-                    <div className="mt-2.5">
+                    // v2.3.0, item 4: money that was handed out on a receipt the
+                    // schedule let through at 3 a.m. is only recoverable from here.
+                    // The button exists for an approved row and nowhere else — the
+                    // API answers 409 for anything that is not.
+                    <div className="mt-2.5 flex flex-wrap gap-2">
                       <Button size="sm" variant="ghost" icon={Receipt} onClick={() => setDecide({ request: row, mode: 'view' })}>
                         {t('topups.viewReceipt')}
                       </Button>
+                      {row.status === 'approved' ? (
+                        <Button size="sm" variant="danger" icon={Ban} onClick={() => setDecide({ request: row, mode: 'reverse' })}>
+                          {t('topups.reverse')}
+                        </Button>
+                      ) : null}
                     </div>
                   )}
                 </article>

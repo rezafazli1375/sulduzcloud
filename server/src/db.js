@@ -258,6 +258,11 @@ CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, create
 --             v1.5.5 that is the card a RECEIPT was paid into;
 --   auto_approved 1 when the scheduled sweep decided it, not a person — the admin
 --             has to be able to tell the two apart in his own list.
+--   reversed_*  since v2.3.0: an approved receipt can be voided when it turns out
+--             fake or a duplicate. The approve columns are NOT overwritten — they
+--             stay as the record of who paid the wallet out — and the cancellation
+--             is written next to them, with the money taken back as its own
+--             ledger line.
 CREATE TABLE IF NOT EXISTS topup_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -279,6 +284,9 @@ CREATE TABLE IF NOT EXISTS topup_requests (
   card_number TEXT NOT NULL DEFAULT '',
   paid_at INTEGER NOT NULL DEFAULT 0,
   auto_approved INTEGER NOT NULL DEFAULT 0,
+  reversed_by INTEGER NOT NULL DEFAULT 0,
+  reversed_at INTEGER NOT NULL DEFAULT 0,
+  reverse_note TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -483,6 +491,16 @@ function migrate(db) {
   ensureColumn(db, 'plans', 'category', "TEXT NOT NULL DEFAULT 'public'");
   ensureColumn(db, 'plans', 'per_user_limit', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'plans', 'allowed_users', "TEXT NOT NULL DEFAULT '[]'");
+  // Panel v2.3.0 — item 4: voiding a receipt that turned out fake or a duplicate.
+  // Purely additive: an existing approved row keeps its decided_by/decided_at/
+  // decision_note exactly as the sweep or the admin wrote them, and only gains the
+  // three columns that say who cancelled it, when, and why. Old installs get them
+  // here; fresh installs already carry them in the schema above.
+  for (const [column, ddl] of [
+    ['reversed_by', 'INTEGER NOT NULL DEFAULT 0'],
+    ['reversed_at', 'INTEGER NOT NULL DEFAULT 0'],
+    ['reverse_note', "TEXT NOT NULL DEFAULT ''"],
+  ]) ensureColumn(db, 'topup_requests', column, ddl);
 }
 
 /**

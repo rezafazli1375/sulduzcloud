@@ -734,14 +734,21 @@ async function main() {
         === `bal:do:${shop.id}:-:100000`,
     `sign=${bot.stepOf(ADMIN_CHAT)?.sign}`);
   const overDraft = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, String(shopMid + 1)));
-  check('an amount larger than the wallet is refused at the confirm step and the screen stays put',
-    overDraft.ok === false && overDraft.reason === 'insufficient_balance'
-      && balanceOf(shop.id) === shopMid && bot.stepOf(ADMIN_CHAT)?.step === 'adm_confirm',
-    `reason=${overDraft.reason}`);
+  // The screen names the amount he typed AND the wallet it leaves behind: one
+  // toman short of the deduction, shown as −۱ with the debt sentence under it.
+  check('v2.3.0 debt: an amount deeper than the wallet is no longer refused — it reaches the confirm screen as a debt',
+    overDraft.ok === true && overDraft.step === 'adm_confirm' && overDraft.sign === '-'
+      && Number(overDraft.amount) === shopMid + 1
+      && bot.stepOf(ADMIN_CHAT)?.step === 'adm_confirm'
+      && textOf(lastTo(ADMIN_CHAT)).includes('بدهکار')
+      && textOf(lastTo(ADMIN_CHAT)).includes(fa(-1))
+      && balanceOf(shop.id) === shopMid,
+    `ok=${overDraft.ok} reason=${overDraft.reason} screen=${textOf(lastTo(ADMIN_CHAT)).replace(/<[^>]*>/g, ' ').replace(/\n/g, ' | ').slice(0, 220)}`);
   const forgedDown = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:-:${shopMid + 5000}`, minusMsgId));
   check('a forged deeper deduction is refused too: the button must match the number on the screen',
     forgedDown.ok === false && forgedDown.reason === 'stale_confirmation' && balanceOf(shop.id) === shopMid,
     `reason=${forgedDown.reason}`);
+  await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, '100000'));
   const txBeforeDeduct = txCount(shop.id);
   const deducted = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:-:100000`, minusMsgId));
   check('the real deduction takes 100000 out, records a debit and writes its receipt in place of the button',
@@ -750,11 +757,38 @@ async function main() {
     `action=${deducted.action} balance=${balanceOf(shop.id)}`);
   const debitTx = getDb().prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').get(shop.id);
   const deductEdit = lastOf('editMessageText');
-  check('the wallet is never allowed to go negative, and the reseller is told what was taken',
-    debitTx.type === 'debit' && Number(debitTx.amount) === 100000 && balanceOf(shop.id) >= 0
+  check('a normal deduction writes the debit and tells the reseller what was taken',
+    debitTx.type === 'debit' && Number(debitTx.amount) === 100000 && balanceOf(shop.id) === shopMid - 100000
       && String(deductEdit?.payload?.text || '').includes('موجودی کاهش یافت')
       && textOf(lastTo(SHOP_TG)).includes('موجودی شما کاهش یافت'),
     `type=${debitTx.type} balance=${balanceOf(shop.id)}`);
+  // v2.3.0: the same conversation can now put the wallet below zero — that is how
+  // the owner records money a reseller owes him without leaving Telegram.
+  await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, bot.BTN_A_MONEY));
+  await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, SHOP_TG));
+  await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:set:${shop.id}:-`, messageSeq));
+  const inDebt = balanceOf(shop.id) + 50000;
+  const debtConfirm = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, String(inDebt)));
+  const debtTxBefore = txCount(shop.id);
+  const debtMsgId = messageSeq;
+  const didDebt = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:-:${inDebt}`, debtMsgId));
+  const debtTx = getDb().prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').get(shop.id);
+  check('v2.3.0 debt: confirming it leaves the wallet negative, records the debit and warns the reseller of the debt',
+    debtConfirm.ok === true && didDebt.ok === true && Number(didDebt.balance) === -50000
+      && balanceOf(shop.id) === -50000 && txCount(shop.id) === debtTxBefore + 1
+      && debtTx.type === 'debit' && Number(debtTx.amount) === inDebt && Number(debtTx.balance_after) === -50000
+      && textOf(lastTo(SHOP_TG)).includes(fa(-50000)),
+    `balance=${balanceOf(shop.id)} reason=${didDebt.reason}`);
+  const backUp = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, bot.BTN_A_MONEY));
+  await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, SHOP_TG));
+  await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:set:${shop.id}:+`, messageSeq));
+  const paidOff = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, '50000'));
+  const payMsgId = messageSeq;
+  const didPay = await bot.handleUpdate(taps(ADMIN_TG, ADMIN_CHAT, `bal:do:${shop.id}:+:50000`, payMsgId));
+  check('v2.3.0 debt: a credit on top of a negative wallet pays it off and lands on zero',
+    backUp.ok === true && paidOff.ok === true && didPay.ok === true
+      && Number(didPay.balance) === 0 && balanceOf(shop.id) === 0,
+    `balance=${balanceOf(shop.id)}`);
 
   // ---- leaving the conversation, and the people who may not enter it
   await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, bot.BTN_A_MONEY));
@@ -767,13 +801,15 @@ async function main() {
       && textOf(lastTo(ADMIN_CHAT)).includes('لغو شد')
       && lastTo(ADMIN_CHAT).payload.reply_markup?.keyboard?.length === 2,
     `action=${cancelledMoney.action}`);
+  const guardBalance23 = balanceOf(shop.id);
+  const guardTx23 = txCount(shop.id);
   const strangerBal = await bot.handleUpdate(taps(STRANGER_TG, STRANGER_TG, `bal:do:${shop.id}:+:1000`, 1));
   const resellerBal = await bot.handleUpdate(taps(SHOP_TG, SHOP_TG, `bal:do:${shop.id}:+:1000`, 1));
   check('neither a stranger nor a reseller may tap a wallet payload, and both are told so out loud',
     strangerBal.reason === 'not_admin' && resellerBal.reason === 'not_admin'
-      && balanceOf(shop.id) === shopMid - 100000
+      && balanceOf(shop.id) === guardBalance23 && txCount(shop.id) === guardTx23
       && calls.filter((one) => one.method === 'answerCallbackQuery' && one.payload.show_alert === true).length >= 2,
-    `stranger=${strangerBal.reason} reseller=${resellerBal.reason}`);
+    `stranger=${strangerBal.reason} reseller=${resellerBal.reason} balance=${balanceOf(shop.id)}/${guardBalance23}`);
   const adminResellerCmd = await bot.handleUpdate(says(ADMIN_TG, ADMIN_CHAT, '/topup'));
   check('a reseller command in the admin chat sends him to his own menu instead of opening a receipt',
     adminResellerCmd.action === 'admin_reseller_command' && topups.pendingCount(owner.id) === 0

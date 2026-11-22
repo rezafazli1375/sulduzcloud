@@ -184,12 +184,20 @@ function validateUserPayload(data, { partial = false } = {}) {
     out.commission_percent = n;
   }
   if (data.permissions !== undefined) out.permissions = normalizePermissions(data.permissions, out.role || data.role || 'reseller');
-  for (const field of ['max_configs', 'max_total_gb', 'max_gb_per_config', 'max_days_per_config', 'balance']) {
+  for (const field of ['max_configs', 'max_total_gb', 'max_gb_per_config', 'max_days_per_config']) {
     if (data[field] !== undefined) {
       const n = Number(data[field]);
       if (!Number.isFinite(n) || n < 0) throw new ApiError(422, 'invalid_limit', `${field} must be a non-negative number`);
-      out[field] = field === 'balance' ? Math.round(n) : n;
+      out[field] = n;
     }
+  }
+  // v2.3.0: a wallet may be written below zero — that is the debt the owner
+  // imposes on a reseller. The ceilings above stay non-negative on purpose: an
+  // unlimited cap is 0, never a negative number.
+  if (data.balance !== undefined) {
+    const n = Number(data.balance);
+    if (!Number.isFinite(n)) throw new ApiError(422, 'invalid_limit', 'balance must be a number');
+    out.balance = Math.round(n);
   }
   if (data.allowed_inbounds !== undefined) {
     const arr = Array.isArray(data.allowed_inbounds) ? data.allowed_inbounds : safeJsonParse(data.allowed_inbounds, []);
@@ -473,6 +481,19 @@ function regenerateApiKey(id, req) {
   return { apiKey: key };
 }
 
+/**
+ * Move a reseller's wallet by a signed amount and write the ledger line for it.
+ *
+ * v2.3.0 — «قابلیت اعمال بدهی و موجودی منفی». This used to refuse any move that
+ * ended below zero, which left the owner with no way to record money a reseller
+ * owes him: a fake receipt that had to be taken back (see topups.reverse), a
+ * penalty, or a debt agreed offline. The result may now be negative, and the
+ * ledger says so honestly — `balance_after` is the debt with its minus sign.
+ *
+ * What still cannot go below zero is a PURCHASE: configs.chargeReseller keeps its
+ * own 402 guard, because buying a package on credit was never asked for and would
+ * let a reseller spend money the owner has not agreed to lend him.
+ */
 function adjustBalance(id, amount, description, req) {
   const db = getDb();
   const user = getUser(id);
@@ -480,7 +501,6 @@ function adjustBalance(id, amount, description, req) {
   const delta = Math.round(Number(amount || 0));
   if (!Number.isFinite(delta) || delta === 0) throw new ApiError(422, 'invalid_amount', 'Amount must be a non-zero number');
   const next = Number(user.balance || 0) + delta;
-  if (next < 0) throw new ApiError(422, 'insufficient_balance', 'Balance cannot become negative');
   const now = Date.now();
   const tx = db.transaction(() => {
     db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE id = ?').run(next, now, Number(id));

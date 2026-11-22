@@ -429,6 +429,30 @@ function pageParams(query, defaultSize = 20, maxSize = 100) {
   return { page, pageSize, offset: (page - 1) * pageSize };
 }
 
+/**
+ * v2.3.0, item 3: the only place that decides which way a ledger line moved money.
+ *
+ * `transactions.amount` carries the sign two different ways, because two different
+ * services wrote it: users.adjustBalance() stores credit and debit as an ABSOLUTE
+ * number and puts the direction in the type, while configs.chargeReseller() stores
+ * purchase and renew NEGATIVE. Reading the sign from the column therefore shows a
+ * purchase as "− -1,200,000" on one page and a debit with the wrong arrow on
+ * another — which is exactly what the transaction list must not do, because the
+ * owner reads it to settle a dispute.
+ *
+ * So the direction comes from the TYPE and the magnitude from Math.abs(). Both
+ * transaction endpoints return this object, and no page is allowed to invent its
+ * own rule.
+ */
+const TX_OUT_TYPES = new Set(['debit', 'purchase', 'renew']);
+const TX_TYPES = ['credit', 'debit', 'purchase', 'renew', 'commission'];
+
+function txMoney(row) {
+  const magnitude = Math.abs(Number(row.amount || 0));
+  const direction = TX_OUT_TYPES.has(String(row.type || '')) ? 'out' : 'in';
+  return { magnitude, direction, signed: direction === 'out' ? -magnitude : magnitude };
+}
+
 function escapeLike(value) {
   return String(value || '').replace(/[\\%_]/g, (m) => `\\${m}`);
 }
@@ -546,6 +570,9 @@ module.exports = {
   sanitizeUser,
   sanitizeConfig,
   pageParams,
+  txMoney,
+  TX_TYPES,
+  TX_OUT_TYPES,
   escapeLike,
   csvEscape,
   toCsv,

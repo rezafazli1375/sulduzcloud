@@ -42,10 +42,18 @@ const TYPE_LABEL = {
   refund: 'stats.typeRefund',
 };
 
-const CREDIT_TYPES = new Set(['credit', 'refund']);
+// v2.3.0: which way a line moved is decided once, on the server (utils.txMoney),
+// and every page reads `direction`. The type sets that used to live here were a
+// second copy of the rule and disagreed with the first about purchases.
 
-const RECEIPT_TONE = { pending: 'amber', approved: 'emerald', rejected: 'rose' };
-const RECEIPT_KEY = { pending: 'wallet.receiptPending', approved: 'wallet.receiptApproved', rejected: 'wallet.receiptRejected' };
+const RECEIPT_TONE = { pending: 'amber', approved: 'emerald', rejected: 'rose', reversed: 'rose' };
+const RECEIPT_KEY = {
+  pending: 'wallet.receiptPending',
+  approved: 'wallet.receiptApproved',
+  rejected: 'wallet.receiptRejected',
+  // v2.3.0 item 4: approved first, then cancelled and the money taken back.
+  reversed: 'wallet.receiptReversed',
+};
 
 /**
  * The reseller's own payment receipts (v1.5.2). He sends them through the
@@ -70,12 +78,23 @@ function MyReceipts({ currency }) {
               {t(RECEIPT_KEY[row.status] || 'wallet.receipts')}
             </Badge>
             <span className="text-[10.5px] text-slate-500">#{row.id}</span>
-            <span className="text-[12px] font-semibold text-slate-100" dir="ltr">
-              {formatMoney(row.amount, lang, currency)}
+            <span
+              className={row.status === 'reversed'
+                ? 'text-[12px] font-semibold text-rose-300'
+                : 'text-[12px] font-semibold text-slate-100'}
+              dir="ltr"
+            >
+              {row.status === 'reversed' ? `-${formatMoney(row.amount, lang, currency)}` : formatMoney(row.amount, lang, currency)}
             </span>
             <span className="ms-auto text-[10.5px] text-slate-500">{relativeTime(row.createdAt, lang)}</span>
             {row.decisionNote ? (
               <p className="w-full whitespace-pre-line text-[10.5px] leading-5 text-slate-400">{row.decisionNote}</p>
+            ) : null}
+            {row.status === 'reversed' ? (
+              <p className="w-full whitespace-pre-line text-[10.5px] leading-5 text-rose-200/80">
+                {t('wallet.receiptReversedNote', { n: formatMoney(row.amount, lang, currency) })}
+                {row.reverseNote ? ` — ${row.reverseNote}` : ''}
+              </p>
             ) : null}
           </div>
         ))}
@@ -388,8 +407,10 @@ export default function Wallet() {
   const rows = data?.rows || [];
   const balance = data?.balance ?? user?.balance ?? 0;
   const currency = meta?.billing?.currency || (lang === 'fa' ? 'تومان' : 'Toman');
-  const totalIn = rows.filter((row) => CREDIT_TYPES.has(row.type)).reduce((sum, row) => sum + Number(row.amount || 0), 0);
-  const totalOut = rows.filter((row) => !CREDIT_TYPES.has(row.type)).reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  // v2.3.0: the server now hands the direction over instead of the raw column,
+  // which mixed two sign conventions (see utils.txMoney).
+  const totalIn = rows.filter((row) => row.direction === 'in').reduce((sum, row) => sum + Number(row.magnitude || 0), 0);
+  const totalOut = rows.filter((row) => row.direction !== 'in').reduce((sum, row) => sum + Number(row.magnitude || 0), 0);
 
   return (
     <>
@@ -404,12 +425,25 @@ export default function Wallet() {
               <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500 to-cyan-500 text-[#04120f] shadow-[0_12px_30px_-12px_rgba(16,185,129,.8)]">
                 <WalletIcon className="h-5 w-5" />
               </span>
-              <Badge tone="emerald" dot>{t('common.active')}</Badge>
+              {Number(balance) < 0 ? (
+                <Badge tone="rose" dot>{t('common.debt')}</Badge>
+              ) : (
+                <Badge tone="emerald" dot>{t('common.active')}</Badge>
+              )}
             </div>
             <p className="mt-4 text-[11px] font-medium uppercase tracking-wider text-slate-500">{t('wallet.balance')}</p>
-            <p className="mt-1.5 text-2xl font-bold tracking-tight text-white">
+            <p
+              className={cx(
+                'mt-1.5 text-2xl font-bold tracking-tight',
+                Number(balance) < 0 ? 'text-rose-300' : 'text-white'
+              )}
+              dir={Number(balance) < 0 ? 'ltr' : undefined}
+            >
               {formatMoney(balance, lang, currency)}
             </p>
+            {Number(balance) < 0 ? (
+              <p className="mt-1.5 text-[10.5px] text-rose-200/80">{t('wallet.debtHint')}</p>
+            ) : null}
             <p className="mt-2 flex items-center gap-1.5 text-[10.5px] text-slate-500">
               <Info className="h-3 w-3" />
               {t('wallet.hint')}
@@ -466,7 +500,7 @@ export default function Wallet() {
               </thead>
               <tbody>
                 {rows.map((row) => {
-                  const credit = CREDIT_TYPES.has(row.type);
+                  const credit = row.direction === 'in';
                   return (
                     <tr key={row.id}>
                       <td>
@@ -483,7 +517,7 @@ export default function Wallet() {
                       </td>
                       <td className="whitespace-nowrap font-mono text-[11.5px]">
                         <span className={credit ? 'text-emerald-300' : 'text-rose-300'} dir="ltr">
-                          {credit ? '+' : '−'}{formatNumber(row.amount, lang)}
+                          {credit ? '+' : '−'}{formatNumber(row.magnitude, lang)}
                         </span>
                       </td>
                       <td className="whitespace-nowrap font-mono text-[11px] text-slate-400">

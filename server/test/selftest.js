@@ -2466,9 +2466,9 @@ function startMockXui(inboundRows) {
         `needFix=${dryRun.json?.data?.needFix} healed=${dryRun.json?.data?.healed} live=${liveBeforeDry}`);
 
       const walletBeforeHeal = Number((await request('GET', '/api/auth/me', { cookies: fixedCookies })).json?.data?.user?.balance || 0);
-      // v1.4.20 guard, from the live defect: this heal pass on the ثنایی panel ran
+      // v1.4.20 guard, from the live defect: this heal pass on the node's own panel ran
       // under v1.4.17 and minted ONE NEW x-ui client per customer (34 of them, each
-      // holding only Status2), which is what split one package across two clients
+      // holding only the extra channel), which is what split one package across two clients
       // and pushed the subscription link behind this panel. The heal must move the
       // channel onto the client the customer already has, so the node must finish
       // the pass with exactly the clients it started with.
@@ -2504,7 +2504,7 @@ function startMockXui(inboundRows) {
       // wrote, so it keeps origin 'panel' while the adopted rows of the same customer
       // stay 'external'. That split is what makes removing the channel undo our own
       // write on the node instead of silently forgetting it, and it is the shape the
-      // ثنایی census finds today (an adopted customer plus one channel of ours).
+      // the external-origin census finds today (an adopted customer plus one channel of ours).
       check('the healed channel is a row this panel wrote, beside the adopted ones',
         String(fixedMember.origin || '') === 'panel'
         && healedGroup.filter((item) => String(item.origin || '') === 'external').length === 1,
@@ -5411,7 +5411,7 @@ function startMockXui(inboundRows) {
             && onNode25(pkgEmail25) === LINE25('برچسب نماینده'),
           `status=${newOwnerRename25.status} node="${onNode25(pkgEmail25)}"`);
         const wireVersion25 = (await request('GET', '/api/health')).json?.version;
-        check('this build is v2.1.0 on the wire too', wireVersion25 === '2.1.0', `version=${wireVersion25}`);
+        check('this build is v2.3.0 on the wire too', wireVersion25 === '2.3.0', `version=${wireVersion25}`);
       } finally {
         if (lifted25) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit25 } });
         tdb.close();
@@ -7027,6 +7027,666 @@ function startMockXui(inboundRows) {
         for (const email of seedEmails21) mockXui.clients.delete(email);
         fs.rmSync(certDir21, { recursive: true, force: true });
         tdb.close();
+      }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════ v2.3.0
+    //
+    // Five asks from the resellers' complaints, one block. Everything here is
+    // proved through the HTTP API against the live database, because 2.3.0 is
+    // about money: what the book says has to be what the wallet actually did.
+    //   ۱) بدهی — the admin may write a wallet below zero and a deduction may
+    //      take it there, while a purchase still refuses to buy on credit.
+    //   ۲) ابطال فیش — an approved receipt can be voided exactly once, and
+    //      voiding it takes the money back through the same function a manual
+    //      debit uses, leaving the original decision visible.
+    //   ۳) پلن بدون مجوز اینباند — a ready-made plan is the OWNER's product, so
+    //      a reseller who holds no grant for its channel can still take it,
+    //      while the ordinary create path keeps asking for the grant.
+    //   ۴) کار گروهی — ticks fold into packages and every package goes through
+    //      the single-config service: a batch is never cheaper, freer, longer
+    //      or more permissive than the same click on one row.
+    //   ۵) تراکنش‌ها — one fleet-wide read of the ledger with the two filters
+    //      the owner named plus direction, and the sign taken from the TYPE
+    //      and never from the column (the two writers disagree about the sign).
+    {
+      const tdb = new Database(path.join(DATA_DIR, 'panel.db'));
+      const P23 = 'Ledger-Pass-12345';
+      const DAY23 = 86400000;
+      const GB23 = 1024 ** 3;
+      const NOW23 = Date.now();
+      const code23 = (res) => String(res.json?.error?.code || '');
+      const data23 = (res) => res.json?.data || {};
+      const book23 = (params, extra = {}) => request('GET', `/api/admin/transactions?${params}`, { cookies, ...extra });
+      const balance23 = (id) => Number(tdb.prepare('SELECT balance FROM users WHERE id = ?').get(Number(id))?.balance || 0);
+      const ledger23 = (id) => tdb.prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY id').all(Number(id));
+      const auditCount23 = (action) => Number(tdb.prepare('SELECT COUNT(*) AS c FROM audit_logs WHERE action = ?').get(action).c);
+      const auditLast23 = (action) => JSON.parse(String(tdb.prepare(
+        'SELECT details FROM audit_logs WHERE action = ? ORDER BY id DESC LIMIT 1'
+      ).get(action)?.details || '{}'));
+      const alive23 = (email) => tdb.prepare('SELECT * FROM configs WHERE email = ? AND deleted_at = 0 ORDER BY id').all(String(email));
+      const buried23 = (email) => tdb.prepare('SELECT * FROM configs WHERE email = ? AND deleted_at > 0 ORDER BY id').all(String(email));
+      const setBalance23 = (id, balance) => request('PATCH', `/api/admin/users/${id}`, { cookies, csrf, body: { balance } });
+      const mkUser23 = async (username, extra = {}) => {
+        const made = await request('POST', '/api/admin/users', {
+          cookies, csrf, body: { username, password: P23, role: 'reseller', balance: 0, max_configs: 100, ...extra },
+        });
+        return Number(data23(made).user?.id || 0);
+      };
+      const login23 = async (username) => {
+        const res = await request('POST', '/api/auth/login', { body: { username, password: P23 } });
+        return { status: res.status, cookies: cookiesFrom(res.headers), csrf: String(res.json?.data?.csrf || '') };
+      };
+      const build23 = async (userId, name, inboundIds, { gb = 5, days = 30 } = {}) => {
+        const res = await request('POST', '/api/admin/configs', {
+          cookies, csrf, body: { userId, inboundIds, gb, days, label: name, customerName: name },
+        });
+        const made = data23(res).configs || [];
+        return { status: res.status, ids: made.map((row) => Number(row.id)), email: String(made[0]?.email || '') };
+      };
+      const extendAdmin23 = (body, who = { cookies, csrf }) => request('POST', '/api/admin/configs/bulk-extend', { ...who, body });
+      const deleteAdmin23 = (body, who = { cookies, csrf }) => request('POST', '/api/admin/configs/bulk-delete', { ...who, body });
+      const itemOf23 = (res, id) => (data23(res).results || []).find((row) => Number(row.id) === Number(id)) || {};
+      const seedTopup23 = (userId, amount, auto = 0, createdAt = Date.now()) => {
+        const now = createdAt;
+        const info = tdb.prepare(
+          `INSERT INTO topup_requests (user_id, amount, status, file_kind, file_id, caption, chat_id, message_id,
+             admin_chat_id, admin_message_id, decided_by, decided_at, decision_note, source, method, reference,
+             auto_approved, created_at, updated_at)
+           VALUES (?, ?, 'pending', 'photo', 'sc230-file', 'فیش واریزی', '', 0, '', 0, 0, 0, '', 'panel',
+             'receipt', ?, ?, ?, ?)`
+        ).run(Number(userId), Number(amount), `SC230-${crypto.randomBytes(6).toString('hex')}`,
+          Number(auto) || 0, now, now);
+        return Number(info.lastInsertRowid);
+      };
+      const decide23 = (verb, id, body = {}, who = { cookies, csrf }) =>
+        request('POST', `/api/admin/topups/${id}/${verb}`, { ...who, body });
+      let monitorWas23 = 120;
+      let billingWas23 = null;
+      let securityWas23 = null;
+      let paymentWas23 = null;
+      let lifted23 = false;
+      let parked23 = false;
+      let visWas902 = 1;
+      let disabled903 = false;
+      const planIds23 = [];
+      const userIds23 = [];
+      const mail23 = [];
+      const nodeIds23 = [];
+      try {
+        const read23 = await request('GET', '/api/admin/settings', { cookies });
+        monitorWas23 = Number(data23(read23).settings?.monitor?.intervalSec || 120);
+        billingWas23 = { ...(data23(read23).settings?.billing || {}) };
+        securityWas23 = { ...(data23(read23).settings?.security || {}) };
+        paymentWas23 = { ...(data23(read23).settings?.payment || {}) };
+        // Ten logins per ten minutes is the fleet's own rule, and the blocks
+        // above spent that window long before this one starts. Four fixture
+        // wallets have to sign in here, so the limit is lifted for the block and
+        // put back exactly as it was in the `finally` below.
+        lifted23 = (await request('PATCH', '/api/admin/settings/security', {
+          cookies, csrf, body: { loginRateLimit: 100 },
+        })).status === 200;
+        parked23 = (await request('PATCH', '/api/admin/settings/monitor', {
+          cookies, csrf, body: { intervalSec: 3600 },
+        })).status === 200;
+        await request('PATCH', '/api/admin/settings/billing', { cookies, csrf, body: { enabled: true, commissionPercent: 0 } });
+
+        const debtId23 = await mkUser23('sc230debt');
+        const grantId23 = await mkUser23('sc230plan');
+        const bulkId23 = await mkUser23('sc230bulk');
+        const otherId23 = await mkUser23('sc230other');
+        userIds23.push(debtId23, grantId23, bulkId23, otherId23);
+
+        // Everything below talks through the reseller's own session. If a fixture
+        // cannot sign in, every one of those checks is a 401 and proves nothing,
+        // so the block says so once, here, with the status that came back.
+        const signed23 = await login23('sc230debt');
+        check('the four fixture wallets exist and can actually sign in',
+          debtId23 > 0 && grantId23 > 0 && bulkId23 > 0 && otherId23 > 0 && signed23.status === 200,
+          `ids=${[debtId23, grantId23, bulkId23, otherId23].join(',')} login=${signed23.status}`);
+
+        // ────────────────────────────── ۱) «اعمال بدهی و موجودی منفی»
+        const negWrite23 = await setBalance23(debtId23, -250000);
+        const afterNeg23 = balance23(debtId23);
+        check('the admin can write a wallet below zero and it is stored, not clamped',
+          negWrite23.status === 200 && afterNeg23 === -250000, `status=${negWrite23.status} balance=${afterNeg23}`);
+
+        const ceilBefore23 = Number(tdb.prepare('SELECT max_gb_per_config AS v FROM users WHERE id = ?').get(debtId23).v);
+        const ceilTry23 = await request('PATCH', `/api/admin/users/${debtId23}`, {
+          cookies, csrf, body: { max_gb_per_config: -5 },
+        });
+        const ceilAfter23 = Number(tdb.prepare('SELECT max_gb_per_config AS v FROM users WHERE id = ?').get(debtId23).v);
+        check('only the wallet goes negative — a ceiling below zero is still refused',
+          ceilTry23.status === 422 && code23(ceilTry23) === 'invalid_limit' && ceilAfter23 === ceilBefore23,
+          `code=${code23(ceilTry23)} stored=${ceilAfter23} was=${ceilBefore23}`);
+
+        const notANumber23 = await setBalance23(debtId23, 'همه‌چیز');
+        check('a wallet that is not a number is refused instead of becoming zero',
+          notANumber23.status === 422 && code23(notANumber23) === 'invalid_limit' && balance23(debtId23) === -250000,
+          `code=${code23(notANumber23)} balance=${balance23(debtId23)}`);
+
+        const deepDebit23 = await request('POST', `/api/admin/users/${debtId23}/balance`, {
+          cookies, csrf, body: { amount: -100000, description: 'کسر بابت بسته‌ای که رایگان تمدید شد' },
+        });
+        const debitLine23 = ledger23(debtId23).slice(-1)[0] || {};
+        check('a deduction that ends below zero goes through and the book prints the debt',
+          deepDebit23.status === 200 && Number(data23(deepDebit23).balance) === -350000
+            && debitLine23.type === 'debit' && Number(debitLine23.amount) === 100000
+            && Number(debitLine23.balance_after) === -350000,
+          `balance=${data23(deepDebit23).balance} line=${debitLine23.type}/${debitLine23.amount}/${debitLine23.balance_after}`);
+
+        const debtor23 = signed23;
+        // 901 is the priced channel (fixed 100 + 10/GB); 904 is free and would
+        // have made this a successful 0-toman order, proving nothing about debt.
+        const onCredit23 = await request('POST', '/api/reseller/configs', {
+          cookies: debtor23.cookies, csrf: debtor23.csrf,
+          body: { inboundIds: [901], gb: 1, days: 1, customerName: 'خرید روی بدهی' },
+        });
+        check('debt is a record, not credit: a purchase still stops at 402',
+          onCredit23.status === 402 && code23(onCredit23) === 'insufficient_balance'
+            && balance23(debtId23) === -350000,
+          `status=${onCredit23.status} code=${code23(onCredit23)} balance=${balance23(debtId23)}`);
+
+        // ────────────────────────────── ۲) «ابطال فیش جعلی یا تکراری»
+        const tGood23 = seedTopup23(otherId23, 400);
+        const approved23 = await decide23('approve', tGood23);
+        const afterApprove23 = balance23(otherId23);
+        check('the approve step still credits the wallet — the baseline the void is judged against',
+          approved23.status === 200 && afterApprove23 === 400, `status=${approved23.status} balance=${afterApprove23}`);
+
+        const reversed23 = await decide23('reverse', tGood23, { note: 'فیش تکراری: همین شماره تراکنش دیروز ثبت شده بود' });
+        const revData23 = data23(reversed23).request || {};
+        check('voiding an approved receipt takes the money back and says who, when and why',
+          reversed23.status === 200 && balance23(otherId23) === 0 && revData23.status === 'reversed'
+            && Number(revData23.reversedBy) > 0 && Number(revData23.reversedAt) > 0
+            && String(revData23.reverseNote).includes('فیش تکراری'),
+          `status=${reversed23.status} balance=${balance23(otherId23)} row=${revData23.status}/${revData23.reversedBy}/${revData23.reverseNote}`);
+
+        const revLines23 = ledger23(otherId23);
+        const revDebit23 = revLines23.filter((row) => row.type === 'debit').slice(-1)[0] || {};
+        check('the claw-back is an ordinary ledger line — the same debit a manual کسر writes',
+          revLines23.filter((row) => row.type === 'credit').length === 1
+            && Number(revDebit23.amount) === 400 && Number(revDebit23.balance_after) === 0
+            && String(revDebit23.description).includes('ابطال'),
+          `lines=${revLines23.map((row) => `${row.type}:${row.amount}`).join(',')} note=${revDebit23.description}`);
+
+        const revKeeps23 = await request('GET', `/api/admin/topups/${tGood23}`, { cookies });
+        const keepData23 = data23(revKeeps23).request || {};
+        check('voiding does not erase the decision it is voiding — the approval is still readable',
+          revKeeps23.status === 200 && Number(keepData23.decidedBy) > 0 && Number(keepData23.decidedAt) > 0
+            && keepData23.status === 'reversed',
+          `decidedBy=${keepData23.decidedBy} status=${keepData23.status}`);
+
+        const twice23 = await decide23('reverse', tGood23, { note: 'دوباره' });
+        const balanceAfterTwice23 = balance23(otherId23);
+        check('the same receipt cannot be clawed back twice',
+          twice23.status === 409 && code23(twice23) === 'already_reversed' && balance23(otherId23) === balanceAfterTwice23,
+          `code=${code23(twice23)} balance=${balanceAfterTwice23}`);
+
+        const tPending23 = seedTopup23(otherId23, 100);
+        const onPending23 = await decide23('reverse', tPending23);
+        const tRejected23 = seedTopup23(otherId23, 100);
+        await decide23('reject', tRejected23, { note: 'رد شده' });
+        const onRejected23 = await decide23('reverse', tRejected23);
+        check('only an approved receipt can be voided — pending and rejected both answer 409',
+          onPending23.status === 409 && code23(onPending23) === 'not_approved'
+            && onRejected23.status === 409 && code23(onRejected23) === 'not_approved',
+          `pending=${code23(onPending23)} rejected=${code23(onRejected23)}`);
+
+        const otherSess23 = await login23('sc230other');
+        const byReseller23 = await decide23('reverse', tPending23, {}, { cookies: otherSess23.cookies, csrf: otherSess23.csrf });
+        const seenByReseller23 = await request('GET', `/api/admin/topups/${tPending23}`, { cookies: otherSess23.cookies });
+        check('a reseller cannot void his own receipt, and cannot even read the admin half',
+          byReseller23.status === 403 && seenByReseller23.status === 403 && balance23(otherId23) === 0,
+          `reverse=${byReseller23.status} read=${seenByReseller23.status}`);
+
+        // The void this check is about has to be judged against a receipt the
+        // SWEEP paid out, not one an admin clicked: approve() writes
+        // auto_approved = 0 for a person, so seeding the flag and approving by
+        // hand would have proved the audit line false — which is exactly what
+        // the code then does. So the switch is opened, the receipt is filed two
+        // days ago, and the real schedule releases it.
+        const payPatch23 = await request('PATCH', '/api/admin/settings/payment', {
+          cookies, csrf,
+          body: {
+            autoApproveEnabled: true, autoApproveReceipt: true, autoApproveMaxAmount: 20000,
+            autoApproveAfterMinutes: 1, autoApproveDailyLimit: 0,
+          },
+        });
+        const tAuto23 = seedTopup23(debtId23, 20000, 0, NOW23 - 2 * DAY23);
+        const sweep23 = await request('POST', '/api/admin/topups/auto-approve/run', { cookies, csrf, body: {} });
+        const autoRow23 = tdb.prepare(
+          'SELECT status, auto_approved, decided_by FROM topup_requests WHERE id = ?'
+        ).get(tAuto23) || {};
+        check('the sweep — not a person — is what paid this receipt out',
+          payPatch23.status === 200 && sweep23.status === 200 && autoRow23.status === 'approved'
+            && Number(autoRow23.auto_approved) === 1 && Number(autoRow23.decided_by) === 0,
+          `pay=${payPatch23.status} run=${JSON.stringify(data23(sweep23)).slice(0, 120)} row=${autoRow23.status}/${autoRow23.auto_approved}/${autoRow23.decided_by}`);
+        const debtVoid23 = await decide23('reverse', tAuto23, { note: 'فیش جعلی' });
+        const debtVoidData23 = data23(debtVoid23).request || {};
+        check('clawing back a fake auto-approval takes the debtor deeper, which is the whole point',
+          debtVoid23.status === 200 && Number(debtVoidData23.clawedBack) === 20000
+            && Number(debtVoidData23.balance) === -350000 && balance23(debtId23) === -350000,
+          `status=${debtVoid23.status} claw=${debtVoidData23.clawedBack} balance=${debtVoidData23.balance}/${balance23(debtId23)}`);
+        const voidAudit23 = auditLast23('topup.reverse');
+        check('the audit names the row, the money, the wallet it left and that the sweep let it through',
+          Number(voidAudit23.amount) === 20000 && Number(voidAudit23.balance) === -350000
+            && voidAudit23.wasAutoApproved === true && String(voidAudit23.note) === 'فیش جعلی',
+          `audit=${JSON.stringify(voidAudit23).slice(0, 160)}`);
+
+        const revList23 = await request('GET', '/api/admin/topups?status=reversed', { cookies });
+        const revListData23 = data23(revList23);
+        check('the reversed shelf lists them and the tab counter counts them',
+          revList23.status === 200 && Number(revListData23.counts?.reversed) >= 2
+            && (revListData23.rows || []).every((row) => row.status === 'reversed')
+            && (revListData23.rows || []).some((row) => Number(row.id) === tGood23),
+          `counts=${JSON.stringify(revListData23.counts || {})} rows=${(revListData23.rows || []).length}`);
+
+        // ────────────────────────────── ۳) «پلن فعال شود حتی بدون اینباند»
+        const grantPatch23 = await request('PATCH', `/api/admin/users/${grantId23}`, {
+          cookies, csrf, body: { allowed_inbounds: [903] },
+        });
+        visWas902 = Number(tdb.prepare('SELECT visible FROM inbounds WHERE id = 902').get().visible);
+        tdb.prepare('UPDATE inbounds SET visible = 0 WHERE id = 902').run();
+        const noGrant23 = await login23('sc230plan');
+        const hisInbounds23 = await request('GET', '/api/reseller/inbounds', { cookies: noGrant23.cookies });
+        const shown23 = (hisInbounds23.json?.data?.rows || []).map((row) => Number(row.id));
+        check('the channel grant still rules the ordinary picker — nothing here was opened up',
+          grantPatch23.status === 200 && !shown23.includes(902) && shown23.includes(903),
+          `shown=${shown23.join(',')}`);
+
+        const mkPlan23 = async (body) => {
+          const made = await request('POST', '/api/admin/plans', { cookies, csrf, body });
+          planIds23.push(Number(data23(made).plan?.id || 0));
+          return made;
+        };
+        const planMain23 = await mkPlan23({
+          name: 'پلن بدون مجوز', gb: 5, days: 30, price: 100, inboundIds: [902], category: 'public',
+        });
+        const hisPlans23 = await request('GET', '/api/reseller/plans', { cookies: noGrant23.cookies });
+        const onShelf23 = (data23(hisPlans23).plans || []).map((row) => Number(row.id));
+        check('a plan built on a channel he was never granted is still on his shelf',
+          planMain23.status === 201 && onShelf23.includes(Number(data23(planMain23).plan.id)),
+          `shelf=${onShelf23.join(',')} want=${data23(planMain23).plan?.id}`);
+
+        const quoteMain23 = await request('POST', '/api/reseller/plans/quote', {
+          cookies: noGrant23.cookies, csrf: noGrant23.csrf, body: { planId: Number(data23(planMain23).plan.id) },
+        });
+        const quoteData23 = data23(quoteMain23);
+        check('the quote prices it at the owner’s number, not the tariff',
+          quoteMain23.status === 200 && Number(quoteData23.price) === 100 && Number(quoteData23.tariff) === 250
+            && Number(quoteData23.saved) === 150 && quoteData23.charged === true,
+          `price=${quoteData23.price} tariff=${quoteData23.tariff} saved=${quoteData23.saved}`);
+
+        const topupForPlan23 = seedTopup23(grantId23, 5000);
+        await decide23('approve', topupForPlan23);
+        const buyMain23 = await request('POST', '/api/reseller/plans/new', {
+          cookies: noGrant23.cookies, csrf: noGrant23.csrf,
+          body: { planId: Number(data23(planMain23).plan.id), customerName: 'مشتری پلن بی‌مجوز' },
+        });
+        const bought23 = (data23(buyMain23).configs || [])[0] || {};
+        const boughtRows23 = alive23(String(bought23.email || ''));
+        check('and he can actually take it: the package is built on the channel he cannot pick by hand',
+          buyMain23.status === 201 && boughtRows23.length === 1 && Number(boughtRows23[0].inbound_id) === 902,
+          `status=${buyMain23.status} rows=${boughtRows23.length} inbound=${boughtRows23[0]?.inbound_id}`);
+        if (bought23.email) mail23.push(String(bought23.email));
+        const planLines23 = ledger23(grantId23);
+        const planPurchase23 = planLines23.filter((row) => row.type === 'purchase').slice(-1)[0] || {};
+        // chargeReseller writes purchase/renew lines as the amount LEAVING, so the
+        // column is negative; the magnitude is what the plan cost.
+        check('the plan’s own price is what left the wallet — one line, ten times cheaper than the tariff',
+          planLines23.filter((row) => row.type === 'purchase').length === 1
+            && Math.abs(Number(planPurchase23.amount)) === 100 && Number(planPurchase23.balance_after) === 4900
+            && balance23(grantId23) === 4900,
+          `line=${planPurchase23.amount}/${planPurchase23.balance_after} balance=${balance23(grantId23)}`);
+
+        const directTry23 = await request('POST', '/api/reseller/configs', {
+          cookies: noGrant23.cookies, csrf: noGrant23.csrf,
+          body: { inboundIds: [902], gb: 1, days: 1, customerName: 'دستی از کانال بسته' },
+        });
+        check('the plan is the exception, not the new rule: hand-picking a channel he was never granted is still refused',
+          directTry23.status === 403 && code23(directTry23) === 'inbound_forbidden',
+          `status=${directTry23.status} code=${code23(directTry23)}`);
+
+        const planExclusive23 = await mkPlan23({
+          name: 'پلن اختصاصی دیگری', gb: 2, days: 7, price: 0, inboundIds: [901],
+          category: 'exclusive', allowed_users: [otherId23],
+        });
+        const hiddenForHim23 = (await request('GET', '/api/reseller/plans', { cookies: noGrant23.cookies })).json?.data?.plans || [];
+        const exclQuote23 = await request('POST', '/api/reseller/plans/quote', {
+          cookies: noGrant23.cookies, csrf: noGrant23.csrf, body: { planId: Number(data23(planExclusive23).plan.id) },
+        });
+        check('an exclusive plan still belongs only to the resellers it names',
+          planExclusive23.status === 201 && !hiddenForHim23.some((row) => Number(row.id) === Number(data23(planExclusive23).plan.id))
+            && exclQuote23.status === 403 && code23(exclQuote23) === 'plan_not_for_you',
+          `quote=${exclQuote23.status}/${code23(exclQuote23)}`);
+
+        // The plan is made while its channel is still alive — createPlan refuses a
+        // disabled inbound with inbound_disabled, and this check is about the shelf
+        // reacting to a channel that was switched off AFTER the plan existed.
+        const planOnDead23 = await mkPlan23({ name: 'پلن روی کانال خاموش', gb: 1, days: 1, price: 0, inboundIds: [903] });
+        const deadPlanId23 = Number(data23(planOnDead23).plan?.id || 0);
+        tdb.prepare('UPDATE inbounds SET enabled = 0 WHERE id = 903').run();
+        disabled903 = true;
+        const afterDisable23 = await request('GET', '/api/reseller/plans', { cookies: noGrant23.cookies });
+        const resellerAfter23 = (await request('GET', '/api/reseller/plans', { cookies: noGrant23.cookies })).json?.data?.plans || [];
+        const adminAfter23 = (await request('GET', '/api/admin/plans', { cookies })).json?.data?.plans || [];
+        const onHisShelf23 = resellerAfter23.some((row) => Number(row.id) === deadPlanId23);
+        const onOwnerScreen23 = adminAfter23.some((row) => Number(row.id) === deadPlanId23);
+        check('a plan whose channel is switched off disappears from the shelf but not from the owner’s screen',
+          planOnDead23.status === 201 && deadPlanId23 > 0 && afterDisable23.status === 200
+            && !onHisShelf23 && onOwnerScreen23,
+          `make=${planOnDead23.status} id=${deadPlanId23} shelf=${onHisShelf23}(${resellerAfter23.length}) admin=${onOwnerScreen23}(${adminAfter23.length})`);
+        tdb.prepare('UPDATE inbounds SET enabled = 1 WHERE id = 903').run();
+        disabled903 = false;
+
+        const otherPanel23 = Number(tdb.prepare("INSERT INTO servers (name, enabled) VALUES ('v2.3.0 fixture', 0)").run().lastInsertRowid);
+        nodeIds23.push(otherPanel23);
+        tdb.prepare(
+          `INSERT INTO inbounds (id, server_id, xui_id, node_id, node_name, remark, protocol, tag, port, network,
+             security, listen, price_fixed, price_per_gb, price_per_day, enabled, visible, sub_sort_index, updated_at)
+           VALUES (921, ?, 921, 0, 'local', 'Fixed 921', 'vless', 'tag921', 1000, 'tcp', 'none', '', 0, 10, 0, 1, 1, 40, ?)`
+        ).run(otherPanel23, Date.now());
+        const fixedTry23 = await request('PATCH', `/api/admin/users/${grantId23}`, { cookies, csrf, body: { fixed_inbound: 921 } });
+        const afterFixed23 = (await request('GET', '/api/reseller/plans', { cookies: noGrant23.cookies })).json?.data?.plans || [];
+        const fixedQuote23 = await request('POST', '/api/reseller/plans/quote', {
+          cookies: noGrant23.cookies, csrf: noGrant23.csrf, body: { planId: Number(data23(planMain23).plan.id) },
+        });
+        check('one subscription still cannot span two panels: a fixed inbound elsewhere keeps that plan off his shelf',
+          fixedTry23.status === 200 && !afterFixed23.some((row) => Number(row.id) === Number(data23(planMain23).plan.id))
+            && fixedQuote23.status === 403 && code23(fixedQuote23) === 'plan_not_for_you',
+          `fixed=${fixedTry23.status} quote=${fixedQuote23.status}/${code23(fixedQuote23)}`);
+        await request('PATCH', `/api/admin/users/${grantId23}`, { cookies, csrf, body: { fixed_inbound: 0 } });
+
+        // ────────────────────────────── ۴) «چند کانفیگ را یک‌جا تمدید/حذف کن»
+        const noTicks23 = await extendAdmin23({ gb: 5 });
+        const nothingToAdd23 = await extendAdmin23({ ids: [1, 2], gb: 0, days: 0 });
+        const tooMany23 = await extendAdmin23({ ids: Array.from({ length: 1001 }, (_, i) => i + 1), gb: 5 });
+        check('a batch that was never told what to do says so before it touches anything',
+          noTicks23.status === 422 && code23(noTicks23) === 'ids_required'
+            && nothingToAdd23.status === 422 && code23(nothingToAdd23) === 'nothing_to_add'
+            && tooMany23.status === 422 && code23(tooMany23) === 'too_many_items',
+          `ids=${code23(noTicks23)} empty=${code23(nothingToAdd23)} many=${code23(tooMany23)}`);
+
+        const pkgA23 = await build23(bulkId23, 'بسته الف', [901, 902], { gb: 5, days: 30 });
+        const pkgB23 = await build23(bulkId23, 'بسته ب', [903], { gb: 5, days: 30 });
+        const pkgC23 = await build23(otherId23, 'بسته دیگری', [904], { gb: 5, days: 30 });
+        mail23.push(pkgA23.email, pkgB23.email, pkgC23.email);
+        await setBalance23(bulkId23, 1000);
+        const ticks23 = [...pkgA23.ids, ...pkgB23.ids];
+
+        const preview23 = await extendAdmin23({ ids: ticks23, gb: 5, days: 0, dryRun: true });
+        const pv23 = data23(preview23);
+        check('two ticks of the same customer fold into one package, and the batch counts packages, not rows',
+          preview23.status === 200 && Number(pv23.total) === 3 && Number(pv23.packages) === 2
+            && Number(pv23.merged) === 1 && Number(pv23.rows) === 3,
+          `total=${pv23.total} packages=${pv23.packages} merged=${pv23.merged} rows=${pv23.rows}`);
+        check('the preview prices each package at its own most expensive channel',
+          (pv23.results || []).length === 2 && Number(itemOf23(preview23, pkgA23.ids[0]).amount) === 250
+            && Number(itemOf23(preview23, pkgB23.ids[0]).amount) === 300 && Number(pv23.tariff) === 550
+            && pv23.results.every((row) => row.ok === true),
+          `amounts=${(pv23.results || []).map((row) => row.amount).join(',')} tariff=${pv23.tariff}`);
+
+        const callsBefore23 = mockXui.calls.length;
+        const auditBeforeExt23 = auditCount23('config.bulk_extend');
+        const snapshotA23 = alive23(pkgA23.email).map((row) => `${row.total_bytes}:${row.expiry_at}`).join('|');
+        const ledgerBefore23 = ledger23(bulkId23).length;
+        const previewTwice23 = await extendAdmin23({ ids: ticks23, gb: 5, days: 0, dryRun: true });
+        const previewAgain23 = data23(previewTwice23);
+        check('a preview is a preview: the node, the ledger, the audit and the rows did not move',
+          previewAgain23.renewed === 2 && mockXui.calls.length === callsBefore23
+            && auditCount23('config.bulk_extend') === auditBeforeExt23 && ledger23(bulkId23).length === ledgerBefore23
+            && alive23(pkgA23.email).map((row) => `${row.total_bytes}:${row.expiry_at}`).join('|') === snapshotA23,
+          `calls=${mockXui.calls.length - callsBefore23} audits=${auditCount23('config.bulk_extend') - auditBeforeExt23} ledger=${ledger23(bulkId23).length - ledgerBefore23}`);
+
+        await setBalance23(bulkId23, 300);
+        const bulkSess23 = await login23('sc230bulk');
+        const runsOut23 = await request('POST', '/api/reseller/configs/bulk-extend', {
+          cookies: bulkSess23.cookies, csrf: bulkSess23.csrf, body: { ids: ticks23, gb: 5, days: 0, dryRun: true },
+        });
+        const runsOutData23 = data23(runsOut23);
+        const outItem23 = itemOf23(runsOut23, pkgB23.ids[0]);
+        check('the preview names the wallet that runs out, at the item it runs out on',
+          runsOut23.status === 200 && itemOf23(runsOut23, pkgA23.ids[0]).ok === true
+            && outItem23.ok === false && outItem23.code === 'insufficient_balance'
+            && Number(runsOutData23.renewed) === 1 && Number(runsOutData23.failed) === 1,
+          `a=${itemOf23(runsOut23, pkgA23.ids[0]).ok} b=${outItem23.code} renewed=${runsOutData23.renewed}`);
+
+        await setBalance23(bulkId23, 1000);
+        const realRun23 = await request('POST', '/api/reseller/configs/bulk-extend', {
+          cookies: bulkSess23.cookies, csrf: bulkSess23.csrf, body: { ids: ticks23, gb: 5, days: 0 },
+        });
+        const realData23 = data23(realRun23);
+        check('a reseller’s batch is charged exactly what a batch of single clicks would have charged',
+          realRun23.status === 200 && Number(realData23.renewed) === 2 && Number(realData23.amount) === 550
+            && balance23(bulkId23) === 450 && ledger23(bulkId23).filter((row) => row.type === 'renew').length === 2,
+          `status=${realRun23.status} renewed=${realData23.renewed} amount=${realData23.amount} balance=${balance23(bulkId23)}`);
+        const rowsA23 = alive23(pkgA23.email);
+        const clientA23 = mockXui.clients.get(pkgA23.email) || {};
+        check('the shared pool stays shared: two rows, one client, one volume',
+          rowsA23.length === 2 && rowsA23.every((row) => Number(row.total_bytes) === 10 * GB23)
+            && Number(clientA23.totalGB) === 10 * GB23 && rowsA23.every((row) => Number(row.expiry_at) === Number(rowsA23[0].expiry_at)),
+          `bytes=${rowsA23.map((row) => row.total_bytes / GB23).join(',')} node=${clientA23.totalGB / GB23}`);
+
+        const cRowsBefore23 = alive23(pkgC23.email).map((row) => Number(row.total_bytes)).join('|');
+        const foreignTick23 = await request('POST', '/api/reseller/configs/bulk-extend', {
+          cookies: bulkSess23.cookies, csrf: bulkSess23.csrf,
+          body: { ids: [...pkgA23.ids, ...pkgC23.ids], gb: 1, days: 0, dryRun: true },
+        });
+        const foreignItem23 = itemOf23(foreignTick23, pkgC23.ids[0]);
+        check('a tick on somebody else’s customer fails as that item, and the rest of the batch still answers',
+          foreignTick23.status === 200 && Number(data23(foreignTick23).failed) === 1
+            && Number(foreignItem23.rows) === 0 && String(foreignItem23.code) === 'forbidden'
+            && alive23(pkgC23.email).map((row) => Number(row.total_bytes)).join('|') === cRowsBefore23,
+          `failed=${data23(foreignTick23).failed} code=${foreignItem23.code} rows=${foreignItem23.rows}`);
+
+        const adminFree23 = await extendAdmin23({ ids: ticks23, gb: 5, days: 0 });
+        const adminFreeData23 = data23(adminFree23);
+        check('an admin batch with no tick takes nothing and still names the money it is not taking',
+          adminFree23.status === 200 && adminFreeData23.charge === false && Number(adminFreeData23.amount) === 0
+            && Number(adminFreeData23.tariff) === 550 && balance23(bulkId23) === 450
+            && (adminFreeData23.results || []).every((row) => row.charged === false),
+          `charge=${adminFreeData23.charge} amount=${adminFreeData23.amount} tariff=${adminFreeData23.tariff} balance=${balance23(bulkId23)}`);
+
+        await setBalance23(bulkId23, 2000);
+        const adminPaid23 = await extendAdmin23({ ids: ticks23, gb: 5, days: 0, charge: true });
+        const adminPaidData23 = data23(adminPaid23);
+        check('and the same batch with the tick on does take it, from the package owner’s wallet',
+          adminPaid23.status === 200 && adminPaidData23.charge === true
+            && Number(adminPaidData23.amount) === 550 && balance23(bulkId23) === 1450
+            && ledger23(bulkId23).filter((row) => row.type === 'renew').length === 4,
+          `amount=${adminPaidData23.amount} balance=${balance23(bulkId23)} renews=${ledger23(bulkId23).filter((row) => row.type === 'renew').length}`);
+
+        const bulkAudit23 = auditLast23('config.bulk_extend');
+        check('the audit records the batch as a batch — ticks, packages, merged, money and the per-item outcome',
+          Number(bulkAudit23.total) === 3 && Number(bulkAudit23.packages) === 2 && Number(bulkAudit23.merged) === 1
+            && Number(bulkAudit23.amount) === 550 && Array.isArray(bulkAudit23.items) && bulkAudit23.items.length === 2,
+          `audit=${JSON.stringify(bulkAudit23).slice(0, 180)}`);
+
+        const delPreview23 = await deleteAdmin23({ ids: [...pkgA23.ids, ...pkgB23.ids], dryRun: true });
+        const delPv23 = data23(delPreview23);
+        check('the delete preview says which clients the node will actually lose',
+          delPreview23.status === 200 && Number(delPv23.packages) === 2 && Number(delPv23.rows) === 3
+            && Number(delPv23.remote) === 3 && Number(delPv23.localOnly) === 0,
+          `packages=${delPv23.packages} rows=${delPv23.rows} remote=${delPv23.remote} local=${delPv23.localOnly}`);
+
+        const extEmail23 = `sc230-ext-${crypto.randomBytes(5).toString('hex')}`;
+        mail23.push(extEmail23);
+        const extId23 = Number(tdb.prepare(
+          `INSERT INTO configs (user_id, server_id, inbound_id, email, sub_id, xui_sub_id, uuid, label,
+             customer_name, total_bytes, expiry_at, enabled, status, origin, created_at, updated_at)
+           VALUES (?, ?, 901, ?, ?, ?, ?, 'بیرونی', 'مشتری بیرونی', ?, ?, 1, 'active', 'external', ?, ?)`
+        ).run(bulkId23, primaryId, extEmail23, `sub-${extEmail23}`, `uuid-${extEmail23}`,
+          crypto.randomUUID(), 3 * GB23, NOW23 + 20 * DAY23, NOW23, NOW23).lastInsertRowid);
+        mockXui.clients.set(extEmail23, {
+          email: extEmail23, id: `uuid-${extEmail23}`, subId: `sub-${extEmail23}`, security: 'auto', comment: '',
+          totalGB: 3 * GB23, expiryTime: NOW23 + 20 * DAY23, enable: true, up: 0, down: 0, inboundIds: [901],
+        });
+        const mixedDel23 = await deleteAdmin23({ ids: [extId23, ...pkgA23.ids], dryRun: true });
+        const mixedData23 = data23(mixedDel23);
+        check('a customer adopted from another panel is counted as forgotten here, not as deleted there',
+          mixedDel23.status === 200 && Number(mixedData23.packages) === 2 && Number(mixedData23.remote) === 2
+            && Number(mixedData23.localOnly) === 1 && Number(itemOf23(mixedDel23, extId23).forgotten) === 1,
+          `remote=${mixedData23.remote} local=${mixedData23.localOnly} ext=${JSON.stringify(itemOf23(mixedDel23, extId23))}`);
+
+        const auditBeforeDel23 = auditCount23('config.bulk_delete');
+        const bulkDel23 = await deleteAdmin23({ ids: [extId23, ...pkgA23.ids, ...pkgB23.ids] });
+        const delData23 = data23(bulkDel23);
+        const aGone23 = alive23(pkgA23.email);
+        const aBuried23 = buried23(pkgA23.email);
+        check('the batch really deletes: every row of every package buried, and the node loses only its own clients',
+          bulkDel23.status === 200 && Number(delData23.deleted) === 3 && Number(delData23.rows) === 4
+            && aGone23.length === 0 && aBuried23.length === 2
+            && !mockXui.clients.has(pkgA23.email) && !mockXui.clients.has(pkgB23.email)
+            && mockXui.clients.has(extEmail23) && alive23(extEmail23).length === 0,
+          `deleted=${delData23.deleted} rows=${delData23.rows} live=${aGone23.length} node=${mockXui.clients.has(extEmail23)}`);
+        check('a bulk delete leaves the same Trash snapshots a single delete would have left',
+          auditCount23('config.bulk_delete') === auditBeforeDel23 + 1
+            && Number(tdb.prepare('SELECT COUNT(*) AS c FROM config_trash WHERE email IN (?, ?)').get(pkgA23.email, pkgB23.email).c) === 2,
+          `audits=${auditCount23('config.bulk_delete') - auditBeforeDel23} trash=${tdb.prepare('SELECT COUNT(*) AS c FROM config_trash WHERE email IN (?, ?)').get(pkgA23.email, pkgB23.email).c}`);
+
+        const trashRow23 = tdb.prepare('SELECT id FROM config_trash WHERE email = ? ORDER BY id LIMIT 1').get(pkgB23.email) || {};
+        const restore23 = await request('POST', `/api/admin/trash/${Number(trashRow23.id || 0)}/restore`, { cookies, csrf, body: {} });
+        const restored23 = alive23(pkgB23.email);
+        check('and one of them comes back through the Trash exactly as the batch found it',
+          restore23.status === 200 && restored23.length === 1 && Number(restored23[0].total_bytes) === 20 * GB23,
+          `status=${restore23.status} rows=${restored23.length} bytes=${restored23[0]?.total_bytes / GB23}GB`);
+
+        // ────────────────────────────── ۵) «منوی تراکنش‌ها»
+        const bookAsReseller23 = await request('GET', '/api/admin/transactions', { cookies: bulkSess23.cookies });
+        check('the book is the owner’s: a reseller session is turned away from it',
+          bookAsReseller23.status === 403, `status=${bookAsReseller23.status}`);
+
+        const bookAll23 = await book23('pageSize=200');
+        const bookRows23 = data23(bookAll23).rows || [];
+        check('every line carries a magnitude and a direction instead of the column’s own sign',
+          bookAll23.status === 200 && bookRows23.length > 0 && bookRows23.every((row) =>
+            typeof row.magnitude === 'number' && ['in', 'out'].includes(row.direction)
+              && Number(row.magnitude) >= 0 && row.amount === undefined
+              && Number(row.signed) === (row.direction === 'out' ? -Number(row.magnitude) : Number(row.magnitude))),
+          `rows=${bookRows23.length} sample=${JSON.stringify(bookRows23[0] || {}).slice(0, 160)}`);
+
+        const sideOf23 = {};
+        for (const row of bookRows23) {
+          if ([debtId23, grantId23, bulkId23, otherId23].includes(Number(row.userId))) sideOf23[row.type] = row.direction;
+        }
+        check('the direction follows the type: a purchase and a renewal leave, a top-up and a کسر arrive as money out',
+          sideOf23.purchase === 'out' && sideOf23.renew === 'out' && sideOf23.credit === 'in' && sideOf23.debit === 'out',
+          `sides=${JSON.stringify(sideOf23)}`);
+
+        const bookMine23 = await book23(`userId=${bulkId23}&pageSize=200`);
+        const mineRows23 = data23(bookMine23).rows || [];
+        check('filtering by reseller leaves nothing but his wallet, and says so back',
+          bookMine23.status === 200 && mineRows23.length > 0
+            && mineRows23.every((row) => Number(row.userId) === Number(bulkId23))
+            && Number(data23(bookMine23).filters?.userId) === Number(bulkId23),
+          `rows=${mineRows23.length} filters=${JSON.stringify(data23(bookMine23).filters || {})}`);
+
+        const bookRenew23 = await book23('type=renew&pageSize=200');
+        const renewRows23 = data23(bookRenew23).rows || [];
+        check('filtering by kind leaves only that kind, and the counts and sums follow the same filter',
+          bookRenew23.status === 200 && renewRows23.length > 0 && renewRows23.every((row) => row.type === 'renew')
+            && Number(data23(bookRenew23).byType?.renew?.count) === renewRows23.length
+            && Number(data23(bookRenew23).sums?.out) === Number(data23(bookRenew23).byType?.renew?.sum)
+            && Number(data23(bookRenew23).sums?.in) === 0,
+          `n=${renewRows23.length} byType=${JSON.stringify(data23(bookRenew23).byType || {})} sums=${JSON.stringify(data23(bookRenew23).sums || {})}`);
+
+        const bookOut23 = await book23('direction=out&pageSize=200');
+        const outRows23 = data23(bookOut23).rows || [];
+        check('«هر چه از این کیف پول رفت» is answered by type, so a negative credit cannot disguise itself',
+          bookOut23.status === 200 && outRows23.length > 0 && outRows23.every((row) => row.direction === 'out')
+            && !outRows23.some((row) => row.type === 'credit') && Number(data23(bookOut23).sums?.in) === 0,
+          `rows=${outRows23.length} types=${[...new Set(outRows23.map((row) => row.type))].join(',')}`);
+
+        const bookIn23 = await book23('direction=in&pageSize=200');
+        const inRows23 = data23(bookIn23).rows || [];
+        check('and the other half is everything that ARRIVED — top-ups and commissions — with nothing that left mixed into it',
+          bookIn23.status === 200 && inRows23.length > 0 && inRows23.every((row) => ['credit', 'commission'].includes(row.type))
+            && Number(data23(bookIn23).sums?.countIn) === inRows23.length,
+          `rows=${inRows23.length} countIn=${data23(bookIn23).sums?.countIn} types=${[...new Set(inRows23.map((row) => row.type))].join(',')}`);
+
+        const bookJunk23 = await book23('type=everything&direction=sideways');
+        const bookPlain23 = await book23('pageSize=200');
+        check('a filter that is not one of the five kinds is ignored rather than an error or a hidden clause',
+          bookJunk23.status === 200 && Number(data23(bookJunk23).total) === Number(data23(bookPlain23).total)
+            && data23(bookJunk23).filters?.type === '' && data23(bookJunk23).filters?.direction === '',
+          `total=${data23(bookJunk23).total} vs ${data23(bookPlain23).total}`);
+
+        const debtTruth23 = Number(tdb.prepare(
+          'SELECT COUNT(*) AS c FROM transactions WHERE user_id = ? AND balance_after < 0'
+        ).get(debtId23).c);
+        const bookDebt23 = await book23(`userId=${debtId23}&pageSize=1`);
+        const debtData23 = data23(bookDebt23);
+        check('the debt card counts the whole filtered book, not the rows the page happens to show',
+          bookDebt23.status === 200 && (debtData23.rows || []).length === 1
+            && Number(debtData23.total) > 1 && Number(debtData23.debt) === debtTruth23 && debtTruth23 >= 1,
+          `page=${(debtData23.rows || []).length} total=${debtData23.total} debt=${debtData23.debt} truth=${debtTruth23}`);
+
+        const actors23 = data23(bookAll23).actors || [];
+        const actorIds23 = actors23.map((row) => Number(row.id));
+        const bookEmpty23 = await book23(`userId=${bulkId23}&direction=in`);
+        check('the reseller dropdown is built from the ledger itself, so it never needs a user list',
+          actors23.length > 0 && actorIds23.includes(Number(bulkId23)) && actorIds23.includes(Number(debtId23))
+            && actors23.every((row) => Number(row.count) > 0)
+            && Number(data23(bookEmpty23).total) === 0 && (data23(bookEmpty23).actors || []).length === actors23.length,
+          `actors=${actors23.length} empty=${data23(bookEmpty23).total}`);
+
+        const bookPage23 = await book23('pageSize=1&page=2');
+        const page2Data23 = data23(bookPage23);
+        check('pagination keeps the same filters and the same totals on every page',
+          bookPage23.status === 200 && (page2Data23.rows || []).length === 1
+            && Number(page2Data23.page) === 2 && Number(page2Data23.total) === Number(data23(bookAll23).total)
+            && Number(page2Data23.debt) === Number(data23(bookAll23).debt),
+          `page=${page2Data23.page} total=${page2Data23.total}/${data23(bookAll23).total} debt=${page2Data23.debt}/${data23(bookAll23).debt}`);
+      } catch (err) {
+        fail += 1;
+        console.log(`  FAIL v2.3.0 block threw — ${err.message}`);
+      } finally {
+        try {
+          tdb.prepare('UPDATE inbounds SET visible = ? WHERE id = 902').run(Number(visWas902));
+          if (disabled903) tdb.prepare('UPDATE inbounds SET enabled = 1 WHERE id = 903').run();
+          for (const id of planIds23) tdb.prepare('UPDATE plans SET deleted_at = ? WHERE id = ?').run(Date.now(), Number(id));
+          for (const email of mail23) mockXui.clients.delete(email);
+          tdb.prepare('DELETE FROM configs WHERE email LIKE ?').run('sc230-%');
+          tdb.prepare('DELETE FROM config_trash WHERE email LIKE ?').run('sc230-%');
+          tdb.prepare('DELETE FROM topup_requests WHERE reference LIKE ?').run('SC230-%');
+          if (nodeIds23.length) {
+            const marks = nodeIds23.map(() => '?').join(',');
+            tdb.prepare(`DELETE FROM inbounds WHERE server_id IN (${marks})`).run(...nodeIds23);
+            tdb.prepare(`DELETE FROM servers WHERE id IN (${marks})`).run(...nodeIds23);
+          }
+          for (const id of userIds23) {
+            tdb.prepare('DELETE FROM transactions WHERE user_id = ?').run(Number(id));
+            tdb.prepare('DELETE FROM users WHERE id = ?').run(Number(id));
+          }
+          tdb.close();
+        } catch (_) { /* the throwaway database is deleted anyway */ }
+        if (parked23) await request('PATCH', '/api/admin/settings/monitor', { cookies, csrf, body: { intervalSec: monitorWas23 } });
+        if (lifted23 && securityWas23.loginRateLimit !== undefined) {
+          await request('PATCH', '/api/admin/settings/security', {
+            cookies, csrf, body: { loginRateLimit: Number(securityWas23.loginRateLimit) },
+          });
+        }
+        if (paymentWas23.autoApproveEnabled !== undefined) {
+          // The sweep is switched back off before this block lets go of the
+          // process, or the next block would find receipts it never filed.
+          await request('PATCH', '/api/admin/settings/payment', {
+            cookies, csrf,
+            body: {
+              autoApproveEnabled: Boolean(paymentWas23.autoApproveEnabled),
+              autoApproveReceipt: Boolean(paymentWas23.autoApproveReceipt),
+              autoApproveMaxAmount: Number(paymentWas23.autoApproveMaxAmount || 0),
+              autoApproveAfterMinutes: Number(paymentWas23.autoApproveAfterMinutes || 15),
+              autoApproveDailyLimit: Number(paymentWas23.autoApproveDailyLimit || 0),
+            },
+          });
+        }
+        if (billingWas23 && billingWas23.enabled !== undefined) {
+          await request('PATCH', '/api/admin/settings/billing', {
+            cookies, csrf,
+            body: { enabled: Boolean(billingWas23.enabled), commissionPercent: Number(billingWas23.commissionPercent || 0) },
+          });
+        }
       }
     }
 

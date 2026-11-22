@@ -323,8 +323,8 @@ function start() {
     log(`Sulduz Cloud ${config.version} listening on ${seen.scheme}://${seen.host}:${seen.port}`);
     if (seen.tlsError) logError(`[net] ${seen.tlsError}`);
     const gate = activation.status();
-    if (gate.required) log(`[boot] awaiting activation — male key ${gate.maleKey}`);
-    else if (gate.activated) log(`[boot] activated (key ${gate.maleKey}, ${gate.source})`);
+    if (gate.required) log(`[boot] awaiting activation — serial ${gate.maleKey}`);
+    else if (gate.activated) log(`[boot] activated (serial ${gate.maleKey}, ${gate.source})`);
     monitor.start();
     startAutoBackupTimer();
     startDailyReportTimer();

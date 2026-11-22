@@ -726,8 +726,10 @@ function UserForm({ open, onClose, editing }) {
         </div>
 
         {!editing ? (
-          <Field label={t('resellers.form.balance')} hint={t('resellers.form.zeroHint')}>
-            <Input type="number" min={0} value={form.balance} onChange={(e) => setForm((prev) => ({ ...prev, balance: e.target.value }))} />
+          // v2.3.0: the starting wallet may be negative — that is the debt the
+          // owner agrees with a reseller before he opens the account.
+          <Field label={t('resellers.form.balance')} hint={t('resellers.form.balanceHint')}>
+            <Input type="number" value={form.balance} onChange={(e) => setForm((prev) => ({ ...prev, balance: e.target.value }))} />
           </Field>
         ) : null}
 
@@ -756,6 +758,28 @@ function toEnglishDigits(value) {
     .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)));
 }
 
+/**
+ * v2.3.0 — «اعمال بدهی و موجودی منفی». A wallet below zero is now something the
+ * owner records on purpose, so every place that shows a balance has to read as a
+ * debt instead of a number that looks like a mistake: rose digits with the sign
+ * kept on the left, plus the word «بدهی». Zero and above keep the old rendering,
+ * so nothing else on these screens changes.
+ */
+function BalanceValue({ value, lang, size = 'sm' }) {
+  const { t } = useI18n();
+  const n = Math.round(Number(value || 0));
+  const digits = cx('font-semibold tabular-nums', size === 'base' ? 'text-base' : 'text-[12px]');
+  if (n < 0) {
+    return (
+      <span className="inline-flex items-center gap-1.5">
+        <span className={`${digits} text-rose-300`} dir="ltr">-{formatNumber(Math.abs(n), lang)}</span>
+        <Badge tone="rose" className="shrink-0 px-1.5 py-0 text-[9px]">{t('common.debt')}</Badge>
+      </span>
+    );
+  }
+  return <span className={cx(digits, n > 0 ? 'text-emerald-300' : 'text-slate-400')}>{formatNumber(n, lang)}</span>;
+}
+
 function BalanceModal({ open, onClose, user }) {
   const { t, lang } = useI18n();
   const toast = useToast();
@@ -773,7 +797,10 @@ function BalanceModal({ open, onClose, user }) {
   const negative = typedNegative || mode === 'sub';
   const signed = negative ? -value : value;
   const after = balance + signed;
-  const invalid = !Number.isFinite(value) || value <= 0 || after < 0;
+  // v2.3.0 «اعمال بدهی»: going below zero is a deliberate outcome now, so the
+  // preview box below turns rose and says so — it is no longer a reason to
+  // disable the button. What is still refused is an amount of zero.
+  const invalid = !Number.isFinite(value) || value <= 0;
 
   const adjust = useMutation({
     mutationFn: (payload) => api.post(`/admin/users/${user.id}/balance`, payload),
@@ -1197,7 +1224,7 @@ function UserDetail({ userId, onClose, onEdit }) {
               </div>
               <div className="text-end">
                 <p className="text-[10px] text-slate-500">{t('common.balance')}</p>
-                <p className="text-base font-bold text-emerald-300">{formatNumber(user.balance, lang)}</p>
+                <p className="leading-tight"><BalanceValue value={user.balance} lang={lang} size="base" /></p>
               </div>
             </div>
 
@@ -1360,8 +1387,11 @@ function UserDetail({ userId, onClose, onEdit }) {
                         <p className="truncate text-[11px] text-slate-300">{tx.description || tx.type}</p>
                         <p className="text-[9px] text-slate-500">{formatDate(tx.createdAt, lang, true)}</p>
                       </div>
-                      <span className={cx('text-[11px] font-semibold', tx.amount < 0 ? 'text-rose-300' : 'text-emerald-300')}>
-                        {tx.amount > 0 ? '+' : ''}{formatNumber(tx.amount, lang)}
+                      {/* v2.3.0: `direction` comes from the server. This used to read
+                          the stored sign, and a wallet deduction — written as a
+                          positive number — was shown here as green income. */}
+                      <span className={cx('text-[11px] font-semibold', tx.direction === 'in' ? 'text-emerald-300' : 'text-rose-300')} dir="ltr">
+                        {tx.direction === 'in' ? '+' : '−'}{formatNumber(tx.magnitude, lang)}
                       </span>
                     </div>
                   ))}
@@ -1540,9 +1570,7 @@ export default function Resellers() {
                         <p className="text-[10px] text-slate-500">{formatBytes(row.stats?.usedBytes, lang)}</p>
                       </td>
                       <td>
-                        <span className={cx('text-[12px] font-semibold', Number(row.balance) > 0 ? 'text-emerald-300' : 'text-slate-400')}>
-                          {formatNumber(row.balance, lang)}
-                        </span>
+                        <BalanceValue value={row.balance} lang={lang} />
                       </td>
                       <td><span className="text-[11px] text-slate-400">{row.lastLoginAt ? relativeTime(row.lastLoginAt, lang) : '—'}</span></td>
                       <td><StatusBadge status={row.status} /></td>
@@ -1584,7 +1612,7 @@ export default function Resellers() {
                 </div>
                 <div className="mt-2.5 flex items-center justify-between text-[10.5px]">
                   <span className="text-slate-500">{t('common.balance')}</span>
-                  <span className="font-semibold text-emerald-300">{formatNumber(row.balance, lang)}</span>
+                  <BalanceValue value={row.balance} lang={lang} />
                 </div>
                 <div className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-white/[0.06] pt-2">
                   {row.role === 'reseller' ? (

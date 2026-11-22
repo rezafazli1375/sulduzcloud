@@ -17,7 +17,10 @@
  *   - every decision is audited and the reseller is notified in the panel;
  *   - an automated decision is audited as the system, never as an admin, because
  *     a sweep that credits a wallet has no person behind it to take the credit
- *     (or the blame).
+ *     (or the blame);
+ *   - since v2.3.0 an approved row can be voided (reverse()): the money comes
+ *     back as its own ledger line, the receipt keeps its original decision, and
+ *     the wallet may end below zero — the debt side of the same feature.
  *
  * Nothing here talks to Telegram: the bot layer delivers the messages, this layer
  * owns the data. That keeps the whole flow testable without a network.
@@ -34,7 +37,18 @@ const { notifyUser, notifyAdmins } = require('../notify');
 // ("50000000000") cannot empty or inflate a wallet by accident.
 const MAX_AMOUNT = 1_000_000_000;
 const MAX_PENDING_PER_USER = 10;
-const STATUSES = ['pending', 'approved', 'rejected'];
+// v2.3.0 adds 'reversed': a receipt that was approved and then found to be forged
+// or paid twice. It is kept as its own status instead of being rewritten to
+// 'rejected', because the two say different things about the wallet — 'rejected'
+// never moved money, 'reversed' moved it and had to take it back.
+const STATUSES = ['pending', 'approved', 'rejected', 'reversed'];
+// A row that is not pending was already decided somehow. v2.3.0 added a third
+// outcome, so the "already decided" answer cannot keep guessing between two
+// words — it would tell an admin a voided receipt had been rejected.
+const DECIDED_WORD = { approved: 'تایید', rejected: 'رد', reversed: 'ابطال' };
+function decidedWord(status) {
+  return DECIDED_WORD[String(status || '')] || 'بررسی';
+}
 
 // Every way money comes in, since v1.5.5: a deposit receipt a person (or the
 // schedule) settles, and a gateway order ZarinPal settles itself. 1.5.4 also offered
@@ -111,6 +125,11 @@ function view(row, extra = {}) {
     cardNumber: String(row.card_number || ''),
     paidAt: Number(row.paid_at || 0),
     autoApproved: Number(row.auto_approved || 0) === 1,
+    // v2.3.0: the cancellation is shown beside the original decision, never
+    // instead of it — the admin must still see who approved the row and when.
+    reversedBy: Number(row.reversed_by || 0),
+    reversedAt: Number(row.reversed_at || 0),
+    reverseNote: String(row.reverse_note || ''),
     createdAt: Number(row.created_at || 0),
     updatedAt: Number(row.updated_at || 0),
     ...extra,
@@ -209,18 +228,34 @@ function listRequests({
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS c FROM topup_requests t ${clause}`).get(...params).c;
   const rows = db.prepare(
-    `SELECT t.*, u.username, u.balance, d.username AS decided_by_name
+    `SELECT t.*, u.username, u.balance, d.username AS decided_by_name, r.username AS reversed_by_name
        FROM topup_requests t
        LEFT JOIN users u ON u.id = t.user_id
        LEFT JOIN users d ON d.id = t.decided_by
+       LEFT JOIN users r ON r.id = t.reversed_by
        ${clause} ORDER BY t.created_at DESC, t.id DESC LIMIT ? OFFSET ?`
   ).all(...params, limit, offset);
-  const counts = { pending: 0, approved: 0, rejected: 0 };
+  const counts = { pending: 0, approved: 0, rejected: 0, reversed: 0 };
   // The counters follow the same scope as the list: a reseller asking for his own
   // receipts must never learn how many the whole fleet has sent — and once the
   // admin filters by method, a tab that still counts the other methods lies to him.
   for (const row of db.prepare(`SELECT t.status, COUNT(*) AS c FROM topup_requests t ${clause} GROUP BY t.status`).all(...params)) {
     counts[row.status] = Number(row.c);
+  }
+  // v2.3.0, item 4: the owner reviews receipts to catch a forged or a twice-used
+  // one. The tracking code is the only handle he has for that, so the page counts
+  // how many rows already carry each reference on this page and marks the ones a
+  // duplicate. Read-only: nothing here decides anything, it only shows him where
+  // to look before he taps.
+  const refs = [...new Set(rows.map((row) => String(row.reference || '').trim()).filter(Boolean))];
+  const refCount = new Map();
+  if (refs.length) {
+    const marks = refs.map(() => '?').join(', ');
+    for (const hit of db.prepare(
+      `SELECT reference, COUNT(*) AS c FROM topup_requests WHERE reference IN (${marks}) GROUP BY reference`
+    ).all(...refs)) {
+      refCount.set(String(hit.reference), Number(hit.c));
+    }
   }
   return {
     total,
@@ -229,6 +264,8 @@ function listRequests({
       username: String(row.username || ''),
       balance: Number(row.balance || 0),
       decidedByName: String(row.decided_by_name || ''),
+      reversedByName: String(row.reversed_by_name || ''),
+      sameReference: refCount.get(String(row.reference || '').trim()) || 0,
     })),
   };
 }
@@ -256,7 +293,7 @@ function approve(id, { amount, note = '', actor = null, source = 'panel', auto =
   if (!row) throw new ApiError(404, 'not_found', 'Top-up request not found');
   if (row.status !== 'pending') {
     throw new ApiError(409, 'already_decided',
-      `این درخواست قبلاً ${row.status === 'approved' ? 'تایید' : 'رد'} شده است / This request was already decided`);
+      `این درخواست قبلاً ${decidedWord(row.status)} شده است / This request was already decided`);
   }
   // The admin may correct the number on the receipt; the reseller's own claim is
   // only the default.
@@ -446,7 +483,7 @@ function reject(id, { note = '', actor = null, source = 'panel' } = {}, req) {
   if (!row) throw new ApiError(404, 'not_found', 'Top-up request not found');
   if (row.status !== 'pending') {
     throw new ApiError(409, 'already_decided',
-      `این درخواست قبلاً ${row.status === 'approved' ? 'تایید' : 'رد'} شده است / This request was already decided`);
+      `این درخواست قبلاً ${decidedWord(row.status)} شده است / This request was already decided`);
   }
   const now = Date.now();
   const adminId = Number(actor?.id || 0);
@@ -474,6 +511,75 @@ function reject(id, { note = '', actor = null, source = 'panel' } = {}, req) {
   return getRequest(row.id);
 }
 
+/**
+ * Void a receipt that was approved and later found to be forged or paid twice
+ * (v2.3.0, the owner's item 4: «اگر یک فیش جعلی یا تکراری بود اون فیش رد و
+ * منقضی کنم از حساب نماینده کسر کنه»).
+ *
+ * Three things happen together, in one SQLite transaction:
+ *   - the row moves 'approved' → 'reversed'. The approve columns are left exactly
+ *     as they were, because "who let this through, and when" is the record the
+ *     owner is reviewing — a fake receipt that was auto-approved must still say
+ *     so afterwards. The cancellation is written next to it, not over it.
+ *   - the wallet is debited by the amount the row actually credited, through the
+ *     same adjustBalance() the panel and the bot use, so the ledger line, the
+ *     balance and the audit entry look like every other money move.
+ *   - the claw-back may take the wallet below zero (v2.3.0 debt). That is the
+ *     whole point: a reseller who paid with a fake receipt usually has already
+ *     spent the money, and refusing the debit would leave the fraud funded.
+ *
+ * The status update is again the lock — it only matches a row that is still
+ * 'approved', so two admins cannot claw the same receipt back twice.
+ */
+function reverse(id, { note = '', actor = null, source = 'panel' } = {}, req) {
+  const db = getDb();
+  const row = rowOf(id);
+  if (!row) throw new ApiError(404, 'not_found', 'Top-up request not found');
+  if (row.status !== 'approved') {
+    throw new ApiError(409, row.status === 'reversed' ? 'already_reversed' : 'not_approved',
+      row.status === 'reversed'
+        ? 'این فیش قبلاً باطل شده است / This receipt has already been reversed'
+        : `فقط فیش تایید‌شده را می‌توان باطل کرد؛ این ردیف «${decidedWord(row.status)}» است / Only an approved receipt can be reversed`);
+  }
+  const value = Math.round(Number(row.amount || 0));
+  if (!(value > 0)) throw new ApiError(422, 'invalid_amount', 'این ردیف مبلغی برای برگشت ندارد / This row has no amount to take back');
+  const now = Date.now();
+  const adminId = Number(actor?.id || 0);
+  const kind = String(row.method || 'receipt');
+  const label = METHOD_LABEL[kind] || METHOD_LABEL.receipt;
+  // Why the row is being cancelled is part of the record, not a comment: months
+  // later this is the only thing that says the receipt was forged, a duplicate,
+  // or a mistake.
+  const reason = String(note || '').slice(0, 500);
+  const description = `ابطال ${label} #${Number(row.id)} و کسر از کیف پول${reason ? ` — ${reason.slice(0, 120)}` : ''}`;
+  const actorReq = req || { user: { id: adminId, role: 'admin' } };
+  let result = null;
+  const tx = db.transaction(() => {
+    const changed = db.prepare(
+      `UPDATE topup_requests SET status = 'reversed', reversed_by = ?, reversed_at = ?, reverse_note = ?, updated_at = ?
+       WHERE id = ? AND status = 'approved'`
+    ).run(adminId, now, reason, now, Number(row.id));
+    if (Number(changed.changes) !== 1) {
+      throw new ApiError(409, 'already_reversed', 'این فیش هم‌زمان باطل شده است / This receipt was reversed at the same moment');
+    }
+    result = usersService.adjustBalance(Number(row.user_id), -value, description, actorReq);
+  });
+  tx();
+  const after = Number(result.balance || 0);
+  notifyUser(Number(row.user_id), {
+    type: 'warning',
+    title: `${label} باطل شد`,
+    body: `${label} #${Number(row.id)}${reason ? ` (${reason.slice(0, 200)})` : ''} باطل شد و ${value.toLocaleString('en-US')} از کیف پول شما کسر گردید. موجودی: ${after.toLocaleString('en-US')}`
+      + (after < 0 ? ` — موجودی شما ${(-after).toLocaleString('en-US')} بدهی است.` : ''),
+    link: '/wallet',
+  });
+  audit(actorReq, 'topup.reverse', 'topup', Number(row.id), {
+    userId: Number(row.user_id), amount: value, balance: after, note: reason,
+    source: String(source || 'panel'), method: kind, wasAutoApproved: Number(row.auto_approved) === 1,
+  });
+  return { ...getRequest(row.id), balance: after, clawedBack: value };
+}
+
 /** Where the admin's copy of a receipt was posted, so the bot can edit it later. */
 function rememberAdminMessage(id, chatId, messageId) {
   getDb().prepare('UPDATE topup_requests SET admin_chat_id = ?, admin_message_id = ?, updated_at = ? WHERE id = ?')
@@ -499,6 +605,7 @@ module.exports = {
   pendingCount,
   approve,
   reject,
+  reverse,
   runAutoApprove,
   rememberAdminMessage,
   view,
