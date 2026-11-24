@@ -169,16 +169,16 @@ export function ConfirmProvider({ children }) {
       {children}
       {state
         ? createPortal(
-            <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <div className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto overscroll-contain p-4">
               <div
-                className="absolute inset-0 bg-[#02040a]/75 backdrop-blur-sm"
+                className="absolute inset-0 bg-[#02040a]/75"
                 onClick={() => close(false)}
                 aria-hidden="true"
               />
               <div
                 role="dialog"
                 aria-modal="true"
-                className="surface relative w-full max-w-md rounded-2xl p-6"
+                className="surface-solid confirm-dialog relative my-auto w-full max-w-md overflow-y-auto rounded-2xl p-6"
                 style={{ animation: 'fadeUp .22s cubic-bezier(.22,1,.36,1)' }}
               >
                 <div className="flex items-start gap-3.5">

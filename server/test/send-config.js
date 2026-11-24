@@ -472,7 +472,7 @@ async function sendChecks() {
 
   check('the whole suite made zero network calls — the recorder saw everything',
     networkAttempts === 0, `attempts=${networkAttempts}`);
-  check('this build is v2.3.0', config.version === '2.3.0', config.version);
+  check('this build is v2.4.0', config.version === '2.4.0', config.version);
 }
 
 (async () => {

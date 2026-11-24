@@ -29,6 +29,7 @@ const { audit, systemAudit } = require('../audit');
 const { notifyUser } = require('../notify');
 const telegram = require('./telegram');
 const qrcode = require('./qrcode');
+const transactions = require('./transactions');
 // v2.1.0: the Trash snapshot. trash.js never requires this file (it takes the rows
 // the delete path is already holding), so this one-way edge cannot dead-lock.
 const trash = require('./trash');
@@ -300,7 +301,7 @@ function commissionFor(buyer, amount) {
   };
 }
 
-function chargeReseller(reseller, amount, description, type, req) {
+function chargeReseller(reseller, amount, description, type, req, configLink = null) {
   if (!billingEnabled() || !amount || amount <= 0) return null;
   const db = getDb();
   const current = usersService.getUser(reseller.id);
@@ -309,6 +310,8 @@ function chargeReseller(reseller, amount, description, type, req) {
   }
   const next = Number(current.balance || 0) - amount;
   const now = Date.now();
+  const configId = Number(configLink?.configId || 0);
+  const configSnapshot = configId ? String(configLink?.snapshot || '') : '';
   // Worked out BEFORE the debit and paid INSIDE the same transaction: a sale must
   // never happen without the commission it owed, and a broken referrer row must
   // never block a customer's package. commissionFor() already dropped the second
@@ -317,14 +320,14 @@ function chargeReseller(reseller, amount, description, type, req) {
   const tx = db.transaction(() => {
     db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE id = ?').run(next, now, current.id);
     db.prepare(
-      'INSERT INTO transactions (user_id, type, amount, balance_after, description, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(current.id, type, -amount, next, description, req?.user?.id || 0, now);
+      'INSERT INTO transactions (user_id, type, amount, balance_after, description, created_by, created_at, config_id, config_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(current.id, type, -amount, next, description, req?.user?.id || 0, now, configId, configSnapshot);
     if (commission) {
       const refRow = db.prepare('SELECT balance FROM users WHERE id = ?').get(commission.referrerId);
       const refBalance = Number(refRow?.balance || 0) + commission.commission;
       db.prepare('UPDATE users SET balance = ?, updated_at = ? WHERE id = ?').run(refBalance, now, commission.referrerId);
       db.prepare(
-        'INSERT INTO transactions (user_id, type, amount, balance_after, description, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        'INSERT INTO transactions (user_id, type, amount, balance_after, description, created_by, created_at, config_id, config_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
       ).run(
         commission.referrerId,
         'commission',
@@ -332,7 +335,9 @@ function chargeReseller(reseller, amount, description, type, req) {
         refBalance,
         `پورسانت ${commission.percent}٪ از خرید ${current.username} (${commission.paid.toLocaleString('en-US')}) — ${description}`,
         req?.user?.id || 0,
-        now
+        now,
+        configId,
+        configSnapshot
       );
       commission.balanceAfter = refBalance;
     }
@@ -1223,7 +1228,8 @@ async function createConfigs(input, req) {
           ? `خرید پلن «${String(input.planName || '').slice(0, 60) || `#${Number(input.planId || 0)}`}» (${gb} GB / ${days} روز)`
           : `ایجاد بسته ${inboundIds.length} اینباندی (${gb} GB مشترک / ${days} روز)`,
         'purchase',
-        req
+        req,
+        transactionConfig(getConfigRow(createdIds[0]), createdIds.map(getConfigRow))
       );
     }
   } catch (err) {
@@ -1742,7 +1748,8 @@ async function extendConfig(id, { gb = 0, days = 0, price = 0, resetUsage = fals
             ? `تمدید جایگزین بسته ${targets.length} اینباندی (${gb}GB / ${addDays}d، مصرف صفر)`
             : `تمدید بسته ${targets.length} اینباندی (+${gb}GB مشترک / +${addDays}d)`,
         'renew',
-        req
+        req,
+        transactionConfig(row, targets)
       );
     }
   } catch (err) {
@@ -2259,26 +2266,12 @@ async function transferCustomer(id, payload = {}, req, viewer, opts = {}) {
     throw new ApiError(409, 'reseller_inactive', `نمایندۀ «${target.username}» غیرفعال است / That reseller is not active`);
   }
 
-  // The two rules that would leave the customer in a state the new owner cannot
-  // manage: a channel he has no permission for, and his own caps. isUsableBy is
-  // the same predicate the create form and addInbound use, so a transfer never
-  // passes where an order would have been refused.
-  const allowed = usersService.allowedInboundIds(target);
-  const fixedId = usersService.fixedInboundId(target);
-  const blocked = [];
-  for (const member of members) {
-    const inbound = getInboundRow(member.inbound_id);
-    if (inboundsService.isUsableBy(inbound, { allowed, fixedId, isAdmin: false })) continue;
-    blocked.push({
-      configId: Number(member.id),
-      inboundId: Number(member.inbound_id),
-      inbound: inbound ? `${inbound.remark || `#${inbound.xui_id}`} · ${inbound.protocol}` : `#${member.inbound_id}`,
-    });
-  }
-  if (blocked.length) {
-    throw new ApiError(409, 'inbound_not_allowed',
-      `«${target.username}» به ${blocked.map((item) => item.inbound).join('، ')} دسترسی ندارد — اول از ویرایش نماینده اجازه بدهید / The target reseller has no permission for these channels — grant them first`);
-  }
+  // v2.4.0: moving an existing customer is an ownership hand-over, not a new
+  // order. The owner's rule is that channel permissions must not block it: a
+  // reseller can receive a package even when those inbounds are hidden from the
+  // create form. Keep the real safety checks below — duplicate ownership and the
+  // target's ceilings — but do not apply isUsableBy() here. Creation and
+  // addInbound still enforce their own permissions.
 
   // configs has UNIQUE(email, inbound_id), so a customer the target already holds
   // on any of these channels would turn the rewrite into an SQLite constraint
@@ -2387,10 +2380,11 @@ async function transferCustomer(id, payload = {}, req, viewer, opts = {}) {
 // client this panel already holds belongs to somebody and has to be MOVED
 // (transferCustomer, whole package, ledger follows), while a client nobody here
 // holds has to be ADOPTED (adoptNodeClient, one row per known channel). Both are
-// called as they are, so every guard those two already have — channel permission,
-// the target's ceilings, the UNIQUE(email, inbound_id) clash, adoption switched
-// off, a client the node no longer has — decides each item here too. Nothing is
-// re-implemented and nothing is loosened for the batch.
+// called as they are, so every guard those two already have — the target's
+// ceilings, the UNIQUE(email, inbound_id) clash, adoption switched off, a client
+// the node no longer has — decides each item here too. Since v2.4.0 a transfer
+// deliberately ignores channel permission, because it moves an existing package
+// instead of opening a new order.
 //
 // A batch is deliberately NOT one transaction. Twenty customers can fail for
 // twenty different reasons (one channel the target may not sell, one ceiling, one
@@ -3338,6 +3332,21 @@ function packageKeyOf(row) {
 }
 
 /**
+ * v2.4.0: the immutable customer identity attached to a wallet line. The row
+ * being charged is the stable package anchor; the small snapshot keeps its display name and
+ * channels readable after a transfer, rename or hard delete. No UUID, subscription
+ * token, phone number or node credential is copied into the ledger.
+ */
+function transactionConfig(row, members = packageRows(row)) {
+  const list = (Array.isArray(members) ? members : [row]).filter(Boolean);
+  if (!list.length) return { configId: 0, snapshot: '' };
+  const anchor = list.find((item) => Number(item.id) === Number(row?.id)) || list[0];
+  const inboundIds = [...new Set(list.map((item) => Number(item.inbound_id ?? item.inboundId ?? 0)).filter((id) => id > 0))];
+  const inbounds = inboundIds.map(getInboundRow).filter(Boolean);
+  return transactions.capture(anchor, list, inbounds);
+}
+
+/**
  * Group panel rows by the x-ui CLIENT they stand for. A package the panel made
  * has one client per row (distinct emails sharing a token), so this returns
  * single-row groups and behaves exactly as before. An adopted customer is ONE
@@ -3585,7 +3594,14 @@ async function attachInbound(row, inbound, req, { free = false, healed = false }
     })();
     insertedId = Number(info.lastInsertRowid);
     if (billingEnabled() && amount > 0) {
-      chargeReseller(user, amount, `افزودن اینباند ${inbound.remark} به ${row.customer_name || email}`, 'purchase', req);
+      chargeReseller(
+        user,
+        amount,
+        `افزودن اینباند ${inbound.remark} به ${row.customer_name || email}`,
+        'purchase',
+        req,
+        transactionConfig(row)
+      );
     }
   } catch (err) {
     // Undo only what this call added: the channel comes off the client again.

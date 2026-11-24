@@ -238,9 +238,16 @@ CREATE TABLE IF NOT EXISTS transactions (
   balance_after INTEGER NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   created_by INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  -- v2.4.0: which package this money bought or renewed. The snapshot keeps the
+  -- customer's display identity from that moment; 0 means an older/ambiguous
+  -- ledger line that must not be guessed.
+  config_id INTEGER NOT NULL DEFAULT 0,
+  config_snapshot TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, created_at);
+-- v2.4.0: idx_transactions_config is created by migrate(), after old databases
+-- have gained config_id. Creating it in SCHEMA would break every v2.3.0 upgrade.
 
 -- v1.5.2: a reseller's payment receipt, sent through the Telegram bot and decided
 -- by the admin. The wallet only moves when a row here reaches 'approved', and the
@@ -417,7 +424,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 
 function ensureColumn(db, table, column, ddl) {
   const exists = db.prepare(`PRAGMA table_info(${table})`).all().some((row) => row.name === column);
-  if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  if (exists) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  return true;
 }
 
 function migrate(db) {
@@ -501,6 +510,24 @@ function migrate(db) {
     ['reversed_at', 'INTEGER NOT NULL DEFAULT 0'],
     ['reverse_note', "TEXT NOT NULL DEFAULT ''"],
   ]) ensureColumn(db, 'topup_requests', column, ddl);
+
+  // Panel v2.4.0 — item 2: purchase/renew lines name the config they paid for.
+  // Both additions are safe on an old book: existing rows keep their money and
+  // description, gain config_id = 0, and are linked only when an audit proves one
+  // unambiguous match. New writes capture the identity at the moment of sale.
+  // The index must wait until AFTER these columns exist. The one-time recovery
+  // runs only when this upgrade actually adds a column, so unmatched historical
+  // rows are not rescanned synchronously on every restart.
+  const addedConfigId = ensureColumn(db, 'transactions', 'config_id', 'INTEGER NOT NULL DEFAULT 0');
+  const addedSnapshot = ensureColumn(db, 'transactions', 'config_snapshot', "TEXT NOT NULL DEFAULT ''");
+  db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_config ON transactions(config_id, created_at)');
+  if (addedConfigId || addedSnapshot) {
+    const { backfillLegacy } = require('./services/transactions');
+    const recovered = backfillLegacy(db);
+    if (recovered.linked || recovered.ambiguous) {
+      console.log(`[db] transaction config links recovered=${recovered.linked} ambiguous_left=${recovered.ambiguous}`);
+    }
+  }
 }
 
 /**

@@ -462,7 +462,7 @@ function UserMenu() {
   };
 
   return (
-    <div className="relative" ref={ref}>
+    <div className="relative shrink-0" ref={ref}>
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
@@ -476,7 +476,7 @@ function UserMenu() {
         <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
       </button>
       {open ? (
-        <div className="absolute end-0 top-12 z-50 w-64 overflow-hidden rounded-2xl border border-white/10 bg-[#070c17]/98 shadow-[0_30px_80px_-24px_#000] backdrop-blur-xl animate-fadeUp">
+        <div className="user-menu-popover absolute end-0 top-12 z-50 overflow-y-auto overscroll-contain rounded-2xl border border-white/10 bg-[#070c17] shadow-[0_30px_80px_-24px_#000] animate-fadeUp">
           <div className="border-b border-white/[0.06] px-4 py-3.5">
             <div className="flex items-center gap-2.5">
               <Avatar name={user?.name || user?.username} />

@@ -12,6 +12,7 @@ const usersService = require('../services/users');
 const inboundsService = require('../services/inbounds');
 const serversService = require('../services/servers');
 const configsService = require('../services/configs');
+const transactionsService = require('../services/transactions');
 const pricing = require('../services/pricing');
 const plansService = require('../services/plans');
 const statsService = require('../services/stats');
@@ -190,11 +191,13 @@ router.get('/users/:id', auth.requirePerm('users'), (req, res) => {
         fleetPercent: Math.max(0, Math.min(50, Math.round(Number(settings.getSetting('billing').commissionPercent || 0)))),
       },
       stats: usersService.userStats(user.id),
-      transactions: transactions.map((t) => ({
+      transactions: transactionsService.presentRows(db, transactions).map((t) => ({
         id: t.id,
         type: t.type,
         // v2.3.0, item 3: one direction rule for every transaction read-out.
         ...txMoney(t),
+        configId: t.configId,
+        config: t.config,
         balanceAfter: t.balance_after,
         description: t.description,
         createdAt: t.created_at,
@@ -915,12 +918,14 @@ router.get('/transactions', auth.requirePerm('stats'), (req, res) => {
       sums,
       debt,
       actors,
-      rows: rows.map((r) => ({
+      rows: transactionsService.presentRows(db, rows).map((r) => ({
         id: r.id,
         userId: r.user_id,
         username: r.username || `#${r.user_id}`,
         type: r.type,
         ...txMoney(r),
+        configId: r.configId,
+        config: r.config,
         balanceAfter: r.balance_after,
         description: r.description,
         createdBy: r.created_by,

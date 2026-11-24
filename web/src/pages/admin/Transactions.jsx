@@ -48,6 +48,101 @@ const TYPE_TONE = {
   commission: 'amber',
 };
 
+const CONFIG_TX_TYPES = new Set(['purchase', 'renew', 'commission']);
+const RAW_UUID = /[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/i;
+const COMPACT_UUID = /^[0-9a-f]{32}$/i;
+const CONFIG_URI = /\b[a-z][a-z0-9+.-]*:\/\/\S+/i;
+const MAX_TX_INBOUNDS = 2;
+
+// Imported x-ui clients can use a UUID as their email/remark. Keep identifiers
+// and subscription links out of the ledger instead of exposing those tokens.
+function safeConfigText(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  if (!text || RAW_UUID.test(text) || COMPACT_UUID.test(text) || CONFIG_URI.test(text)) return '';
+  return text;
+}
+
+function txConfigId(row) {
+  if (!CONFIG_TX_TYPES.has(row?.type) || !row?.config || typeof row.config !== 'object' || Array.isArray(row.config)) return null;
+  const id = Number(row.configId ?? row.config.id);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function txInboundSummary(inbound, lang) {
+  const remark = safeConfigText(inbound?.remark);
+  const protocol = safeConfigText(inbound?.protocol);
+  const nodeName = safeConfigText(inbound?.nodeName);
+  const port = Number(inbound?.port);
+  const portLabel = Number.isInteger(port) && port > 0 && port <= 65535
+    ? `:${formatNumber(port, lang)}`
+    : '';
+  return [remark, protocol, portLabel, nodeName].filter(Boolean).join(' · ');
+}
+
+/** Historical package details attached to a purchase, renewal or commission. */
+function TxConfig({ row, mobile = false }) {
+  const { t, lang } = useI18n();
+  const configId = txConfigId(row);
+  if (configId === null) return null;
+
+  const config = row.config;
+  const identities = [config.customerName, config.label, config.email]
+    .map(safeConfigText)
+    .filter((value, index, list) => value && list.indexOf(value) === index);
+  const identity = identities[0] || t('common.unknown');
+  const secondaryIdentity = identities.slice(1).join(' · ');
+  const description = safeConfigText(row.description);
+  const summaries = (Array.isArray(config.inbounds) ? config.inbounds : [])
+    .map((inbound) => txInboundSummary(inbound, lang))
+    .filter(Boolean);
+  const shownInbounds = summaries.slice(0, MAX_TX_INBOUNDS);
+  const hiddenInbounds = summaries.length - shownInbounds.length;
+  const textClass = mobile ? 'line-clamp-2 break-words leading-4' : 'truncate';
+
+  return (
+    <div className="min-w-0 space-y-1">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-[10.5px] font-semibold text-cyan-200" dir="auto">
+          {t('transactions.configNumber', { id: formatNumber(configId, lang) })}
+        </span>
+        {config.deleted === true || config.deleted === 1 ? (
+          <Badge tone="rose" className="px-1.5 py-0 text-[9px]">{t('transactions.deletedPackage')}</Badge>
+        ) : null}
+      </div>
+      <p className={cx('text-[11px] font-medium text-slate-200', textClass)} dir="auto" title={identity}>
+        {identity}
+      </p>
+      {secondaryIdentity ? (
+        <p className={cx('text-[10px] text-slate-500', textClass)} dir="auto" title={secondaryIdentity}>
+          {secondaryIdentity}
+        </p>
+      ) : null}
+      {shownInbounds.length ? (
+        <ul className="space-y-0.5" aria-label={t('common.inbounds')}>
+          {shownInbounds.map((summary, index) => (
+            <li key={index} className={cx('text-[10px] text-slate-400', textClass)} dir="auto" title={summary}>
+              {summary}
+            </li>
+          ))}
+          {hiddenInbounds > 0 ? (
+            <li className="text-[9.5px] text-slate-500">
+              {t('transactions.moreInbounds', { n: formatNumber(hiddenInbounds, lang) })}
+            </li>
+          ) : null}
+        </ul>
+      ) : (
+        <p className="text-[10px] leading-4 text-slate-500">{t('transactions.noInboundDetails')}</p>
+      )}
+      {description ? (
+        <p className={cx('text-[10px] text-slate-500', textClass)} dir="auto" title={description}>
+          {description}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 /** One money line: sign and colour come from `direction`, never from the number. */
 function TxAmount({ row, lang, size = 'sm' }) {
   const credit = row.direction === 'in';
@@ -227,7 +322,11 @@ export default function Transactions() {
                         {Number(row.balanceAfter) < 0 ? ` ${t('common.debt')}` : ''}
                       </td>
                       <td className="max-w-[320px]">
-                        <p className="truncate text-[11px] text-slate-300" title={row.description || ''}>{row.description || '—'}</p>
+                        {txConfigId(row) === null ? (
+                          <p className="truncate text-[11px] text-slate-300" title={row.description || ''}>{row.description || '—'}</p>
+                        ) : (
+                          <TxConfig row={row} />
+                        )}
                       </td>
                       <td className="whitespace-nowrap text-[10.5px] text-slate-500">
                         {row.createdByName || t('transactions.bySystem')}
@@ -248,7 +347,11 @@ export default function Transactions() {
                   <Link to="/resellers" className="min-w-0 truncate text-[12px] font-semibold text-slate-100">{row.username}</Link>
                   <span className="ms-auto"><TxAmount row={row} lang={lang} size="base" /></span>
                 </div>
-                <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-slate-400">{row.description || '—'}</p>
+                {txConfigId(row) === null ? (
+                  <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-slate-400">{row.description || '—'}</p>
+                ) : (
+                  <div className="mt-1"><TxConfig row={row} mobile /></div>
+                )}
                 <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
                   <span>{formatDate(row.createdAt, lang, true)}</span>
                   <span>·</span>

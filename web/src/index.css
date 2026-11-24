@@ -129,6 +129,20 @@ body::after {
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.035) inset, 0 26px 70px -40px rgba(0, 0, 0, 0.95);
   }
 
+  /* The vh fallback keeps older mobile WebViews usable; dvh excludes browser
+     chrome on current phones, including short landscape viewports. */
+  .confirm-dialog {
+    max-height: calc(100vh - 2rem);
+    max-height: calc(100dvh - 2rem);
+  }
+
+  .user-menu-popover {
+    width: 16rem;
+    max-width: calc(100vw - 2rem);
+    max-height: calc(100vh - 5rem);
+    max-height: calc(100dvh - 5rem);
+  }
+
   .card {
     @apply surface rounded-2xl;
   }

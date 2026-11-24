@@ -1,6 +1,6 @@
 {
   "name": "sulduzcloud",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "private": true,
   "description": "Sulduz Cloud - Reseller VPN Management Panel",
   "main": "src/index.js",
@@ -15,6 +15,8 @@
     "bot-test": "node test/bot-topup.js",
     "payment-test": "node test/payment.js",
     "send-test": "node test/send-config.js",
+    "transactions-test": "node test/transactions.js",
+    "migration-test": "node test/migration240.js",
     "admin": "node scripts/admin-cli.js"
   },
   "engines": {

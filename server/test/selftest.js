@@ -5255,38 +5255,34 @@ function startMockXui(inboundRows) {
             && Number(cfg25(pkgId25).user_id) === srcId25,
           codes25.join(' '));
 
-        // The permission rule is the one the create form already honours (v1.5.1):
-        // a VISIBLE channel is every reseller's, whatever his allow list says, so
-        // the only way a target can be blocked is a hidden channel he was never
-        // granted. Both of his channels go hidden, and the three answers below are
-        // the three states of that — no grant, half a grant, the whole grant.
+        // v2.4.0: channel permission controls NEW orders, not an ownership move.
+        // A hidden channel with no grant must not block the transfer preview or
+        // the real hand-over; a partial grant is equally irrelevant.
         const grant25 = async (ids) => (await request('PATCH', `/api/admin/users/${perm25.id}`, {
           cookies, csrf, body: { allowed_inbounds: ids },
         })).status === 200;
         tdb.prepare('UPDATE inbounds SET visible = 0 WHERE id IN (901, 902)').run();
         const granted0 = await grant25([903]);
-        const blocked25 = await move25(pkgId25, { toUserId: perm25.id });
-        check('a target with no grant for these channels is refused before anything is written',
-          granted0 && blocked25.status === 409 && code25(blocked25) === 'inbound_not_allowed'
-            && Number(cfg25(pkgId25).user_id) === srcId25,
-          `status=${blocked25.status} code=${code25(blocked25)}`);
-        const granted1 = await grant25([901]);
-        const half25 = await move25(pkgId25, { toUserId: perm25.id });
-        check('half the channels is still half the subscription: the whole move waits for the rest',
-          granted1 && half25.status === 409 && code25(half25) === 'inbound_not_allowed'
-            && Number(cfg25(pkgId25).user_id) === srcId25,
-          `msg=${String(half25.json?.error?.message || '').slice(0, 70)}`);
-        const granted2 = await grant25([901, 902]);
-        const grantedMove25 = await move25(pkgId25, { toUserId: perm25.id });
-        check('and a grant for both is enough, hidden or not — the same rule an order follows',
-          granted2 && grantedMove25.status === 200 && grantedMove25.json?.data?.moved === 2
+        const previewBlocked25 = await move25(pkgId25, { toUserId: perm25.id, dryRun: true });
+        const movedNoGrant25 = await move25(pkgId25, { toUserId: perm25.id });
+        check('v2.4.0 a target with no grant for these channels can preview and receive the whole package',
+          granted0 && previewBlocked25.status === 200 && previewBlocked25.json?.data?.moved === 0
+            && movedNoGrant25.status === 200 && movedNoGrant25.json?.data?.moved === 2
             && rowsOf25(pkgEmail25).every((row) => Number(row.user_id) === perm25.id),
-          `status=${grantedMove25.status} code=${code25(grantedMove25)}`);
+          `preview=${previewBlocked25.status} moved=${movedNoGrant25.status}:${code25(movedNoGrant25)}`);
+        const granted1 = await grant25([901]);
+        const movedHalfGrant25 = await move25(pkgId25, { toUserId: srcId25 });
+        const returnedHalfGrant25 = await move25(pkgId25, { toUserId: perm25.id });
+        check('a partial grant changes nothing: ownership can move in both directions',
+          granted1 && movedHalfGrant25.status === 200 && returnedHalfGrant25.status === 200
+            && rowsOf25(pkgEmail25).every((row) => Number(row.user_id) === perm25.id),
+          `back=${movedHalfGrant25.status}:${code25(movedHalfGrant25)} again=${returnedHalfGrant25.status}:${code25(returnedHalfGrant25)}`);
+        const granted2 = await grant25([901, 902]);
+        const returnedFullGrant25 = await move25(pkgId25, { toUserId: srcId25 });
         tdb.prepare('UPDATE inbounds SET visible = 1 WHERE id IN (901, 902)').run();
-        const backToSrc25 = await move25(pkgId25, { toUserId: srcId25 });
-        check('putting the channels back in view puts the customer back where he started',
-          backToSrc25.status === 200 && Number(cfg25(pkgId25).user_id) === srcId25 && live25(perm25.id) === 0,
-          `status=${backToSrc25.status} owner=${cfg25(pkgId25).user_id}`);
+        check('putting the channels back in view still puts the customer back where he started',
+          granted2 && returnedFullGrant25.status === 200 && Number(cfg25(pkgId25).user_id) === srcId25 && live25(perm25.id) === 0,
+          `status=${returnedFullGrant25.status} owner=${cfg25(pkgId25).user_id}`);
 
         // His caps are checked too, so a move cannot smuggle past max_configs.
         const cappedBuild25 = await request('POST', '/api/admin/configs', {
@@ -5411,7 +5407,7 @@ function startMockXui(inboundRows) {
             && onNode25(pkgEmail25) === LINE25('برچسب نماینده'),
           `status=${newOwnerRename25.status} node="${onNode25(pkgEmail25)}"`);
         const wireVersion25 = (await request('GET', '/api/health')).json?.version;
-        check('this build is v2.3.0 on the wire too', wireVersion25 === '2.3.0', `version=${wireVersion25}`);
+        check('this build is v2.4.0 on the wire too', wireVersion25 === '2.4.0', `version=${wireVersion25}`);
       } finally {
         if (lifted25) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit25 } });
         tdb.close();
@@ -5708,6 +5704,37 @@ function startMockXui(inboundRows) {
               && String(row.customer_name) === 'مشتری تکی' && String(row.customer_phone) === '09120000000')
             && notes26(dst26.id, 'کانفیگ به لیست شما اضافه شد').length === 1,
           `adopted=${sa26.adopted} label=${soloRows26[0]?.label} note=${notes26(dst26.id, 'کانفیگ به لیست شما اضافه شد').length}`);
+
+        // v2.4.0: the search page's batch path must be just as permission-blind
+        // as the single transfer. Use a fresh target so earlier count assertions
+        // stay meaningful, and put the package back before the final node guard.
+        const noGrant26 = await mkUser26('bulknogrant');
+        await request('PATCH', `/api/admin/users/${noGrant26.id}`, { cookies, csrf, body: { allowed_inbounds: [903] } });
+        const vis26 = bdb.prepare('SELECT id, visible FROM inbounds WHERE id IN (901, 902) ORDER BY id').all();
+        bdb.prepare('UPDATE inbounds SET visible = 0 WHERE id IN (901, 902)').run();
+        try {
+          const noGrantPreview26 = await bulk26([item26(pkgC26.email)], noGrant26.id, { dryRun: true });
+          const noGrantRun26 = await bulk26([item26(pkgC26.email)], noGrant26.id);
+          const landedNoGrant26 = rowsOf26(pkgC26.email);
+          const returned26 = await bulk26([item26(pkgC26.email)], dst26.id);
+          const noGrantPreviewData26 = noGrantPreview26.json?.data || {};
+          const noGrantRunData26 = noGrantRun26.json?.data || {};
+          const returnedData26 = returned26.json?.data || {};
+          check('v2.4.0 bulk search transfer ignores hidden and ungranted inbounds too',
+            noGrant26.id > 0 && noGrantPreview26.status === 200 && noGrantPreviewData26.moved === 1
+              && noGrantRun26.status === 200 && noGrantRunData26.moved === 1
+              && landedNoGrant26.length > 0
+              && landedNoGrant26.every((row) => Number(row.user_id) === noGrant26.id)
+              && returned26.status === 200 && returnedData26.moved === 1
+              && rowsOf26(pkgC26.email).every((row) => Number(row.user_id) === dst26.id),
+            `preview=${noGrantPreview26.status}:${code26(noGrantPreview26)} moved=${noGrantPreviewData26.moved} failed=${noGrantPreviewData26.failed} results=${JSON.stringify(noGrantPreviewData26.results || [])}`
+              + ` run=${noGrantRun26.status}:${code26(noGrantRun26)} moved=${noGrantRunData26.moved} failed=${noGrantRunData26.failed} results=${JSON.stringify(noGrantRunData26.results || [])}`
+              + ` back=${returned26.status}:${code26(returned26)} moved=${returnedData26.moved} failed=${returnedData26.failed} results=${JSON.stringify(returnedData26.results || [])}`
+              + ` ids=src:${src26.id} dst:${dst26.id} noGrant:${noGrant26.id} targets=${noGrantPreviewData26.toUserId}/${noGrantRunData26.toUserId}/${returnedData26.toUserId}`
+              + ` owners=${rowsOf26(pkgC26.email).map((row) => Number(row.user_id)).join(',')}`);
+        } finally {
+          for (const row of vis26) bdb.prepare('UPDATE inbounds SET visible = ? WHERE id = ?').run(Number(row.visible), Number(row.id));
+        }
         check('the whole v1.5.6 block never wrote to a node: handing over is a panel-only fact',
           writes26(blockStart26).length === 0,
           `writes=${writes26(blockStart26).join(',') || 'none'}`);
@@ -7339,6 +7366,14 @@ function startMockXui(inboundRows) {
             && Math.abs(Number(planPurchase23.amount)) === 100 && Number(planPurchase23.balance_after) === 4900
             && balance23(grantId23) === 4900,
           `line=${planPurchase23.amount}/${planPurchase23.balance_after} balance=${balance23(grantId23)}`);
+        const planSnap23 = JSON.parse(String(planPurchase23.config_snapshot || 'null'));
+        check('v2.4.0 the purchase line points to the exact config and keeps only display-safe details',
+          Number(planPurchase23.config_id) === Number(boughtRows23[0].id)
+            && planSnap23?.email === String(boughtRows23[0].email)
+            && planSnap23?.inbounds?.length === 1
+            && !/secret|uuid|sub_id|customer_phone/i.test(String(planPurchase23.config_snapshot))
+            && !String(planPurchase23.config_snapshot).includes(String(boughtRows23[0].uuid)),
+          `config=${planPurchase23.config_id}/${boughtRows23[0].id} snapshot=${String(planPurchase23.config_snapshot).slice(0, 140)}`);
 
         const directTry23 = await request('POST', '/api/reseller/configs', {
           cookies: noGrant23.cookies, csrf: noGrant23.csrf,
@@ -7461,6 +7496,15 @@ function startMockXui(inboundRows) {
           realRun23.status === 200 && Number(realData23.renewed) === 2 && Number(realData23.amount) === 550
             && balance23(bulkId23) === 450 && ledger23(bulkId23).filter((row) => row.type === 'renew').length === 2,
           `status=${realRun23.status} renewed=${realData23.renewed} amount=${realData23.amount} balance=${balance23(bulkId23)}`);
+        const renewLines23 = ledger23(bulkId23).filter((row) => row.type === 'renew');
+        const renewSnaps23 = renewLines23.map((row) => JSON.parse(String(row.config_snapshot || 'null')));
+        check('v2.4.0 each renewal names its own package, including every inbound of a multi-inbound customer',
+          renewLines23.length === 2
+            && renewLines23.map((row) => Number(row.config_id)).sort((a, b) => a - b)
+              .join(',') === [pkgA23.ids[0], pkgB23.ids[0]].sort((a, b) => a - b).join(',')
+            && renewSnaps23.map((snap) => snap?.inbounds?.length).sort((a, b) => a - b).join(',') === '1,2'
+            && renewSnaps23.every((snap) => snap?.email && !/"uuid"|"sub_id"|"customer_phone"/i.test(JSON.stringify(snap))),
+          `links=${renewLines23.map((row) => `${row.config_id}:${row.config_snapshot?.length || 0}`).join(',')}`);
         const rowsA23 = alive23(pkgA23.email);
         const clientA23 = mockXui.clients.get(pkgA23.email) || {};
         check('the shared pool stays shared: two rows, one client, one volume',
@@ -7581,6 +7625,18 @@ function startMockXui(inboundRows) {
             && mineRows23.every((row) => Number(row.userId) === Number(bulkId23))
             && Number(data23(bookMine23).filters?.userId) === Number(bulkId23),
           `rows=${mineRows23.length} filters=${JSON.stringify(data23(bookMine23).filters || {})}`);
+        const deletedDetail23 = mineRows23.find((row) => row.type === 'renew' && Number(row.configId) === Number(pkgA23.ids[0]));
+        const restoredDetail23 = mineRows23.find((row) => row.type === 'renew' && Number(row.configId) === Number(pkgB23.ids[0]));
+        const plainMoney23 = mineRows23.filter((row) => ['credit', 'debit'].includes(row.type));
+        const restoredAnchor23 = tdb.prepare('SELECT id, user_id, server_id, email, deleted_at FROM configs WHERE id = ?').get(Number(pkgB23.ids[0]));
+        const restoredTrash23 = tdb.prepare('SELECT id, head_config_id, restored_at FROM config_trash WHERE email = ? ORDER BY id').all(pkgB23.email);
+        check('v2.4.0 the ledger API explains deleted and restored packages without touching money rows',
+          deletedDetail23?.config?.deleted === true && deletedDetail23.config.email === pkgA23.email
+            && restoredDetail23?.config?.deleted === false && restoredDetail23.config.email === pkgB23.email
+            && plainMoney23.every((row) => Number(row.configId) === 0 && row.config === null),
+          `deleted=${deletedDetail23?.config?.deleted}/${deletedDetail23?.config?.email} restored=${restoredDetail23?.config?.deleted}/${restoredDetail23?.config?.email} plain=${plainMoney23.length}`
+            + ` anchor=${pkgB23.ids[0]} db=${JSON.stringify(restoredAnchor23)} live=${JSON.stringify(alive23(pkgB23.email).map((row) => ({ id: row.id, user_id: row.user_id, server_id: row.server_id, deleted_at: row.deleted_at })))}`
+            + ` trash=${JSON.stringify(restoredTrash23)} detail=${JSON.stringify(restoredDetail23?.config)}`);
 
         const bookRenew23 = await book23('type=renew&pageSize=200');
         const renewRows23 = data23(bookRenew23).rows || [];
@@ -7638,6 +7694,18 @@ function startMockXui(inboundRows) {
             && Number(page2Data23.page) === 2 && Number(page2Data23.total) === Number(data23(bookAll23).total)
             && Number(page2Data23.debt) === Number(data23(bookAll23).debt),
           `page=${page2Data23.page} total=${page2Data23.total}/${data23(bookAll23).total} debt=${page2Data23.debt}/${data23(bookAll23).debt}`);
+
+        tdb.prepare('UPDATE users SET referrer_id = ?, commission_percent = 0 WHERE id = ?').run(otherId23, grantId23);
+        await request('PATCH', '/api/admin/settings/billing', { cookies, csrf, body: { enabled: true, commissionPercent: 5 } });
+        const commissionRenew23 = await extendAdmin23({ ids: [Number(boughtRows23[0].id)], gb: 1, days: 0, charge: true });
+        const buyerCommissionLine23 = ledger23(grantId23).filter((row) => row.type === 'renew').slice(-1)[0] || {};
+        const referrerLine23 = ledger23(otherId23).filter((row) => row.type === 'commission').slice(-1)[0] || {};
+        check('v2.4.0 the matching commission carries the same package link as the purchase it paid on',
+          commissionRenew23.status === 200 && Number(buyerCommissionLine23.config_id) > 0
+            && Number(referrerLine23.config_id) === Number(buyerCommissionLine23.config_id)
+            && String(referrerLine23.config_snapshot) === String(buyerCommissionLine23.config_snapshot)
+            && Number(referrerLine23.amount) > 0,
+          `buyer=${buyerCommissionLine23.config_id} referrer=${referrerLine23.config_id} amount=${referrerLine23.amount}`);
       } catch (err) {
         fail += 1;
         console.log(`  FAIL v2.3.0 block threw — ${err.message}`);
