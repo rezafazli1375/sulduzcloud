@@ -1950,6 +1950,146 @@ function startMockXui(inboundRows) {
     });
     check('the package pool can be restored to its original size',
       quotaBack.status === 200 && quotaBack.json?.data?.config?.totalBytes === 10 * gbUnit);
+    // v2.4.2 — THE STALE VOLUME BUG. A customer whose package really holds 30 GB on
+    // the node was shown as 20 GB and switched off at 20. The background sync
+    // copied every field of the x-ui client back to its own rows EXCEPT the
+    // volume, so a number changed on the node — in x-ui itself, or by another
+    // panel sharing that node — never reached the panel, and the shared-pool
+    // cutoff worked from the stale copy. A three-inbound package on one client is
+    // the shape the bug was reported on.
+    const q242Email = multiConfigs[0].email;
+    const q242Ids = multiConfigs.map((config) => Number(config.id));
+    const readQ242 = () => {
+      const Database = require('better-sqlite3');
+      const handle = new Database(path.join(DATA_DIR, 'panel.db'));
+      try {
+        return handle.prepare(
+          `SELECT id, total_bytes, sync_status, enabled FROM configs WHERE id IN (${q242Ids.map(() => '?').join(',')}) ORDER BY id`
+        ).all(...q242Ids);
+      } finally {
+        handle.close();
+      }
+    };
+    const nodeQ242 = () => mockXui.clients.get(q242Email) || {};
+    const poolRowQ242 = async () => {
+      const list = await request('GET', `/api/reseller/configs?search=${customerSearch}`, { cookies: shopCookies });
+      return list.json?.data?.rows?.[0] || {};
+    };
+    // POST /api/admin/sync is monitor.runCycle('manual'), and runCycle hands back
+    // the PREVIOUS result, without doing any work, when a timer cycle is still in
+    // flight. Each check below edits the node and then needs the panel to have
+    // read that edit, so a call that answered 200 is not enough: the cycle that
+    // answered must be a manual one that started after the last one we accepted.
+    let q242CycleAt = 0;
+    const syncNow = async () => {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const res = await request('POST', '/api/admin/sync', { cookies, csrf });
+        const at = Number(res.json?.data?.at || 0);
+        if (res.status === 200 && res.json?.data?.reason === 'manual' && at > q242CycleAt) {
+          q242CycleAt = at;
+          return res;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      throw new Error('the monitor never ran a fresh manual cycle');
+    };
+    // The node now says 30 GiB while the panel still says 20 — no, 10 here, the
+    // size this fixture was left at — and the customer has used more than the
+    // panel's number but less than the real one.
+    nodeQ242().totalGB = 30 * gbUnit;
+    bumpClient(multiConfigs[0], 6 * gbUnit, 6 * gbUnit);
+    const mirrorSync = await syncNow();
+    const mirrorCounters = mirrorSync.json?.data?.configs || {};
+    const mirrorRow = await poolRowQ242();
+    check('the volume the node declares is mirrored into every row of the package',
+      mirrorSync.status === 200
+        && Number(mirrorCounters.quotaMirrored) >= 3
+        && readQ242().every((row) => Number(row.total_bytes) === 30 * gbUnit)
+        && mirrorRow.totalBytes === 30 * gbUnit,
+      `mirrored=${mirrorCounters.quotaMirrored} rows=${readQ242().map((row) => row.total_bytes / gbUnit).join(',')} list=${mirrorRow.totalBytes / gbUnit}`);
+    check('traffic over the stale number but under the real one leaves the customer online',
+      mirrorRow.used === 12 * gbUnit && mirrorRow.remaining === 18 * gbUnit
+        && mirrorRow.status === 'active' && nodeQ242().enable !== false,
+      `used=${mirrorRow.used / gbUnit} remaining=${mirrorRow.remaining / gbUnit} status=${mirrorRow.status} nodeEnabled=${nodeQ242().enable}`);
+    // Fixing the display must not turn the cutoff into a leak: the moment he
+    // crosses the REAL quota every member still stops, and this pool remembers
+    // that it was the one that stopped him.
+    bumpClient(multiConfigs[0], 15 * gbUnit, 15 * gbUnit);
+    const cutoffSync = await syncNow();
+    const cutoffRow = await poolRowQ242();
+    check('the pool still cuts him off at the real quota and marks the rows it stopped',
+      Number(cutoffSync.json?.data?.configs?.disabled) >= 1
+        && cutoffRow.used === 30 * gbUnit && cutoffRow.status === 'depleted'
+        && nodeQ242().enable === false
+        && readQ242().every((row) => String(row.sync_status) === 'over_quota' && Number(row.enabled) === 0),
+      `disabled=${cutoffSync.json?.data?.configs?.disabled} status=${cutoffRow.status} marks=${readQ242().map((row) => row.sync_status).join(',')}`);
+    // The other half of the bug, and the reason 'over_quota' is written at all:
+    // nothing used to know that the pool — not the owner, not an expiry — had
+    // switched this customer off, so raising the volume on the node left him
+    // disabled forever. Now that same pass lets him back in.
+    nodeQ242().totalGB = 40 * gbUnit;
+    const raiseSync = await syncNow();
+    const raiseRow = await poolRowQ242();
+    check('raising the volume on the node switches that customer back on and clears the mark',
+      Number(raiseSync.json?.data?.configs?.reEnabled) >= 1
+        && nodeQ242().enable !== false && raiseRow.status === 'active'
+        && raiseRow.totalBytes === 40 * gbUnit && raiseRow.used === 30 * gbUnit
+        && readQ242().every((row) => String(row.sync_status) === '' && Number(row.enabled) === 1),
+      `reEnabled=${raiseSync.json?.data?.configs?.reEnabled} status=${raiseRow.status} rows=${readQ242().map((row) => `${row.enabled}:${row.sync_status}`).join(',')}`);
+    // A node client with no volume set means unlimited ON THE NODE, not "zero
+    // gigabytes sold". The panel's own number is what the reseller paid for, so a
+    // 0 may never overwrite it.
+    nodeQ242().totalGB = 0;
+    const unlimitedSync = await syncNow();
+    const unlimitedRow = await poolRowQ242();
+    check('an unlimited node client never wipes the volume the panel sold',
+      unlimitedSync.status === 200 && unlimitedRow.totalBytes === 40 * gbUnit
+        && readQ242().every((row) => Number(row.total_bytes) === 40 * gbUnit),
+      `list=${unlimitedRow.totalBytes / gbUnit} rows=${readQ242().map((row) => row.total_bytes / gbUnit).join(',')}`);
+    // And the guard the owner asked for without asking: he switched a customer
+    // off himself. The pool has no idea why, so it must keep its hands off him —
+    // only the mark this release writes may be undone by this release.
+    const handOff = await request('POST', `/api/admin/configs/${multiConfigs[0].id}/toggle`, {
+      cookies, csrf, body: { enabled: false },
+    });
+    const handSync = await syncNow();
+    const handRow = await poolRowQ242();
+    check('a customer the owner switched off by hand is not brought back by the pool',
+      handOff.status === 200 && nodeQ242().enable === false
+        && readQ242().every((row) => Number(row.enabled) === 0 && String(row.sync_status) === '')
+        && handRow.enabled === false,
+      `nodeEnabled=${nodeQ242().enable} rows=${readQ242().map((row) => `${row.enabled}:${row.sync_status}`).join(',')} list=${handRow.enabled} reEnabled=${handSync.json?.data?.configs?.reEnabled}`);
+    // Leave the fixture exactly as this block found it — 10 GiB pool, nothing
+    // used, online — so the checks after it still describe the same customer.
+    const handOn = await request('POST', `/api/admin/configs/${multiConfigs[0].id}/toggle`, {
+      cookies, csrf, body: { enabled: true },
+    });
+    bumpClient(multiConfigs[0], 0, 0);
+    nodeQ242().totalGB = 10 * gbUnit;
+    const restoreSync = await syncNow();
+    const restoreRow = await poolRowQ242();
+    check('the volume block leaves the package as it found it: 10 GiB, unused, online',
+      handOn.status === 200 && restoreSync.status === 200
+        && restoreRow.totalBytes === 10 * gbUnit && restoreRow.used === 0
+        && restoreRow.status === 'active' && nodeQ242().enable !== false
+        && readQ242().every((row) => Number(row.total_bytes) === 10 * gbUnit
+          && String(row.sync_status) === '' && Number(row.enabled) === 1),
+      `gb=${restoreRow.totalBytes / gbUnit} used=${restoreRow.used} status=${restoreRow.status}`);
+    // v2.4.2 also answers the second complaint: the SSH menu wrote Persian text
+    // into a terminal that is not, and bidi made every page come out reversed and
+    // mangled. The menu and the console CLI it calls are English-only now, so
+    // nothing depends on how the terminal orders right-to-left runs. Comments may
+    // stay Persian — they are never printed.
+    const persianOutput = (file) => fs.readFileSync(file, 'utf8').split(/\r?\n/).filter((line) => {
+      const hash = line.indexOf('#');
+      return /[\u0600-\u06FF]/.test(hash === -1 ? line : line.slice(0, hash));
+    }).length;
+    const menuSh = [path.join(ROOT, '..', 'menu.sh'), path.join(ROOT, 'menu.sh')]
+      .find((candidate) => fs.existsSync(candidate)) || '';
+    check('the SSH menu and its CLI print no Persian at all',
+      Boolean(menuSh) && persianOutput(menuSh) === 0
+        && persianOutput(path.join(ROOT, 'scripts', 'admin-cli.js')) === 0,
+      `menu=${menuSh ? menuSh.replace(/\\/g, '/') : 'missing'} menuLines=${menuSh ? persianOutput(menuSh) : -1} cliLines=${persianOutput(path.join(ROOT, 'scripts', 'admin-cli.js'))}`);
     const adminGrouped = await request('GET', `/api/admin/configs?userId=${shopId}&search=${customerSearch}`, { cookies });
     check('admin and reseller see the same complete customer package',
       adminGrouped.status === 200 && adminGrouped.json?.data?.total === 1
@@ -5407,7 +5547,7 @@ function startMockXui(inboundRows) {
             && onNode25(pkgEmail25) === LINE25('برچسب نماینده'),
           `status=${newOwnerRename25.status} node="${onNode25(pkgEmail25)}"`);
         const wireVersion25 = (await request('GET', '/api/health')).json?.version;
-        check('this build is v2.4.0 on the wire too', wireVersion25 === '2.4.0', `version=${wireVersion25}`);
+        check('this build is v2.4.2 on the wire too', wireVersion25 === '2.4.2', `version=${wireVersion25}`);
       } finally {
         if (lifted25) await request('PATCH', '/api/admin/settings/security', { cookies, csrf, body: { loginRateLimit: limit25 } });
         tdb.close();

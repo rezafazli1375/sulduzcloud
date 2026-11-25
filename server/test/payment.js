@@ -633,7 +633,7 @@ async function main() {
   check('everything else in that section is still editable — only the name is pinned',
     settings.setSetting('general', { tagline: 'استقلال' }).tagline === 'استقلال'
       && settings.getSetting('general').panelName === brand.PANEL_NAME);
-  check('this build is v2.4.0', config.version === '2.4.0', config.version);
+  check('this build is v2.4.2', config.version === '2.4.2', config.version);
 
   // ═══════════════════════════ 10. پورسانت maths ════════════════════════════
   console.log('\n── پورسانت معرفی ──');

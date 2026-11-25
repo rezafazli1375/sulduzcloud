@@ -46,6 +46,13 @@ const DAY_MS = 86400000;
 // actually belong; the cap stops an ancient row from writing hundreds of rows.
 const MAX_SPREAD_DAYS = 7;
 
+// v2.4.2: the shared-pool cutoff writes this into `sync_status` of every row it
+// switches off, and only rows carrying it may be switched back on by the next
+// pass. It has to stay distinct from 'missing' (v1.5.8 filters on that) and from
+// '' (the healthy value the sync writes every pass); the UI shows a badge for
+// 'missing' only, so this marker is invisible until it is needed.
+const OVER_QUOTA_MARK = 'over_quota';
+
 /**
  * Book one x-ui client's traffic delta into usage_daily, across the panel-timezone
  * days its window covers. `fromMs` is when the panel last read this client.
@@ -4108,10 +4115,14 @@ async function syncConfigs({ pruneUsageDays } = {}) {
   );
   const updateConfig = db.prepare(
     `UPDATE configs SET up_bytes = ?, down_bytes = ?, last_up = ?, last_down = ?, last_online_at = ?,
-       enabled = ?, uuid = ?, xui_sub_id = ?, sync_status = ?, last_synced_at = ?, updated_at = ? WHERE id = ?`
+       enabled = ?, uuid = ?, xui_sub_id = ?, total_bytes = ?, sync_status = ?, last_synced_at = ?, updated_at = ? WHERE id = ?`
   );
   let synced = 0;
   let missing = 0;
+  // v2.4.2: rows whose stored quota was not the quota the node actually enforces.
+  const quotaDrift = [];
+  let quotaMirrored = 0;
+  let expiryDrift = 0;
   // Traffic history is per x-ui CLIENT. Every row of one client carries the same
   // counters, so accruing the delta once per row would write the same bytes as
   // many times as the customer has inbounds and the dashboard traffic chart would
@@ -4128,8 +4139,33 @@ async function syncConfigs({ pruneUsageDays } = {}) {
       if (!client) {
         missing += 1;
         updateConfig.run(row.up_bytes, row.down_bytes, row.last_up, row.last_down, row.last_online_at,
-          row.enabled, row.uuid, row.xui_sub_id, 'missing', Date.now(), Date.now(), row.id);
+          row.enabled, row.uuid, row.xui_sub_id, row.total_bytes, 'missing', Date.now(), Date.now(), row.id);
         continue;
+      }
+      // v2.4.2 — the node is the authority for the volume a customer is cut off
+      // at, so the panel's copy follows it. This bug was reported as «a 30 GB
+      // subscription shows 20 GB and is switched off at 20»: the sync already
+      // read up/down/enabled/uuid/subId from the node every pass and never looked
+      // at totalGB, so a quota raised on the x-ui panel (or a failed half-write
+      // from this panel's own extend) left `configs.total_bytes` at the old
+      // number — and both the displayed quota and the shared-pool cutoff below
+      // are computed from that stored number.
+      // Only a number the node itself declares is copied: `quotaBytes` is the
+      // raw totalGB, so an unlimited client (0) keeps the panel's own figure
+      // instead of wiping a paid plan, exactly like refreshPackage has always
+      // refused to write quota from `traffic.total`.
+      const nodeQuota = Number(client.quotaBytes || 0);
+      const storedQuota = Number(row.total_bytes || 0);
+      const mirroredQuota = nodeQuota > 0 ? nodeQuota : storedQuota;
+      if (nodeQuota > 0 && nodeQuota !== storedQuota) {
+        quotaMirrored += 1;
+        if (quotaDrift.length < 20) quotaDrift.push(`${row.email}: ${storedQuota} -> ${nodeQuota}`);
+      }
+      if (nodeQuota > 0 && Number(client.expiryAt || 0) > 0
+        && Number(client.expiryAt || 0) !== Number(row.expiry_at || 0)) {
+        // Counted, never copied: a shorter expiry on the node would silently
+        // take days a customer paid for, so this drift is reported instead.
+        expiryDrift += 1;
       }
       const up = Number(client.up || 0);
       const down = Number(client.down || 0);
@@ -4145,12 +4181,12 @@ async function syncConfigs({ pruneUsageDays } = {}) {
       }
       updateConfig.run(up, down, up, down, client.lastOnlineAt || 0,
         client.enabled ? 1 : 0, client.uuid || row.uuid, client.subId || row.xui_sub_id,
-        '', Date.now(), Date.now(), row.id);
+        mirroredQuota, '', Date.now(), Date.now(), row.id);
       synced += 1;
       const gkey = packageKeyOf(row);
       if (!groups.has(gkey)) groups.set(gkey, { quota: 0, perClient: new Map(), members: [] });
       const group = groups.get(gkey);
-      group.quota = Math.max(group.quota, Number(row.total_bytes || 0));
+      group.quota = Math.max(group.quota, mirroredQuota);
       // The pool is per x-ui CLIENT, not per panel row. An adopted customer
       // sitting on three inbounds is ONE client whose counters repeat on every
       // row of that client, so adding up_bytes once per row would read as triple
@@ -4165,6 +4201,11 @@ async function syncConfigs({ pruneUsageDays } = {}) {
         email: row.email,
         serverId: sid,
         enabled: Boolean(client.enabled),
+        // What this row said BEFORE this pass rewrote sync_status to ''. That is
+        // how the pass can tell "switched off by this pool" from "switched off by
+        // the owner, by an expiry, or on the node itself".
+        poolMarked: String(row.sync_status || '') === OVER_QUOTA_MARK,
+        expiryAt: Number(row.expiry_at || 0),
       });
     }
   });
@@ -4172,40 +4213,87 @@ async function syncConfigs({ pruneUsageDays } = {}) {
 
   // One shared pool: when the package total reaches its quota, stop every
   // member (x-ui only knows each client's own quota, not the package sum).
-  // Extending or raising the quota re-enables the members.
+  // v2.4.2 adds the other half of that rule — the switch back on. Before this
+  // release nothing recorded that THIS pool had been the one to stop a customer,
+  // so a subscription disabled against a stale 20 GB number stayed disabled
+  // forever after the sync above learned the node really allows 30 GB; only an
+  // extend (or an admin touching him) could free him. `sync_status = 'over_quota'`
+  // is now written when this pool switches a client off, and it is the ONLY
+  // thing this loop is allowed to switch back on — so a customer the owner
+  // disabled by hand, or one whose time has run out, stays off.
+  const now = Date.now();
   let disabled = 0;
+  let reEnabled = 0;
   const serverCache = new Map();
+  const serverFor = (id) => {
+    if (!serverCache.has(id)) serverCache.set(id, serversService.resolveServer(id));
+    return serverCache.get(id);
+  };
   for (const group of groups.values()) {
     const used = [...group.perClient.values()].reduce((sum, value) => sum + value, 0);
-    if (group.quota <= 0 || used < group.quota) continue;
-    // One call per x-ui client: the same email on several inbounds is one
-    // customer, and switching him off twice only multiplies the panel writes.
-    const done = new Set();
+    if (group.quota <= 0) continue;
+    const over = used >= group.quota;
+    if (!over && !group.members.some((member) => member.poolMarked && !member.enabled)) continue;
+    // One x-ui CLIENT is one customer: collect his rows and move all of them
+    // together. Before v2.4.2 this loop acted on the first row it met per client
+    // and wrote the switch to that row only, so the other inbounds of a
+    // multi-inbound customer kept saying the opposite of the node until the next
+    // pass read him again — the package was listed as «mixed», and the row that
+    // carried the mark was not necessarily the one the owner had open.
+    const byClient = new Map();
     for (const member of group.members) {
-      if (!member.enabled) continue;
       const clientKey = `${member.serverId}|${String(member.email).toLowerCase()}`;
-      if (done.has(clientKey)) continue;
-      done.add(clientKey);
-      try {
-        if (!serverCache.has(member.serverId)) {
-          serverCache.set(member.serverId, serversService.resolveServer(member.serverId));
+      if (!byClient.has(clientKey)) byClient.set(clientKey, []);
+      byClient.get(clientKey).push(member);
+    }
+    for (const client of byClient.values()) {
+      const [head] = client;
+      if (over) {
+        if (!head.enabled) continue;
+        try {
+          await xui.setEnabled(head.email, false, serverFor(head.serverId));
+          const stamp = Date.now();
+          for (const member of client) {
+            db.prepare('UPDATE configs SET enabled = 0, sync_status = ?, updated_at = ? WHERE id = ?')
+              .run(OVER_QUOTA_MARK, stamp, member.id);
+          }
+          disabled += 1;
+        } catch (err) {
+          console.error(`[configs] shared pool: could not disable ${head.email}:`, err.message);
         }
-        await xui.setEnabled(member.email, false, serverCache.get(member.serverId));
-        db.prepare('UPDATE configs SET enabled = 0, updated_at = ? WHERE id = ?')
-          .run(Date.now(), member.id);
-        disabled += 1;
+        continue;
+      }
+      if (head.enabled || !client.some((member) => member.poolMarked)) continue;
+      if (client.some((member) => member.expiryAt > 0 && member.expiryAt <= now)) continue;
+      try {
+        await xui.setEnabled(head.email, true, serverFor(head.serverId));
+        const stamp = Date.now();
+        for (const member of client) {
+          db.prepare('UPDATE configs SET enabled = 1, updated_at = ? WHERE id = ?').run(stamp, member.id);
+        }
+        reEnabled += 1;
       } catch (err) {
-        console.error(`[configs] shared pool: could not disable ${member.email}:`, err.message);
+        console.error(`[configs] shared pool: could not re-enable ${head.email}:`, err.message);
       }
     }
   }
   if (disabled) console.log(`[configs] shared pool: disabled ${disabled} client(s) over quota`);
+  if (reEnabled) console.log(`[configs] shared pool: re-enabled ${reEnabled} client(s) the pool had stopped under the real quota`);
+  if (quotaMirrored) {
+    console.log(`[configs] quota mirrored from node on ${quotaMirrored} row(s): ${quotaDrift.join(', ')}${quotaMirrored > quotaDrift.length ? ' …' : ''}`);
+  }
+  if (expiryDrift) {
+    console.warn(`[configs] quota follows the node, expiry does not: ${expiryDrift} row(s) disagree with the node on expiry (left as paid; check the panel settings)`);
+  }
 
   if (pruneUsageDays) {
     const cutoff = new Date(Date.now() - pruneUsageDays * DAY_MS).toISOString().slice(0, 10);
     db.prepare('DELETE FROM usage_daily WHERE day < ?').run(cutoff);
   }
-  return { synced, missing, disabled, total: rows.length, durationMs: Date.now() - started };
+  return {
+    synced, missing, disabled, reEnabled, quotaMirrored, expiryDrift,
+    total: rows.length, durationMs: Date.now() - started,
+  };
 }
 
 // Alerts are per CUSTOMER PACKAGE: a five-inbound subscription warns once, about

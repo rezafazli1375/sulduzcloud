@@ -106,7 +106,7 @@ function cmdAdmins() {
     .prepare("SELECT username, status, created_at FROM users WHERE deleted_at = 0 AND role = 'admin' ORDER BY id")
     .all();
   for (const row of rows) {
-    const status = row.status === 'active' ? 'فعال' : row.status;
+    const status = row.status === 'active' ? 'active' : row.status;
     const stamp = Number(row.created_at);
     const when = Number.isFinite(stamp) && stamp > 0
       ? new Date(stamp > 1e12 ? stamp : stamp * 1000).toISOString().slice(0, 10)
@@ -137,17 +137,17 @@ function cmdBootstrap(username, password, name) {
   // ignored it would hand a stranger a way past the female key: the panel would
   // look activated to itself without ever having been given one.
   if (activation.isRequired()) {
-    return fail(`این نصب هنوز فعال نشده است. کلید فعالسازی را با «activation set <key>» یا از صفحهٔ فعال‌سازی در مرورگر وارد کنید؛ سریال: ${activation.challengeMale()}`);
+    return fail(`This install is not activated yet. Enter the activation key with "activation set <key>" or from the activation page in the browser; serial: ${activation.challengeMale()}`);
   }
   const existing = getDb().prepare('SELECT COUNT(*) AS c FROM users WHERE deleted_at = 0').get().c;
   if (Number(existing) > 0) {
-    console.log(`حساب مالک از قبل وجود دارد (${existing} حساب فعال) — چیزی ساخته نشد.`);
+    console.log(`The owner account already exists (${existing} active accounts) — nothing was created.`);
     return true;
   }
   const user = String(username || '').trim();
   const pw = String(password || '');
-  if (!USERNAME_RE.test(user)) return fail('نام کاربری باید ۳ تا ۳۲ نویسه باشد: حرف انگلیسی، رقم، نقطه، خط تیره یا زیرخط.');
-  if (pw.length < 8) return fail('رمز عبور باید حداقل ۸ نویسه باشد.');
+  if (!USERNAME_RE.test(user)) return fail('The username must be 3 to 32 characters: english letters, digits, dot, dash or underscore.');
+  if (pw.length < 8) return fail('The password must be at least 8 characters.');
   let created;
   try {
     created = users.createUser(
@@ -155,9 +155,9 @@ function cmdBootstrap(username, password, name) {
       null
     );
   } catch (err) {
-    return fail(err && err.message ? err.message : 'حساب مالک ساخته نشد.');
+    return fail(err && err.message ? err.message : 'the owner account was not created.');
   }
-  console.log(`حساب مالک ساخته شد: ${created.username} (id ${created.id}, نقش admin).`);
+  console.log(`Owner account created: ${created.username} (id ${created.id}, role admin).`);
   return true;
 }
 
@@ -199,19 +199,19 @@ function cmdReset(username, explicit) {
 // login name never touches a single package — which is why this is allowed at all.
 function cmdRename(username, nextName) {
   const user = users.getUserByUsername(username);
-  if (!user) return fail(`حسابی با نام «${username}» وجود ندارد / no account named "${username}".`);
+  if (!user) return fail(`no account named "${username}".`);
   const next = String(nextName || '').trim();
   if (!USERNAME_RE.test(next)) {
-    return fail('نام کاربری جدید باید ۳ تا ۳۲ نویسه باشد: حرف انگلیسی، رقم، نقطه، خط تیره یا زیرخط.');
+    return fail('The new username must be 3 to 32 characters: english letters, digits, dot, dash or underscore.');
   }
-  if (next.toLowerCase() === String(user.username).toLowerCase()) return fail('نام جدید با نام فعلی یکی است.');
+  if (next.toLowerCase() === String(user.username).toLowerCase()) return fail('the new name is the same as the current one.');
   try {
     users.updateUser(user.id, { username: next }, null);
   } catch (err) {
-    return fail(err && err.message ? err.message : 'تغییر نام کاربری انجام نشد.');
+    return fail(err && err.message ? err.message : 'the username was not changed.');
   }
-  console.log(`نام کاربری «${user.username}» به «${next}» تغییر کرد (نقش ${user.role}).`);
-  console.log('از این پس با همین نام وارد پنل شوید؛ نشست‌های قبلی با نام قدیمی دیگر کاری ندارند.');
+  console.log(`Username "${user.username}" changed to "${next}" (role ${user.role}).`);
+  console.log('From now on log in with this name; old sessions of the previous name do nothing.');
   return true;
 }
 
@@ -224,7 +224,7 @@ function patchGeneral(patch) {
   try {
     return settings.updateSection('general', patch);
   } catch (err) {
-    fail(`ذخیرهٔ تنظیمات عمومی ناموفق بود: ${err && err.message ? err.message : err}`);
+    fail(`saving the general settings failed: ${err && err.message ? err.message : err}`);
     return null;
   }
 }
@@ -240,21 +240,21 @@ function showOr(value) {
 function networkReadout() {
   const general = settings.getSetting('general') || {};
   const want = net.desired();
-  console.log(`پورت ذخیره‌شده در تنظیمات (general.panelPort) : ${showOr(general.panelPort)}`);
-  console.log(`پورت در فایل .env (PORT)                      : ${showOr(process.env.PORT)}`);
-  console.log(`پورتی که پنل در بالاآمدن بعدی می‌گیرد          : ${want.port}`);
-  console.log(`آدرس اتصال (HOST)                             : ${want.host}`);
-  console.log(`آدرس عمومی در تنظیمات (publicUrl)             : ${showOr(general.publicUrl)}`);
-  console.log(`آدرس عمومی در .env  (PUBLIC_URL)              : ${showOr(process.env.PUBLIC_URL)}`);
-  console.log(`مسیر کلید عمومی (sslCertPath)                 : ${showOr(want.certPath)}`);
-  console.log(`مسیر کلید خصوصی (sslKeyPath)                  : ${showOr(want.keyPath)}`);
+  console.log(`port stored in the settings (general.panelPort) : ${showOr(general.panelPort)}`);
+  console.log(`port in the .env file (PORT)                      : ${showOr(process.env.PORT)}`);
+  console.log(`port the panel takes on its next boot             : ${want.port}`);
+  console.log(`listen address (HOST)                             : ${want.host}`);
+  console.log(`public address in the settings (publicUrl)        : ${showOr(general.publicUrl)}`);
+  console.log(`public address in .env (PUBLIC_URL)               : ${showOr(process.env.PUBLIC_URL)}`);
+  console.log(`public key path (sslCertPath)                     : ${showOr(want.certPath)}`);
+  console.log(`private key path (sslKeyPath)                     : ${showOr(want.keyPath)}`);
   if (want.certPath || want.keyPath) {
-    for (const [label, file] of [['کلید عمومی', want.certPath], ['کلید خصوصی', want.keyPath]]) {
-      if (!file) { console.log(`  ${label}: تنظیم نشده — تا هر دو مسیر پر نشوند پنل HTTP می‌ماند.`); continue; }
-      console.log(`  ${label}: ${fs.existsSync(file) ? 'وجود دارد' : 'یافت نشد!'} ${file}`);
+    for (const [label, file] of [['public key', want.certPath], ['private key', want.keyPath]]) {
+      if (!file) { console.log(`  ${label}: not set — the panel stays on HTTP until both paths are filled.`); continue; }
+      console.log(`  ${label}: ${fs.existsSync(file) ? 'present' : 'NOT FOUND!'} ${file}`);
     }
   } else {
-    console.log('  گواهی: تنظیم نشده — پنل روی HTTP سرو می‌شود (nginx می‌تواند HTTPS را تمام کند).');
+    console.log('  certificate: not set — the panel is served on HTTP (nginx can end TLS itself).');
   }
 }
 
@@ -262,12 +262,12 @@ function cmdPort(action, value) {
   const general = settings.getSetting('general') || {};
   if (action === 'get') { console.log(net.desired().port); return true; }
   if (action === 'show' || !action) { networkReadout(); return true; }
-  if (action !== 'set') return fail('دستور پورت: port set <عدد> | port get | port show');
+  if (action !== 'set') return fail('port commands: port set <number> | port get | port show');
   const port = net.clampPort(value);
-  if (!port) return fail(`پورت نامعتبر است: «${showOr(value)}». عددی بین ${net.MIN_PORT} و ${net.MAX_PORT}.`);
+  if (!port) return fail(`invalid port: "${showOr(value)}". A number between ${net.MIN_PORT} and ${net.MAX_PORT}.`);
   if (!patchGeneral({ panelPort: port })) return false;
-  console.log(`پورت پنل روی ${port} ذخیره شد (پیش از آن: ${showOr(general.panelPort)}).`);
-  console.log('یادآوری: فایل .env و تنظیم nginx را هم همین منو به‌روز می‌کند؛ پنل تا ریستارت جابه‌جا نمی‌شود.');
+  console.log(`the panel port was saved as ${port} (before: ${showOr(general.panelPort)}).`);
+  console.log('Reminder: this menu updates the .env file and the nginx config too; the panel does not move until a restart.');
   return true;
 }
 
@@ -286,21 +286,21 @@ function cmdUrl(action, value) {
   const general = settings.getSetting('general') || {};
   if (action === 'get') { console.log(net.desired().publicUrl); return true; }
   if (action === 'show' || !action) {
-    console.log(`publicUrl (تنظیمات) : ${showOr(general.publicUrl)}`);
+    console.log(`publicUrl (settings) : ${showOr(general.publicUrl)}`);
     console.log(`PUBLIC_URL (.env)   : ${showOr(process.env.PUBLIC_URL)}`);
     return true;
   }
   if (action === 'clear') {
     if (!patchGeneral({ publicUrl: '' })) return false;
-    console.log('آدرس عمومی پاک شد؛ پنل از آدرس درخواست‌شدهٔ مرورگر استفاده می‌کند.');
+    console.log('the public address was cleared; the panel uses the address the browser requested.');
     return true;
   }
-  if (action !== 'set') return fail('دستور آدرس: url set <آدرس کامل> | url get | url show | url clear');
-  if (!String(value || '').trim()) return fail('آدرس خالی است. برای پاک‌کردن: url clear');
+  if (action !== 'set') return fail('url commands: url set <full address> | url get | url show | url clear');
+  if (!String(value || '').trim()) return fail('the address is empty. To clear it: url clear');
   const url = validPublicUrl(value);
-  if (url === null) return fail(`آدرس نامعتبر است: «${showOr(value)}». باید http:// یا https:// با یک میزبان کامل باشد.`);
+  if (url === null) return fail(`invalid address: "${showOr(value)}". It must be http:// or https:// with a full host.`);
   if (!patchGeneral({ publicUrl: url })) return false;
-  console.log(`آدرس پنل ذخیره شد: ${url} — لینک سابسکرایب و کوکی از این پس همین را می‌آورند.`);
+  console.log(`panel address saved: ${url} — subscription links and cookies use it from now on.`);
   return true;
 }
 
@@ -312,21 +312,21 @@ function cmdSsl(action, flags) {
   if (action === 'show' || !action) { networkReadout(); return true; }
   if (action === 'clear') {
     if (!patchGeneral({ sslCertPath: '', sslKeyPath: '' })) return false;
-    console.log('مسیرهای گواهی پاک شد. اگر nginx خود HTTPS را تمام می‌کند، همین درست است.');
+    console.log('certificate paths cleared. If nginx ends HTTPS itself, this is correct.');
     return true;
   }
-  if (action !== 'set') return fail('گواهی: use ssl set --cert <path> --key <path> | ssl show | ssl clear');
+  if (action !== 'set') return fail('certificate: use ssl set --cert <path> --key <path> | ssl show | ssl clear');
   const cert = String(flags.cert || '').trim();
   const key = String(flags.key || '').trim();
-  if (!cert || !key) return fail('برای HTTPS هر دو مسیر لازم است: --cert و --key.');
-  for (const [label, file] of [['کلید عمومی', cert], ['کلید خصوصی', key]]) {
-    if (!file.startsWith('/')) return fail(`${label}: مسیر باید مطلق باشد (با / شروع شود).`);
-    if (!fs.existsSync(file)) return fail(`${label}: فایلی در ${file} وجود ندارد.`);
+  if (!cert || !key) return fail('both paths are required for HTTPS: --cert and --key.');
+  for (const [label, file] of [['public key', cert], ['private key', key]]) {
+    if (!file.startsWith('/')) return fail(`${label}: the path must be absolute (it must start with /).`);
+    if (!fs.existsSync(file)) return fail(`${label}: no file exists at ${file}.`);
   }
   const { error } = net.readKeyPair(cert, key);
-  if (error) return fail(`جفت گواهی قابل استفاده نیست: ${error}`);
+  if (error) return fail(`the certificate pair is not usable: ${error}`);
   if (!patchGeneral({ sslCertPath: cert.slice(0, 300), sslKeyPath: key.slice(0, 300) })) return false;
-  console.log('مسیرهای گواهی ذخیره شد. پس از ریستارت، پنل مستقیم روی HTTPS سرو می‌شود.');
+  console.log('Certificate paths saved. After a restart the panel is served directly on HTTPS.');
   return true;
 }
 
@@ -346,20 +346,20 @@ function cmdActivation(action, value) {
     // The key may arrive as `activation set <key>` or in the environment: the
     // installer passes it through the environment so it never appears in `ps`.
     const result = activation.activate(String(value || process.env.ACTIVATION_KEY || ''), { source: 'cli' });
-    if (!result.ok) return fail(`کلید فعالسازی برای این نصب معتبر نیست (سریال: ${result.male}).`);
-    console.log(`پنل فعال شد. سریال ${result.male} با همین نصب جفت شد.`);
+    if (!result.ok) return fail(`this activation key is not valid for this install (serial: ${result.male}).`);
+    console.log(`The panel is activated. Serial ${result.male} is now paired with this install.`);
     return true;
   }
   const status = activation.status();
   if (status.activated) {
     const when = status.activatedAt ? new Date(status.activatedAt).toISOString().slice(0, 16).replace('T', ' ') : '';
-    console.log(`وضعیت: فعال ✓   سریال: ${status.maleKey || '—'}   زمان: ${when || '—'}   از طریق: ${status.source || '—'}`);
+    console.log(`status: active ✓   serial: ${status.maleKey || '—'}   time: ${when || '—'}   by: ${status.source || '—'}`);
     return true;
   }
-  console.log('وضعیت: فعال نشده ✗');
-  console.log(`سریال این نصب: ${status.maleKey}`);
-  console.log('برای فعال‌سازی: کلید فعالسازیِ همین سریال را از مالک بگیرید و بزنید  sulduzcloud activate');
-  if (status.legacy) console.log('نکته: این نصب از نسخهٔ پیشین ارتقا یافته؛ حساب‌ها وجود دارند و پنل کار می‌کند.');
+  console.log('status: not activated ✗');
+  console.log(`serial of this install: ${status.maleKey}`);
+  console.log('to activate: get the activation key of this serial from the owner and run  sulduzcloud activate');
+  if (status.legacy) console.log('note: this install was upgraded from an earlier version; the accounts exist and the panel works.');
   return true;
 }
 
@@ -392,7 +392,7 @@ function main() {
       const who = second || process.env.ADMIN_USERNAME || '';
       const secret = third || process.env.ADMIN_PASSWORD || '';
       if (!who || !secret) {
-        fail('bootstrap <username> <password> [name] — یا ADMIN_USERNAME و ADMIN_PASSWORD را تنظیم کنید.');
+        fail('bootstrap <username> <password> [name] — or set ADMIN_USERNAME and ADMIN_PASSWORD.');
         process.exitCode = 2;
       } else if (!cmdBootstrap(who, secret, _[3] || '')) {
         process.exitCode = 1;

@@ -44,12 +44,12 @@ ok()   { printf '%s%s%s\n' "$c_g" "$*" "$c_r"; }
 warn() { printf '%s%s%s\n' "$c_y" "$*" "$c_r"; }
 err()  { printf '%s%s%s\n' "$c_red" "$*" "$c_r" >&2; }
 head1() { printf '\n%s%s%s\n' "$c_b" "$*" "$c_r"; }
-pause() { printf '\n'; read -rp "Enter را بزنید تا برگردید..." _ || true; }
+pause() { printf '\n'; read -rp "Press Enter to go back..." _ || true; }
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then exec sudo -- "$0" "$@"; fi
-    err "این منو باید با کاربر root اجرا شود."
+    err "This menu must run as root."
     exit 1
   fi
 }
@@ -162,10 +162,10 @@ version_shown() {
 }
 
 service_state() {
-  if systemctl is-active --quiet "$SERVICE"; then ok "پنل (${SERVICE}): فعال"; else err "پنل (${SERVICE}): غیرفعال"; fi
+  if systemctl is-active --quiet "$SERVICE"; then ok "panel (${SERVICE}): active"; else err "panel (${SERVICE}): inactive"; fi
   local active_since
   active_since="$(systemctl show -p ActiveEnterTimestamp --value "$SERVICE" 2>/dev/null)"
-  [ -n "$active_since" ] && say "  از: $active_since"
+  [ -n "$active_since" ] && say "  since: $active_since"
 }
 
 xui_pid() { systemctl show -p MainPID --value x-ui 2>/dev/null; }
@@ -173,9 +173,9 @@ xui_pid() { systemctl show -p MainPID --value x-ui 2>/dev/null; }
 xui_state() {
   local pid; pid="$(xui_pid)"
   if [ -n "$pid" ] && [ "$pid" != "0" ]; then
-    say "  x-ui: فعال، pid $pid (این منو هرگز آن را تغییر نمی‌دهد)"
+    say "  x-ui: active, pid $pid (this menu never changes it)"
   else
-    say "  x-ui: غیرفعال یا روی این سرور نصب نیست (روی سرور دیگر دیده می‌شود)"
+    say "  x-ui: inactive, or not installed on this server (it may run on another one)"
   fi
 }
 
@@ -183,9 +183,9 @@ xui_state() {
 # proof; anything else is said out loud instead of hidden.
 xui_guard() { # before after label
   if [ "${1:-}" = "${2:-}" ]; then
-    say "  x-ui دست‌نخورده: pid ${2:-0} ($3)"
+    say "  x-ui untouched: pid ${2:-0} ($3)"
   else
-    warn "  pid سرویس x-ui عوض شد (${1:-0} -> ${2:-0}) — این منو آن را تغییر نداد؛ بررسی کنید."
+    warn "  the x-ui pid changed (${1:-0} -> ${2:-0}) — this menu did not change it; please check."
   fi
 }
 
@@ -264,35 +264,35 @@ latest_release_tag() {
 }
 
 page_update() {
-  head1 "۱) آپدیت پنل"
+  head1 "1) Update panel"
   local now latest
   now="$(version_shown)"
-  say "  نسخهٔ در حال اجرا: ${now:-نامشخص (پنل پاسخ نمی‌دهد)}"
-  say "  مخزن: $REPO_SLUG"
-  say "  مسیر نصب: $APP_DIR"
-  printf '\n  خواندن آخرین نسخهٔ منتشرشده...'
+  say "  running version: ${now:-unknown (the panel is not answering)}"
+  say "  repository: $REPO_SLUG"
+  say "  install path: $APP_DIR"
+  printf '\n  reading the latest published version...'
   latest="$(latest_release_tag)"
   if [ -z "$latest" ]; then
-    err "  آخرین نسخه از گیت‌هاب خوانده نشد (اینترنت، DNS یا rate limit)."
-    say "  روش دستی همان لینک تک‌دستوری نصب است:"
+    err "  the latest version could not be read from GitHub (network, DNS or rate limit)."
+    say "  the manual way is the same one-command install link:"
     say "    curl -fsSL https://raw.githubusercontent.com/$REPO_SLUG/main/install.sh | sudo bash"
     pause; return 1
   fi
-  say "  آخرین نسخهٔ منتشرشده: $latest"
+  say "  latest published version: $latest"
   if [ -n "$now" ] && [ "v$now" = "$latest" ]; then
-    ok "  پنل به‌روز است (همان نسخه)."
+    ok "  the panel is up to date (same version)."
     pause; return 0
   fi
   say ""
-  say "  آپدیت = نصب دوبارهٔ همان نسخهٔ منتشرشده: فایل‌ها و بیلد وب عوض می‌شوند."
-  say "  دیتابیس، تنظیمات پنل و فایل .env شما دست‌نخورده می‌مانند (نصب‌کننده"
-  say "  صریحاً .env را نگه می‌دارد و هیچ داده‌ای پاک نمی‌کند)."
-  printf '\n  ادامه؟ [y/N]: '
+  say "  Update = reinstall the same published release: the files and the web build change."
+  say "  The database, the panel settings and your .env file stay untouched (the installer"
+  say "  explicitly keeps .env and deletes no data)."
+  printf '\n  Continue? [y/N]: '
   local a; read -r a || true
-  [[ "${a:-}" =~ ^[Yy]$ ]] || { say "  بدون تغییر بیرون آمدید."; return 0; }
+  [[ "${a:-}" =~ ^[Yy]$ ]] || { say "  Left without changes."; return 0; }
 
   local bkp; bkp="$(backup_now)"
-  if [ -n "$bkp" ]; then ok "  بکاپ دیتابیس: $bkp"; else warn "  بکاپ ساخته نشد؛ ادامه ریسکش با شماست."; fi
+  if [ -n "$bkp" ]; then ok "  database backup: $bkp"; else warn "  no backup was made; continuing is at your own risk."; fi
   local xui_before; xui_before="$(xui_pid)"
 
   local dom port flag_domain=""
@@ -301,26 +301,26 @@ page_update() {
 
   local script; script="$(mktemp /tmp/sc-install-XXXXXX.sh)"
   if ! curl -fsSL --max-time 40 "https://raw.githubusercontent.com/$REPO_SLUG/main/install.sh" -o "$script"; then
-    err "  دانلود install.sh ناموفق بود."; rm -f "$script"; pause; return 1
+    err "  downloading install.sh failed."; rm -f "$script"; pause; return 1
   fi
-  say "  در حال آپدیت (بیلد وب چند دقیقه طول می‌کشد)..."
+  say "  updating (the web build takes a few minutes)..."
   # --non-interactive: the menu already collected what the installer would ask.
   if bash "$script" --non-interactive --dir "$APP_DIR" --port "$port" $flag_domain; then
-    ok "  آپدیت انجام شد."
+    ok "  update finished."
   else
-    err "  آپدیت با خطا تمام شد. وضعیت پنل:"
+    err "  the update ended with an error. Panel status:"
     journalctl -u "$SERVICE" -n 25 --no-pager
   fi
   rm -f "$script"
 
   sleep 2
-  xui_guard "$xui_before" "$(xui_pid)" "پس از آپدیت"
+  xui_guard "$xui_before" "$(xui_pid)" "after update"
   local h; h="$(health)"
   if [ -n "$h" ]; then
-    ok "  پنل بالا آمد: $h"
-    say "  اگر مرورگر هنوز نسخهٔ قدیمی را نشان می‌دهد: Ctrl+F5 (حافظهٔ کش مرورگر است، نه سرور)."
+    ok "  the panel is up: $h"
+    say "  If the browser still shows the old version: Ctrl+F5 (that is the browser cache, not the server)."
   else
-    err "  پنل بالا نیامد: journalctl -u $SERVICE -n 40"
+    err "  the panel did not come up: journalctl -u $SERVICE -n 40"
   fi
   pause
 }
@@ -328,48 +328,48 @@ page_update() {
 # ---------------------------------------------------------------- 2) change port
 
 page_port() {
-  head1 "۲) تغییر پورت پنل"
+  head1 "2) Change panel port"
   local live want envp
   live="$(live_port || true)"; want="$(desired_port)"; envp="$(panel_port)"
-  say "  پورتی که پنل همین حالا گوش می‌دهد: ${live:-نامشخص (سرویس بالا نیست؟)}"
-  say "  پورت ذخیره‌شده در تنظیمات پنل:    ${want:-(خالی)}"
-  say "  پورت در فایل .env:                ${envp}"
+  say "  port the panel is listening on right now: ${live:-unknown (is the service up?)}"
+  say "  port stored in the panel settings:    ${want:-(empty)}"
+  say "  port in the .env file:                ${envp}"
   say ""
-  say "  این کار هر سه را یکجا عوض می‌کند؛ اگر فقط یکی عوض شود، src/net.js عدد"
-  say "  ذخیره‌شده در تنظیمات را بر .env مقدم می‌داند و شمارهٔ قدیمی برمی‌گردد."
+  say "  This changes all three at once; if only one of them changes, src/net.js prefers"
+  say "  the number stored in the settings and the old port comes back."
   say ""
-  say "  نکته: اگر پنل را با دامنه و nginx باز می‌کنید، آدرس مرورگر شما پورت ندارد;"
-  say "  اینجا پورت داخلی جابه‌جا می‌شود و nginx هم با همان گزینه وصل می‌شود."
-  printf '\n  پورت تازه (۱۰۲۴ تا ۶۵۵۳۵، خالی = انصراف): '
+  say "  Note: if you open the panel through a domain and nginx, your browser address has no port;"
+  say "  this moves the internal port and nginx is repointed to the same number."
+  printf '\n  new port (1024 to 65535, empty = cancel): '
   local p; read -r p || true
   p="${p//[^0-9]/}"
   [ -z "$p" ] && return 0
-  if ! valid_port "$p"; then err "  پورت معتبر نیست (بین ۱۰۲۴ و ۶۵۵۳۵)."; pause; return 1; fi
+  if ! valid_port "$p"; then err "  invalid port (between 1024 and 65535)."; pause; return 1; fi
   if [ "$p" = "${live:-$envp}" ]; then
-    warn "  پنل همین حالا روی $p است؛ چیزی تغییر نکرد."; pause; return 0
+    warn "  the panel is already on $p; nothing changed."; pause; return 0
   fi
   if ! port_free "$p"; then
-    err "  پورت $p روی این سرور آزاد نیست:"
+    err "  port $p is not free on this server:"
     ss -ltnp "sport = :$p" 2>/dev/null | sed -n '2,5p' | sed 's/^/    /'
-    say "  آن سرویس را آزاد کنید و دوباره بیایید — پنل جابه‌جا نشد."
+    say "  free that service and come back — the panel was not moved."
     pause; return 1
   fi
   if [ "$p" -ge 2000 ] && [ "$p" -le 2100 ]; then
-    warn "  این شماره در بازهٔ پورت‌های معمول x-ui است؛ بعداً ممکن است برخورد کند."
+    warn "  this number is inside the usual x-ui port range; it may collide later."
   fi
 
   local xui_before; xui_before="$(xui_pid)"
   local bkp; bkp="$(backup_now)"
-  [ -n "$bkp" ] && say "  بکاپ دیتابیس: $bkp"
+  [ -n "$bkp" ] && say "  database backup: $bkp"
 
   # 1) the stored setting — the number src/net.js reads first.
   if ! cli port set "$p"; then
-    err "  ذخیرهٔ پورت در تنظیمات پنل ناموفق بود؛ پنل جابه‌جا نشد."
+    err "  saving the port in the panel settings failed; the panel was not moved."
     pause; return 1
   fi
   # 2) .env — what systemd hands the service, and what the installer reads later.
   env_set PORT "$p"
-  say "  PORT=$p در $ENV_FILE نوشته شد."
+  say "  PORT=$p was written to $ENV_FILE."
 
   # 3) nginx — the site that proxies to the OLD port has to follow.
   local site old; site="$(nginx_site)"; old="$envp"
@@ -377,48 +377,48 @@ page_port() {
     cp -a "$site" "$site.bak.$(date +%s)"
     sed -i -E "s#127\.0\.0\.1:${old}([^0-9]|$)#127.0.0.1:${p}\1#g" "$site"
     if nginx -t >/dev/null 2>&1; then
-      systemctl reload nginx && ok "  nginx به پورت $p وصل شد ($site)."
+      systemctl reload nginx && ok "  nginx repointed to port $p ($site)."
     else
-      err "  nginx بعد از تغییر پورت معتبر نیست؛ نسخهٔ قبلی برگردانده شد:"
+      err "  nginx is not valid after the port change; the previous version was restored:"
       local prev; prev="$(ls -1t "$site.bak."* 2>/dev/null | head -1)"
       [ -n "$prev" ] && cp -a "$prev" "$site" && nginx -t >/dev/null 2>&1 && systemctl reload nginx
-      warn "  پنل روی $p است ولی nginx هنوز به $old اشاره می‌کند؛ دستی بررسی کنید."
+      warn "  the panel is on $p but nginx still points at $old; please check it by hand."
     fi
   else
-    warn "  سایت nginx‌ای که به پورت $old اشاره کند پیدا نشد؛ فقط تنظیمات پنل و .env عوض شد."
+    warn "  no nginx site referencing port $old was found; only the panel settings and .env changed."
   fi
 
   systemctl restart "$SERVICE"
   sleep 3
   if [ -n "$(health_on "$p")" ]; then
-    ok "  پنل روی پورت $p بالا آمد."
+    ok "  the panel came up on port $p."
   else
-    err "  پنل روی $p پاسخ نداد؛ بازگردانی به $old:"
+    err "  the panel did not answer on $p; rolling back to $old:"
     cli port set "$old" >/dev/null; env_set PORT "$old"
     [ -n "$site" ] && sed -i -E "s#127\.0\.0\.1:${p}([^0-9]|$)#127.0.0.1:${old}\1#g" "$site"
     nginx -t >/dev/null 2>&1 && systemctl reload nginx
     systemctl restart "$SERVICE"; sleep 2
     if [ -n "$(health_on "$old")" ]; then
-      ok "  پنل به $old برگشت و کار می‌کند."
-      warn "  اگر فایل سایت را دستی عوض کرده باشید ممکن است nginx روی $old نمانده باشد."
+      ok "  the panel is back on $old and working."
+      warn "  if you edited the site file by hand, nginx may not have stayed on $old."
     else
-      err "  پنل حتی روی $old هم بالا نیامد: journalctl -u $SERVICE -n 40"
+      err "  the panel did not come up even on $old: journalctl -u $SERVICE -n 40"
     fi
   fi
-  xui_guard "$xui_before" "$(xui_pid)" "پس از تغییر پورت"
+  xui_guard "$xui_before" "$(xui_pid)" "after the port change"
   pause
 }
 
 # ---------------------------------------------------------------- pages
 
 page_status() {
-  head1 "وضعیت پنل"
+  head1 "Panel status"
   service_state
   local h; h="$(health)"
-  if [ -n "$h" ]; then ok "  health: $h"; else err "  health: پاسخ نداد"; fi
-  say "  آدرس عمومی: $(public_url || true)"
-  say "  پورت زنده:   $(live_port || echo نامشخص)    (مورد نظر: $(desired_port) | در .env: $(panel_port))"
-  say "  دیتابیس: $(env_get DATA_DIR || echo /var/lib/sulduzcloud)/panel.db"
+  if [ -n "$h" ]; then ok "  health: $h"; else err "  health: no answer"; fi
+  say "  public address: $(public_url || true)"
+  say "  live port:   $(live_port || echo unknown)    (wanted: $(desired_port) | in .env: $(panel_port))"
+  say "  database: $(env_get DATA_DIR || echo /var/lib/sulduzcloud)/panel.db"
   local xui; xui="$(as_sulduz node -e '
     try {
       const s = require(process.argv[1] + "/server/src/settings");
@@ -427,9 +427,9 @@ page_status() {
       if (x && x.url) process.stdout.write(String(x.url).replace(/^(https?:\/\/[^/]+).*$/, "$1") + "/…");
     } catch (_) {}
   ' "$APP_DIR" 2>/dev/null)"
-  [ -n "$xui" ] && say "  x-ui متصل: $xui"
+  [ -n "$xui" ] && say "  x-ui connected: $xui"
   xui_state
-  say "  فعال‌سازی:"
+  say "  activation:"
   cli activation show 2>/dev/null | sed 's/^/    /'
 }
 
@@ -456,46 +456,46 @@ cred_save() { # username password
 # type, the port behind it, the accounts, where the password file is, and the
 # activation key this install answers with.
 page_details() {
-  head1 "۴) اطلاعات ورود پنل"
+  head1 "4) Panel login details"
   local live want
   live="$(live_port || true)"; want="$(desired_port)"
-  say "  آدرس برای مرورگر : $(public_url || echo 'تنظیم نشده — با گزینهٔ دامنه یا ssl تنظیمش کنید')"
-  say "  پورت زنده        : ${live:-نامشخص (سرویس بالا نیست؟)}"
-  say "  پورت مورد نظر    : ${want:-نامشخص}    (در .env: $(panel_port))"
-  say "  سرویس            : $SERVICE  —  $(systemctl is-active "$SERVICE" 2>/dev/null || echo '?')"
-  say "  نسخهٔ پنل        : $(version_shown || echo نامشخص)"
+  say "  browser address : $(public_url || echo 'not set — set it with the domain or ssl option')"
+  say "  live port       : ${live:-unknown (is the service up?)}"
+  say "  wanted port     : ${want:-unknown}    (in .env: $(panel_port))"
+  say "  service         : $SERVICE  —  $(systemctl is-active "$SERVICE" 2>/dev/null || echo '?')"
+  say "  panel version   : $(version_shown || echo unknown)"
   say ""
   local admins; admins="$(admin_list)"
   if [ -z "$admins" ]; then
-    warn "  هنوز هیچ حساب مدیری ساخته نشده است."
-    say "  پنل را در مرورگر باز کنید؛ اولین صفحه حساب مالک را می‌سازد."
-    say "  اگر صفحه باز نشد: sulduzcloud net   و   sulduzcloud logs"
+    warn "  no admin account exists yet."
+    say "  Open the panel in a browser; the first page creates the owner account."
+    say "  If that page did not open: sulduzcloud net   and   sulduzcloud logs"
   else
-    say "  حساب‌های مدیر (نمایش / وضعیت / تاریخ ساخت):"
+    say "  admin accounts (username / status / created):"
     printf '%s\n' "$admins" | while IFS= read -r line; do [ -n "$line" ] && say "    $line"; done
   fi
   say ""
   if [ -f "$CRED_FILE" ]; then
     local u p t
     u="$(cred_get ADMIN_USER)"; p="$(cred_get ADMIN_PASS)"; t="$(cred_get ADMIN_SET)"
-    say "  نام کاربری ذخیره‌شده در این منو : $u"
-    say "  رمز عبور                      : $p"
-    say "  آخرین تنظیم از همین منو        : $t"
-    warn "  اگر رمز را از داخل پنل وب عوض کرده‌اید این مقدار قدیمی است؛ گزینهٔ ۳."
+    say "  username stored in this menu : $u"
+    say "  password                     : $p"
+    say "  last set from this menu      : $t"
+    warn "  if you changed the password inside the web panel, this value is old; use option 3."
   else
-    say "  رمز عبور: قابل نمایش نیست — رمزها هش می‌شوند و بازیابی ندارند."
-    say "  با گزینهٔ ۳ می‌توانید رمز تازه بسازید (همان لحظه نمایش داده و در همین"
-    say "  سرور در $CRED_FILE ذخیره می‌شود)."
+    say "  password: not showable — passwords are hashed and cannot be recovered."
+    say "  Option 3 can create a new password (it is shown once and stored on this"
+    say "  server in $CRED_FILE)."
   fi
   say ""
-  say "  فعال‌سازی:"
+  say "  activation:"
   cli activation show 2>/dev/null | sed 's/^/    /'
   say ""
-  say "  شبکه:"
+  say "  network:"
   cli net show 2>/dev/null | sed 's/^/    /'
   say ""
-  say "  دیتابیس: $(env_get DATA_DIR || echo /var/lib/sulduzcloud)/panel.db"
-  say "  فایل رمز: $CRED_FILE (فقط root)"
+  say "  database: $(env_get DATA_DIR || echo /var/lib/sulduzcloud)/panel.db"
+  say "  password file: $CRED_FILE (root only)"
 }
 
 # ---------------------------------------------------------------- 3) owner account
@@ -504,32 +504,32 @@ set_admin_password() { # username [password]
   local u="$1" pw="${2:-}" out
   if [ -n "$pw" ]; then
     cli reset "$u" --password "$pw" >/dev/null \
-      || { err "  تغییر رمز ناموفق بود."; return 1; }
+      || { err "  changing the password failed."; return 1; }
   else
-    out="$(cli reset "$u")" || { err "  تغییر رمز ناموفق بود."; return 1; }
+    out="$(cli reset "$u")" || { err "  changing the password failed."; return 1; }
     pw="$(printf '%s\n' "$out" | sed -n 's/^  New password: //p')"
   fi
-  [ -n "$pw" ] || { err "  رمز تازه ساخته نشد."; return 1; }
+  [ -n "$pw" ] || { err "  no new password was created."; return 1; }
   cred_save "$u" "$pw"
   say ""
-  say "  کاربر      : $u"
-  ok "  رمز جدید   : $pw"
-  warn "  این رمز در $CRED_FILE (mode 600، فقط root) ذخیره شد تا از همین منو قابل نمایش باشد."
-  say "  نشست‌های بازِ مرورگر با رمز قدیمی از کار می‌افتند؛ این درستِ کار است."
+  say "  username   : $u"
+  ok "  new password : $pw"
+  warn "  this password was stored in $CRED_FILE (mode 600, root only) so this menu can show it again."
+  say "  Open browser sessions stop working with the old password; that is the correct behaviour."
   return 0
 }
 
 rename_owner() { # current-name
   local cur="$1" next
   RENAME_RESULT=""
-  printf '\n  نام کاربری جدید (۳ تا ۳۲ نویسهٔ انگلیسی، رقم، . _ -، خالی = انصراف): '
+  printf '\n  new username (3 to 32 english letters, digits, . _ -, empty = cancel): '
   read -r next || true
   next="${next//[^A-Za-z0-9._-]/}"
-  [ -n "$next" ] || { say "  بدون تغییر."; return 0; }
+  [ -n "$next" ] || { say "  No change."; return 0; }
   local out
   if ! out="$(cli rename "$cur" "$next" 2>&1)"; then
     printf '%s\n' "$out" | sed 's/^/  /'
-    warn "  نام کاربری تغییر نکرد."
+    warn "  the username did not change."
     return 1
   fi
   printf '%s\n' "$out" | sed 's/^/  /'
@@ -539,41 +539,41 @@ rename_owner() { # current-name
   # longer logs anybody in.
   if [ -f "$CRED_FILE" ]; then
     local p; p="$(cred_get ADMIN_PASS)"
-    if [ -n "$p" ]; then cred_save "$next" "$p"; say "  $CRED_FILE هم به نام تازه به‌روز شد."
-    else say "  (رمزی در فایل نبود؛ چیزی برای به‌روزرسانی نبود.)"; fi
+    if [ -n "$p" ]; then cred_save "$next" "$p"; say "  $CRED_FILE was updated to the new name too."
+    else say "  (there was no password in the file; nothing to update.)"; fi
   fi
   return 0
 }
 
 page_owner() {
-  head1 "۳) بازنشانی نام کاربری و رمز مالک"
+  head1 "3) Reset owner username and password"
   local first; first="$(owner_name)"
   if [ -z "$first" ]; then
-    warn "  حساب مدیری در این پنل نیست."
-    say "  اگر تازه نصب کرده‌اید، پنل را در مرورگر باز کنید تا صفحهٔ نخستین ورود ظاهر شود."
-    say "  اگر مطمئن هستید پنل بالا است: sulduzcloud status"
+    warn "  this panel has no admin account."
+    say "  If you have just installed it, open the panel in a browser so the first-run page appears."
+    say "  If you are sure the panel is running: sulduzcloud status"
     pause; return 1
   fi
-  say "  حساب مالک فعلی: $first"
+  say "  current owner account: $first"
   local admins; admins="$(admin_list)"
   if [ -n "$admins" ] && [ "$(printf '%s\n' "$admins" | awk 'NF' | wc -l)" -gt 1 ]; then
-    warn "  چند حساب مدیر وجود دارد؛ این منو روی $first کار می‌کند."
+    warn "  there are several admin accounts; this menu works on $first."
     printf '%s\n' "$admins" | sed 's/^/    /'
   fi
   say ""
-  say "  1) تغییر رمز عبور"
-  say "  2) تغییر نام کاربری"
-  say "  3) هر دو (وقتی دسترسی کامل را باخته‌اید)"
-  say "  0) بازگشت"
-  printf '  انتخاب: '
+  say "  1) Change the password"
+  say "  2) Change the username"
+  say "  3) Both (when you have lost full access)"
+  say "  0) Back"
+  printf '  choice: '
   local ch; read -r ch || true
   case "${ch:-}" in
     1)
-      printf '  رمز به‌صورت خودکار ساخته شود؟ [Y/n]: '
+      printf '  generate the password automatically? [Y/n]: '
       local auto; read -r auto || true
       if [[ "${auto:-Y}" =~ ^[Nn]$ ]]; then
-        local pw; printf '  رمز جدید (حداقل ۸ کاراکتر): '; read -rs pw || true; printf '\n'
-        [ ${#pw} -ge 8 ] || { err "  کوتاه است."; pause; return 1; }
+        local pw; printf '  new password (at least 8 characters): '; read -rs pw || true; printf '\n'
+        [ ${#pw} -ge 8 ] || { err "  too short."; pause; return 1; }
         set_admin_password "$first" "$pw"
       else
         set_admin_password "$first"
@@ -583,7 +583,7 @@ page_owner() {
     3)
       if rename_owner "$first"; then
         local who="${RENAME_RESULT:-$first}"
-        printf '\n  حالا رمز حساب %s:\n' "$who"
+        printf '\n  now the password of account %s:\n' "$who"
         set_admin_password "$who"
       fi
       ;;
@@ -593,13 +593,13 @@ page_owner() {
 }
 
 page_domain() {
-  head1 "تنظیم دامنه"
-  say "دامنهٔ فعلی: $(public_url || true)"
-  say "قبل از این کار رکورد A دامنه را به IP همین سرور وصل کنید."
-  printf '\nدامنهٔ جدید (مثلاً panel.example.com، خالی = انصراف): '
+  head1 "Set domain"
+  say "Current address: $(public_url || true)"
+  say "Before this, point the domain A record to this server IP."
+  printf '\nnew domain (for example panel.example.com, empty = cancel): '
   local d; read -r d || true
   [ -z "${d:-}" ] && return
-  if ! valid_domain "$d"; then err "دامنه معتبر نیست."; pause; return; fi
+  if ! valid_domain "$d"; then err "invalid domain."; pause; return; fi
   set_domain "$d"
   pause
 }
@@ -608,58 +608,58 @@ set_domain() { # host [scheme]
   local d="$1" scheme="${2:-}"
   [ -n "$scheme" ] || { if [ -f "/etc/letsencrypt/live/$d/cert.pem" ]; then scheme="https"; else scheme="http"; fi; }
   env_set PUBLIC_URL "$scheme://$d"
-  ok "PUBLIC_URL روی $scheme://$d تنظیم شد."
+  ok "PUBLIC_URL was set to $scheme://$d."
   # .env is the boot-time fallback; the stored setting is what src/net.js and every
   # subscribe link actually read, so a domain change that skips it is a no-op the
   # next time the browser asks for a link.
   if cli url set "$scheme://$d" >/dev/null 2>&1; then
-    ok "آدرس عمومی در تنظیمات پنل هم روی $scheme://$d رفت."
+    ok "the public address was written to the panel settings too: $scheme://$d."
   else
-    warn "آدرس عمومی در تنظیمات پنل نوشته نشد (خطا در CLI)؛ از داخل پنل وب چک کنید."
+    warn "the public address could not be written to the panel settings (CLI error); check it in the web panel."
   fi
   local site; site="$(nginx_site)"
   if [ -n "$site" ] && [ -f "$site" ]; then
     cp -a "$site" "$site.bak.$(date +%s)"
     sed -i -E "s/server_name[[:space:]]+[^;]+;/server_name $d;/g" "$site"
     if nginx -t >/dev/null 2>&1; then
-      systemctl reload nginx && ok "nginx به‌روزرسانی شد ($site)."
+      systemctl reload nginx && ok "nginx was updated ($site)."
     else
-      err "خطای nginx -t؛ reload انجام نشد (نسخهٔ قبلی: $site.bak.*)."
+      err "nginx -t failed; no reload happened (previous version: $site.bak.*)."
       nginx -t || true
       return 1
     fi
   else
-    warn "فایل سایت nginx پیدا نشد (نصب با --no-nginx) — فقط .env تغییر کرد."
+    warn "no nginx site file was found (installed with --no-nginx) — only .env changed."
   fi
   systemctl restart "$SERVICE"
   sleep 2
-  if [ -n "$(health)" ]; then ok "پنل با دامنهٔ جدید بالا آمد."; else err "پنل بالا نیامد: journalctl -u $SERVICE -n 50"; fi
+  if [ -n "$(health)" ]; then ok "the panel came up with the new domain."; else err "the panel did not come up: journalctl -u $SERVICE -n 50"; fi
 }
 
 page_ssl() {
-  head1 "۵) گواهی SSL خودکار"
+  head1 "5) Automatic SSL certificate"
   local d; d="$(domain_only)"
   if [ -z "$d" ]; then
-    say "  هنوز دامنه‌ای تنظیم نشده است و بدون دامنه گواهی Let's Encrypt معنا ندارد."
-    printf '  دامنه (مثلاً panel.example.com، خالی = انصراف): '
+    say "  no domain is set yet, and a Let's Encrypt certificate makes no sense without one."
+    printf '  domain (for example panel.example.com, empty = cancel): '
     read -r d || true
     d="${d//[^A-Za-z0-9.-]/}"
     [ -n "$d" ] || return 0
-    valid_domain "$d" || { err "  دامنه معتبر نیست."; pause; return 1; }
-    say "  رکورد A دامنه باید به IP همین سرور اشاره کند."
+    valid_domain "$d" || { err "  invalid domain."; pause; return 1; }
+    say "  the domain A record must point to this server IP."
     set_domain "$d" https
     pause; return 0
   fi
-  say "  دامنه: $d"
+  say "  domain: $d"
   ssl_status_show
   say ""
-  say "  1) صدور/تمدید خودکار Let's Encrypt — TLS در nginx تمام شود (توصیهٔ نصب پیش‌فرض)"
-  say "  2) صدور خودکار — خودِ پنل HTTPS سرو کند (سریال و کلید فعالسازی و مسیر سرتیفکت در پنل)"
-  say "  3) تمدید گواهی‌های موجود + نصب قلاب تمدید خودکار"
-  say "  4) خودم مسیر دو فایل گواهی را می‌دهم"
-  say "  5) گواهی پنل را بردار (برگشت به HTTP پشت nginx)"
-  say "  0) بازگشت"
-  printf '  انتخاب: '
+  say "  1) Automatic Let's Encrypt issue/renew — TLS ends at nginx (recommended, default install)"
+  say "  2) Automatic issue — the panel itself serves HTTPS (serial, activation key and cert paths in the panel)"
+  say "  3) Renew existing certificates + install the automatic renewal hook"
+  say "  4) I will give the paths of the two certificate files myself"
+  say "  5) Remove the panel certificate (back to HTTP behind nginx)"
+  say "  0) Back"
+  printf '  choice: '
   local ch; read -r ch || true
   case "${ch:-}" in
     1) ssl_via_nginx "$d" ;;
@@ -680,34 +680,34 @@ ssl_status_show() {
   info="$(cert_expiry "$cert")"
   if [ -n "$info" ]; then
     end="${info%%|*}"; days="${info##*|}"
-    say "  گواهی فعال   : $cert"
-    say "  معتبر تا     : ${end} — ${days} روز مانده"
-    [ "$days" -lt 0 ] 2>/dev/null && err "    گواهی منقضی شده است!"
-    [ "$days" -ge 0 ] 2>/dev/null && [ "$days" -lt 14 ] 2>/dev/null && warn "    کمتر از ۱۴ روز؛ گزینهٔ ۳."
+    say "  active certificate : $cert"
+    say "  valid until        : ${end} — ${days} days left"
+    [ "$days" -lt 0 ] 2>/dev/null && err "    the certificate has expired!"
+    [ "$days" -ge 0 ] 2>/dev/null && [ "$days" -lt 14 ] 2>/dev/null && warn "    fewer than 14 days left; use option 3."
   else
-    say "  گواهی فعال   : هیچ (سرویس روی HTTP است)"
+    say "  active certificate : none (the service is on HTTP)"
   fi
   pair="$(cli ssl get 2>/dev/null)"
   if [ -n "$pair" ]; then
-    say "  پنل خودش HTTPS سرو می‌کند:"
+    say "  the panel serves HTTPS itself:"
     printf '%s\n' "$pair" | sed 's/^/    /'
   else
-    say "  پنل: مسیر گواهی ندارد — اگر nginx گواهی دارد، TLS همان‌جا تمام می‌شود (حالت عادی)."
+    say "  panel: no certificate path — if nginx has a certificate, TLS ends there (the normal case)."
   fi
   if [ -x /usr/bin/certbot ] || command -v certbot >/dev/null 2>&1; then
-    say "  certbot      : نصب است"
+    say "  certbot      : installed"
   else
-    say "  certbot      : نصب نیست (در اولین صدور خودکار نصب می‌شود)"
+    say "  certbot      : not installed (it is installed on the first automatic issue)"
   fi
 }
 
 ssl_email_ask() {
   SSL_EMAIL="$(awk -F= '$1=="SC_SSL_EMAIL"{print $2}' "$MENU_ENV" 2>/dev/null)"
   if [ -z "$SSL_EMAIL" ]; then
-    printf "  ایمیل برای Let's Encrypt: "
+    printf "  email for Let's Encrypt: "
     read -r SSL_EMAIL || true
     SSL_EMAIL="${SSL_EMAIL//[[:space:]]/}"
-    [ -n "$SSL_EMAIL" ] || { err "    ایمیل لازم است."; return 1; }
+    [ -n "$SSL_EMAIL" ] || { err "    an email is required."; return 1; }
     mkdir -p "$(dirname "$MENU_ENV")"
     printf 'SC_SSL_EMAIL=%s\n' "$SSL_EMAIL" > "$MENU_ENV"
     chmod 600 "$MENU_ENV"
@@ -717,18 +717,18 @@ ssl_email_ask() {
 
 ensure_certbot() {
   command -v certbot >/dev/null 2>&1 && return 0
-  warn "  certbot نصب نیست؛ از مخزن توزیع نصب می‌شود..."
+  warn "  certbot is not installed; installing it from the distribution repository..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y --no-install-recommends certbot python3-certbot-nginx >/dev/null \
-      || { err "    نصب certbot ناموفق بود."; return 1; }
+      || { err "    installing certbot failed."; return 1; }
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y certbot python3-certbot-nginx >/dev/null || { err "    نصب certbot ناموفق بود."; return 1; }
+    dnf install -y certbot python3-certbot-nginx >/dev/null || { err "    installing certbot failed."; return 1; }
   else
-    err "    مدیر بسته‌ای نشناختم؛ certbot را خودتان نصب کنید."
+    err "    I did not recognise a package manager; install certbot yourself."
     return 1
   fi
-  command -v certbot >/dev/null 2>&1 || { err "    certbot نصب شد اما در PATH نیست."; return 1; }
-  ok "    certbot نصب شد."
+  command -v certbot >/dev/null 2>&1 || { err "    certbot was installed but is not in PATH."; return 1; }
+  ok "    certbot installed."
 }
 
 ssl_data_dir() { local d; d="$(env_get DATA_DIR)"; printf '%s' "${d:-/var/lib/sulduzcloud}"; }
@@ -740,7 +740,7 @@ ssl_install_pair() { # domain
   local d="$1" dir live out
   SSL_PAIR_DIR=""
   dir="$(ssl_data_dir)/ssl/$d"; live="/etc/letsencrypt/live/$d"
-  [ -f "$live/fullchain.pem" ] && [ -f "$live/privkey.pem" ] || { err "    گواهی $live پیدا نشد؛ اول آن را صادر کنید."; return 1; }
+  [ -f "$live/fullchain.pem" ] && [ -f "$live/privkey.pem" ] || { err "    certificate $live not found; issue it first."; return 1; }
   mkdir -p "$dir"
   cp -f "$live/fullchain.pem" "$dir/fullchain.pem"
   cp -f "$live/privkey.pem" "$dir/privkey.pem"
@@ -750,7 +750,7 @@ ssl_install_pair() { # domain
   chmod 640 "$dir/privkey.pem" 2>/dev/null || true
   if ! out="$(cli ssl set --cert "$dir/fullchain.pem" --key "$dir/privkey.pem" 2>&1)"; then
     printf '%s\n' "$out" | sed 's/^/    /' >&2
-    err "    پنل این جفت گواهی را نپذیرفت."
+    err "    the panel did not accept this certificate pair."
     return 1
   fi
   printf '%s\n' "$out" | sed 's/^/    /'
@@ -764,7 +764,7 @@ install_cert_hook() { # domain
   local d="$1" hook dir
   hook="/etc/letsencrypt/renewal-hooks/deploy/sulduzcloud.sh"
   dir="$(ssl_data_dir)/ssl/$d"
-  [ -n "$d" ] || { err "  دامنه‌ای تنظیم نیست؛ قلاب تمدید لازم نیست."; return 1; }
+  [ -n "$d" ] || { err "  no domain is set; the renewal hook is not needed."; return 1; }
   mkdir -p "$(dirname "$hook")"
   cat > "$hook" <<HOOK_EOF
 #!/usr/bin/env bash
@@ -800,13 +800,13 @@ systemctl restart "$SERVICE" 2>/dev/null || true
 echo "[sulduzcloud] renewal hook: certificate copied into \$DIR and the panel restarted"
 HOOK_EOF
   chmod 755 "$hook"
-  ok "  قلاب تمدید نصب شد: $hook"
-  say "  هر تمدید خودکار certbot، گواهی تازه را به پنل می‌دهد و فقط سرویس $SERVICE را ری‌استارت می‌کند."
+  ok "  renewal hook installed: $hook"
+  say "  every automatic certbot renewal now hands the new certificate to the panel and restarts only $SERVICE."
 }
 
 renew_ssl() {
   ensure_certbot || return 1
-  say "  در حال تمدید (اگر زمانش نرسیده باشد certbot کاری نمی‌کند)..."
+  say "  renewing (certbot does nothing if the certificate is not due yet)..."
   certbot renew --quiet --non-interactive 2>&1 | sed 's/^/    /'
   ssl_status_show
 }
@@ -816,19 +816,19 @@ ssl_via_nginx() { # domain
   local d="$1"
   ensure_certbot || return 1
   ssl_email_ask || return 1
-  [ -n "$(nginx_site)" ] || { err "  سایت nginx پیدا نشد؛ گواهی با --nginx ممکن نیست. از گزینهٔ ۲ یا نصب nginx استفاده کنید."; return 1; }
+  [ -n "$(nginx_site)" ] || { err "  no nginx site was found; a certificate with --nginx is not possible. Use option 2 or install nginx."; return 1; }
   local xui_before; xui_before="$(xui_pid)"
-  say "  certbot --nginx: گواهی می‌گیرد، پورت ۸۰ را به ۴۴۳ تبدیل می‌کند و nginx را بازمی‌خواند."
+  say "  certbot --nginx: gets the certificate, turns port 80 into 443 and reloads nginx."
   certbot --nginx -d "$d" --redirect --non-interactive --agree-tos -m "$SSL_EMAIL" 2>&1 | sed 's/^/    /'
   if [ ! -f "/etc/letsencrypt/live/$d/fullchain.pem" ]; then
-    err "  گواهی ساخته نشد؛ تنظیمات پنل دست‌نخورده ماند. DNS دامنه و باز بودن پورت ۸۰ را بررسی کنید."
+    err "  no certificate was created; the panel settings stayed untouched. Check the domain DNS and that port 80 is open."
     return 1
   fi
   # nginx holds TLS now: the panel must not be holding half a pair.
   cli ssl clear >/dev/null 2>&1
   set_domain "$d" https
-  xui_guard "$xui_before" "$(xui_pid)" "پس از صدور گواهی"
-  ok "  https://$d آماده است (TLS در nginx)."
+  xui_guard "$xui_before" "$(xui_pid)" "after issuing the certificate"
+  ok "  https://$d is ready (TLS ends at nginx)."
 }
 
 ssl_on_panel() { # domain
@@ -837,10 +837,10 @@ ssl_on_panel() { # domain
   ssl_email_ask || return 1
   email="$SSL_EMAIL"
   if [ -f "/etc/letsencrypt/live/$d/fullchain.pem" ]; then
-    say "  گواهی $d از قبل روی سرور هست؛ همان کپی می‌شود."
+    say "  the certificate of $d is already on the server; the same one is copied."
   else
-    [ -n "$(nginx_site)" ] || { err "  نه گواهی هست نه nginx؛ certbot راهی برای صدور ندارد."; return 1; }
-    say "  certbot فقط گواهی می‌گیرد (certonly) و به nginx دست نمی‌زند."
+    [ -n "$(nginx_site)" ] || { err "  there is neither a certificate nor nginx; certbot has no way to issue one."; return 1; }
+    say "  certbot only gets the certificate (certonly) and does not touch nginx."
     certbot certonly --nginx -d "$d" --non-interactive --agree-tos -m "$email" 2>&1 | sed 's/^/    /' || true
   fi
   ssl_install_pair "$d" || return 1
@@ -849,41 +849,41 @@ ssl_on_panel() { # domain
   # HTTP to it — otherwise the domain goes dark exactly when this succeeds.
   site="$(nginx_site)"
   if [ -n "$site" ] && [ -f "$site" ]; then
-    warn "  nginx در این نصب به پنل proxy_pass می‌کند؛ آن را به https سوییچ می‌کنم."
-    nginx_upstream_tls https || warn "  nginx تغییر نکرد؛ اگر آدرس دامنه از کار افتاد: گزینهٔ ۵."
+    warn "  nginx in this install proxy_passes to the panel; switching it to https."
+    nginx_upstream_tls https || warn "  nginx did not change; if the domain address stops working: option 5."
   fi
   local xui_before; xui_before="$(xui_pid)"
   systemctl restart "$SERVICE"
   sleep 3
   local p; p="$(desired_port)"
   if curl -fsSk --max-time 5 "https://127.0.0.1:$p/api/health" >/dev/null 2>&1; then
-    ok "  پنل خودش روی پورت $p HTTPS سرو می‌کند."
+    ok "  the panel itself serves HTTPS on port $p."
   else
-    err "  پنل روی https پاسخ نداد؛ بازگردانی به HTTP:"
+    err "  the panel did not answer on https; rolling back to HTTP:"
     cli ssl clear >/dev/null 2>&1
     [ -n "$site" ] && nginx_upstream_tls http
     systemctl restart "$SERVICE"; sleep 2
-    if [ -n "$(health)" ]; then ok "  پنل روی HTTP بالا آمد."; else err "  پنل بالا نیامد: journalctl -u $SERVICE -n 40"; fi
+    if [ -n "$(health)" ]; then ok "  the panel came up on HTTP."; else err "  the panel did not come up: journalctl -u $SERVICE -n 40"; fi
   fi
-  xui_guard "$xui_before" "$(xui_pid)" "پس از گواهی روی پنل"
-  [ -n "$SSL_PAIR_DIR" ] && say "  مسیرها: $SSL_PAIR_DIR/fullchain.pem و $SSL_PAIR_DIR/privkey.pem"
+  xui_guard "$xui_before" "$(xui_pid)" "after moving the certificate to the panel"
+  [ -n "$SSL_PAIR_DIR" ] && say "  paths: $SSL_PAIR_DIR/fullchain.pem and $SSL_PAIR_DIR/privkey.pem"
 }
 
 ssl_take_paths() {
   local c k
-  printf '  مسیر کلید عمومی (fullchain، با / شروع شود، خالی = انصراف): '; read -r c || true
+  printf '  public key path (fullchain, must start with /, empty = cancel): '; read -r c || true
   [ -n "${c:-}" ] || return 0
-  printf '  مسیر کلید خصوصی (privkey): '; read -r k || true
-  [ -n "${k:-}" ] || { err "  هر دو مسیر لازم است."; return 1; }
-  cli ssl set --cert "$c" --key "$k" || { err "  پنل این جفت را نپذیرفت."; return 1; }
+  printf '  private key path (privkey): '; read -r k || true
+  [ -n "${k:-}" ] || { err "  both paths are required."; return 1; }
+  cli ssl set --cert "$c" --key "$k" || { err "  the panel did not accept this pair."; return 1; }
   local site; site="$(nginx_site)"
   [ -n "$site" ] && [ -f "$site" ] && nginx_upstream_tls https
   systemctl restart "$SERVICE"; sleep 3
   local p; p="$(desired_port)"
   if curl -fsSk --max-time 5 "https://127.0.0.1:$p/api/health" >/dev/null 2>&1; then
-    ok "  پنل روی پورت $p با این گواهی HTTPS سرو می‌شود."
+    ok "  the panel is served over HTTPS on port $p with this certificate."
   else
-    err "  پنل روی https پاسخ نداد؛ مسیرها پاک شد تا سرویس زنده بماند."
+    err "  the panel did not answer on https; the paths were cleared so the service stays alive."
     cli ssl clear >/dev/null 2>&1
     [ -n "$site" ] && nginx_upstream_tls http
     systemctl restart "$SERVICE"
@@ -892,17 +892,17 @@ ssl_take_paths() {
 
 ssl_remove() { # domain
   local d="${1:-}"
-  printf '  گواهی پنل برداشته شود و برگردد پشت nginx؟ [y/N]: '
+  printf '  remove the panel certificate and go back behind nginx? [y/N]: '
   local a; read -r a || true
-  [[ "${a:-}" =~ ^[Yy]$ ]] || { say "  بدون تغییر."; return 0; }
+  [[ "${a:-}" =~ ^[Yy]$ ]] || { say "  No change."; return 0; }
   cli ssl clear
   local site; site="$(nginx_site)"
   [ -n "$site" ] && [ -f "$site" ] && nginx_upstream_tls http
   local xui_before; xui_before="$(xui_pid)"
   systemctl restart "$SERVICE"; sleep 2
-  if [ -n "$(health)" ]; then ok "  پنل روی HTTP است."; else err "  پنل بالا نیامد: journalctl -u $SERVICE -n 40"; fi
+  if [ -n "$(health)" ]; then ok "  the panel is on HTTP."; else err "  the panel did not come up: journalctl -u $SERVICE -n 40"; fi
   [ -n "$d" ] && set_domain "$d" "$( [ -f "/etc/letsencrypt/live/$d/fullchain.pem" ] && echo https || echo http )"
-  xui_guard "$xui_before" "$(xui_pid)" "پس از برداشتن گواهی"
+  xui_guard "$xui_before" "$(xui_pid)" "after removing the certificate"
 }
 
 # proxy_pass is the one line that decides whether nginx can reach a TLS panel.
@@ -921,10 +921,10 @@ nginx_upstream_tls() { # https|http
     sed -i -E "s#(proxy_pass[[:space:]]+)https://(127\.0\.0\.1:${port}[;/])#\1http://\2#g" "$site"
   fi
   if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx && ok "  nginx: proxy_pass روی $want."
+    systemctl reload nginx && ok "  nginx: proxy_pass on $want."
     return 0
   fi
-  err "  nginx بعد از تغییر معتبر نبود؛ نسخهٔ قبلی برگشت."
+  err "  nginx was not valid after the change; the previous version was restored."
   local prev; prev="$(ls -1t "$site.bak."* 2>/dev/null | head -1)"
   if [ -n "$prev" ]; then
     cp -a "$prev" "$site"
@@ -934,67 +934,67 @@ nginx_upstream_tls() { # https|http
 }
 
 page_backup() {
-  head1 "بکاپ فوری"
+  head1 "Backup now"
   local out; out="$(backup_now)"
   if [ -n "$out" ]; then
-    ok "بکاپ ساخته شد: $out ($(du -h "$out" | cut -f1))"
-    say "  همین تابع قبل از آپدیت و قبل از تغییر پورت هم اجرا می‌شود."
+    ok "backup created: $out ($(du -h "$out" | cut -f1))"
+    say "  the same function runs before an update and before a port change."
   else
-    err "بکاپ ناموفق بود — فایل‌های better-sqlite3 و مسیر دیتابیس را بررسی کنید."
+    err "backup failed — check the better-sqlite3 files and the database path."
   fi
   pause
 }
 
 page_net() {
-  head1 "شبکهٔ پنل"
+  head1 "Panel network"
   cli net show
   say ""
-  say "  پورت زنده: $(live_port || echo نامشخص)"
-  say "  برای جابه‌جایی پورت: گزینهٔ ۲ (یا sulduzcloud port)"
-  say "  برای HTTPS: گزینهٔ ۵"
+  say "  live port: $(live_port || echo unknown)"
+  say "  to move the port: option 2 (or sulduzcloud port)"
+  say "  for HTTPS: option 5"
   pause
 }
 
 # ---------------------------------------------------------------- activate
 
 page_activate() {
-  head1 "فعال‌سازی پنل"
+  head1 "Panel activation"
   local st; st="$(cli activation show 2>/dev/null)"
   printf '%s\n' "$st"
   say ""
-  if printf '%s' "$st" | grep -q 'وضعیت: فعال'; then
-    say "  چیزی لازم نیست؛ این نصب فعال است و سریالش دیگر نمایش داده نمی‌شود."
+  if printf '%s' "$st" | grep -q 'status: active'; then
+    say "  nothing is needed; this install is activated and its serial is not shown again."
     pause; return 0
   fi
-  say "  سریال بالا فقط برای همین نصب است. آن را برای مالک بفرستید و کلید فعالسازیِ"
-  say "  همان سریال را بگیرید؛ کلیدهای فعالسازی نه در این سرور و نه در مخزن نگه‌داشته می‌شوند."
-  printf '\n  کلید فعالسازی (خالی = انصراف): '
+  say "  The serial above belongs to this install only. Send it to the owner and get the"
+  say "  activation key of that serial; activation keys are stored neither on this server nor in the repository."
+  printf '\n  activation key (empty = cancel): '
   local k; read -r k || true
-  [ -n "${k:-}" ] || { say "  بدون تغییر."; pause; return 0; }
+  [ -n "${k:-}" ] || { say "  No change."; pause; return 0; }
   if cli activation set "$k"; then
-    ok "  پنل فعال شد؛ حالا می‌توانید حساب مالک را بسازید."
+    ok "  the panel is activated; you can now create the owner account."
   else
-    err "  این کلید برای این نصب معتبر نبود (شمارش تلاش‌ها در دیتابیس ثبت شد)."
+    err "  this key was not valid for this install (the attempt count is recorded in the database)."
   fi
   pause
 }
 
 page_restart() {
-  head1 "ری‌استارت پنل"
-  say "فقط سرویس $SERVICE ری‌استارت می‌شود؛ x-ui و کاربران دست نمی‌خورند."
+  head1 "Restart panel"
+  say "Only the $SERVICE service is restarted; x-ui and the customers are not touched."
   if [ -t 0 ]; then
-    printf 'ادامه؟ [y/N]: '
+    printf 'Continue? [y/N]: '
     local a; read -r a || true
     [[ "${a:-}" =~ ^[Yy]$ ]] || return
   fi
   systemctl restart "$SERVICE"
   sleep 2
-  if [ -n "$(health)" ]; then ok "پنل سالم بالا آمد: $(health)"; else err "پنل بالا نیامد:"; journalctl -u "$SERVICE" -n 30 --no-pager; fi
+  if [ -n "$(health)" ]; then ok "the panel came up healthy: $(health)"; else err "the panel did not come up:"; journalctl -u "$SERVICE" -n 30 --no-pager; fi
   pause
 }
 
 page_logs() {
-  head1 "۳۰ خط آخر لاگ"
+  head1 "Last 30 log lines"
   journalctl -u "$SERVICE" -n 30 --no-pager
   pause
 }
@@ -1004,19 +1004,19 @@ page_logs() {
 draw_menu() {
   clear 2>/dev/null || true
   printf '%s' "$c_b"
-  say "  Sulduz Cloud — منوی سرور"
+  say "  Sulduz Cloud — server menu"
   printf '%s' "$c_r"
-  say "  $(public_url || echo 'آدرس تنظیم نشده')   |   پورت $(live_port || echo '?')   |   نسخه $(version_shown || echo '?')"
+  say "  $(public_url || echo 'no address set')   |   port $(live_port || echo '?')   |   version $(version_shown || echo '?')"
   say "  ------------------------------------------------------------"
-  say "  1) update                      آپدیت به آخرین نسخهٔ منتشرشده"
-  say "  2) change port panel           تغییر پورت پنل"
-  say "  3) reset username/password     بازنشانی نام کاربری و رمز مالک"
-  say "  4) view panel login details    نمایش اطلاعات ورود پنل"
-  say "  5) automatic ssl               گواهی SSL خودکار (nginx یا خود پنل)"
-  say "  6) exit                        خروج"
+  say "  1) update                      update to the latest published version"
+  say "  2) change port panel           change the panel port"
+  say "  3) reset username/password     reset the owner username and password"
+  say "  4) view panel login details    show the panel login details"
+  say "  5) automatic ssl               SSL certificate (nginx or the panel itself)"
+  say "  6) exit                        exit"
   say "  ------------------------------------------------------------"
-  say "  بیشتر:  sulduzcloud status | domain <host> | net | activate | backup | restart | logs"
-  printf '  انتخاب: '
+  say "  more:  sulduzcloud status | domain <host> | net | activate | backup | restart | logs"
+  printf '  choice: '
 }
 
 main_menu() {
@@ -1038,7 +1038,7 @@ main_menu() {
 main() {
   need_root "$@"
   if [ ! -d "$APP_DIR/server" ]; then
-    err "نصب در $APP_DIR پیدا نشد. با SC_APP_DIR مسیر را بدهید."
+    err "no install found in $APP_DIR. Give the path with SC_APP_DIR."
     exit 1
   fi
   case "${1:-}" in
@@ -1047,7 +1047,7 @@ main() {
     owner|accounts) page_owner ;;
     port)
       if [ -n "${2:-}" ]; then
-        if valid_port "$2"; then cli port set "$2" && env_set PORT "$2" && say "بعد از آن sulduzcloud restart"; else err "پورت معتبر نیست."; fi
+        if valid_port "$2"; then cli port set "$2" && env_set PORT "$2" && say "then run sulduzcloud restart"; else err "invalid port."; fi
       else
         page_port
       fi ;;
@@ -1057,7 +1057,7 @@ main() {
     net) page_net ;;
     domain)
       if [ -n "${2:-}" ]; then
-        if valid_domain "$2"; then set_domain "$2"; else err "دامنه معتبر نیست."; fi
+        if valid_domain "$2"; then set_domain "$2"; else err "invalid domain."; fi
       else
         page_domain
       fi
@@ -1067,8 +1067,8 @@ main() {
     logs) page_logs ;;
     ""|-m|menu) main_menu ;;
     *)
-      say "استفاده:"
-      say "  sulduzcloud                 منوی ۶ گزینه‌ای"
+      say "usage:"
+      say "  sulduzcloud                 the 6-item menu"
       say "  sulduzcloud update | port <n> | owner | details | ssl [domain]"
       say "  sulduzcloud status | net | activate | domain <host> | backup | restart | logs"
       ;;

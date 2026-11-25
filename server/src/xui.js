@@ -97,6 +97,12 @@ function normalizeClient(raw, inboundIds) {
     limitIp: Number(raw.limitIp || 0),
     limitHwid: Number(raw.limitHwid || 0),
     totalBytes: Number(raw.totalGB || traffic.total || 0),
+    // The node's OWN declared quota, with no fallback to the traffic row. v2.4.2
+    // added this because the background sync has to be able to tell "this client
+    // is unlimited on the node" (totalGB 0) apart from "the node did not answer
+    // the field and only the traffic row has an old number": mirroring the second
+    // one would write a number nobody chose into the customer's plan.
+    quotaBytes: Number(raw.totalGB || 0),
     expiryAt: Number(raw.expiryTime || traffic.expiryTime || 0),
     enabled: raw.enable !== false,
     comment: String(raw.comment || ''),
